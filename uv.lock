@@ -103,7 +103,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "apache-beam" },
     { name = "avro-python3" },
-    { name = "basedpyright" },
     { name = "contextlib2" },
     { name = "cython" },
     { name = "lvis" },
@@ -134,7 +133,6 @@ dev = [
 requires-dist = [
     { name = "apache-beam", specifier = ">=2.73.0" },
     { name = "avro-python3", specifier = ">=1.10.2" },
-    { name = "basedpyright", specifier = ">=1.39.3" },
     { name = "contextlib2", specifier = ">=21.6.0" },
     { name = "cython", specifier = ">=3.2.4" },
     { name = "lvis", specifier = ">=0.5.3" },
