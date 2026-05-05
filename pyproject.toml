@@ -1,0 +1,27 @@
+[project]
+name = "ba-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "apache-beam>=2.73.0",
+    "avro-python3>=1.10.2",
+    "basedpyright>=1.39.3",
+    "contextlib2>=21.6.0",
+    "cython>=3.2.4",
+    "keras>=3.12.1",
+    "lvis>=0.5.3",
+    "lxml>=6.1.0",
+    "matplotlib>=3.10.6",
+    "pandas>=2.3.3",
+    "pillow>=12.2.0",
+    "pycocotools>=2.0.11",
+    "pyparsing==2.4.7",
+    "sacrebleu<=2.2.0",
+    "scipy>=1.15.3",
+    "six>=1.17.0",
+    # "tensorflow-io>=0.37.1",
+    "tf-models-official>=2.5.1",
+    "tf-slim>=1.1.0",
+]
