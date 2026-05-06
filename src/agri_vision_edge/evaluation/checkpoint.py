@@ -163,7 +163,6 @@ def summarize_checkpoint_metrics(
 
     return metrics_df.loc[idx]
 
-
 #
 # Batch checkpoint evaluation
 #
@@ -361,3 +360,75 @@ def find_best_checkpoint(
     )
 
     return metrics_df.loc[idx]
+
+
+#
+# Checkpoint discovery
+#
+
+
+def list_checkpoints(
+    checkpoint_dir: PathLike,
+):
+    """
+    List available TF checkpoints.
+
+    Args:
+        checkpoint_dir:
+            Training checkpoint directory.
+
+    Returns:
+        Sorted list of checkpoint prefixes.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+
+    checkpoints = []
+
+    for path in checkpoint_dir.glob("ckpt-*.index"):
+        stem = path.stem
+
+        match = re.match(r"ckpt-(\d+)", stem)
+
+        if match is None:
+            continue
+
+        step = int(match.group(1))
+
+        checkpoints.append(
+            (
+                step,
+                checkpoint_dir / stem,
+            )
+        )
+
+    checkpoints.sort(key=lambda x: x[0])
+
+    return [p for _, p in checkpoints]
+
+
+def checkpoint_step(
+    checkpoint_path: PathLike,
+):
+    """
+    Extract numeric checkpoint step.
+
+    Args:
+        checkpoint_path:
+            Checkpoint prefix.
+
+    Returns:
+        Integer step number.
+    """
+    checkpoint_path = Path(checkpoint_path)
+
+    match = re.search(
+        r"ckpt-(\d+)",
+        checkpoint_path.name,
+    )
+
+    if match is None:
+        raise ValueError(
+            f"Invalid checkpoint name: {checkpoint_path}"
+        )
+
+    return int(match.group(1))

@@ -14,8 +14,6 @@ from .train import (
 
 from .eval import (
     launch_eval,
-    list_checkpoints,
-    checkpoint_step,
 )
 
 from .export import (
@@ -45,8 +43,6 @@ __all__ = [
     # Evaluation
     #
     "launch_eval",
-    "list_checkpoints",
-    "checkpoint_step",
 
     #
     # Export
