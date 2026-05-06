@@ -1,74 +1,87 @@
 """
 Preprocessing utilities for converting PhenoBench segmentation data
-into object detection training data.
+into TensorFlow Object Detection training data.
 
 This module provides functions to:
 
 1. Extract bounding boxes from instance + semantic masks
 2. Resize images and scale bounding boxes to model input size
 3. Normalize bounding boxes for TensorFlow Object Detection API
+4. Split datasets into validation and test subsets
 
-Typical usage (dataset preparation):
+Typical usage:
 
     from agri_vision_edge.data.preprocessing import (
-        extract_boxes,
-        resize_image_and_boxes,
-        normalize_boxes,
+        process_sample,
+        split_indices,
     )
 
     image = load_rgb_image(...)
     instances = load_instance_mask(...)
     semantics = load_semantic_mask(...)
 
-    boxes, labels = extract_boxes(instances, semantics)
-
-    image_resized, boxes_resized = resize_image_and_boxes(
-        image, boxes, size=320
+    image_resized, boxes_normalized, labels = process_sample(
+        image=image,
+        instances=instances,
+        semantics=semantics,
+        size=320,
     )
-
-    boxes_normalized = normalize_boxes(boxes_resized, image_size=320)
 
 Notes:
 - Bounding boxes are extracted BEFORE resizing.
-- All downstream steps (training, inference, quantization) must use the same preprocessing.
-- Input images are expected to be uint8 in range [0, 255].
+- All downstream steps (training, inference, quantization)
+  must use identical preprocessing.
+- Input images are expected to be uint8 in the range [0, 255].
 """
 
-from typing import List, Tuple
-import numpy as np
+import random
+from typing import List, Sequence, Tuple
+
 import cv2
+import numpy as np
+
+
+DEFAULT_TARGET_SIZE = 320
+DEFAULT_ALLOWED_CLASSES = (1, 2)
+DEFAULT_MIN_AREA = 20
 
 
 def extract_boxes(
     instances: np.ndarray,
     semantics: np.ndarray,
-    allowed_classes: Tuple[int, ...] = (1, 2),
-    min_area: int = 0,
+    allowed_classes: Tuple[int, ...] = DEFAULT_ALLOWED_CLASSES,
+    min_area: int = DEFAULT_MIN_AREA,
 ) -> Tuple[List[List[int]], List[int]]:
     """
     Extract bounding boxes and class labels from instance and semantic masks.
 
-    Each unique instance ID (>0) is treated as one object. The class label is
-    determined via majority voting over the semantic mask.
+    Each unique instance ID (>0) is treated as one object. The class label
+    is determined via majority voting over the semantic mask.
 
     Args:
         instances (np.ndarray):
-            Instance mask (H, W), values >0 correspond to individual plants.
+            Instance mask of shape (H, W).
+            Values >0 correspond to individual plants.
         semantics (np.ndarray):
-            Semantic mask (H, W), containing class IDs per pixel.
-        allowed_classes (Tuple[int, ...], optional):
-            Class IDs to keep (default: (1, 2) → crop, weed).
-        min_area (int, optional):
-            Minimum bounding box area in pixels to keep an instance.
+            Semantic mask of shape (H, W).
+            Contains class IDs per pixel.
+        allowed_classes (Tuple[int, ...]):
+            Class IDs to keep.
+        min_area (int):
+            Minimum bounding box area in pixels.
 
     Returns:
         Tuple[List[List[int]], List[int]]:
-            - boxes: list of [xmin, ymin, xmax, ymax] (pixel coordinates)
-            - labels: list of class IDs
+            boxes:
+                Bounding boxes in pixel coordinates:
+                [xmin, ymin, xmax, ymax]
+            labels:
+                Corresponding class IDs.
 
     Notes:
-        - Instances with classes not in allowed_classes are skipped.
-        - Very small objects can be filtered via min_area.
+        - Instances with classes not in `allowed_classes`
+          are skipped.
+        - Very small objects can be filtered via `min_area`.
     """
     boxes: List[List[int]] = []
     labels: List[int] = []
@@ -84,48 +97,56 @@ def extract_boxes(
 
         ys, xs = np.where(mask)
 
-        xmin, xmax = xs.min(), xs.max()
-        ymin, ymax = ys.min(), ys.max()
+        xmin = int(xs.min())
+        xmax = int(xs.max())
+
+        ymin = int(ys.min())
+        ymax = int(ys.max())
 
         area = (xmax - xmin + 1) * (ymax - ymin + 1)
+
         if area < min_area:
             continue
 
         class_pixels = semantics[mask].astype(np.int32)
-        cls = np.bincount(class_pixels).argmax()
+        cls = int(np.bincount(class_pixels).argmax())
 
         if cls not in allowed_classes:
             continue
 
         boxes.append([xmin, ymin, xmax, ymax])
-        labels.append(int(cls))
+        labels.append(cls)
 
     return boxes, labels
 
 
 def resize_image_and_boxes(
     image: np.ndarray,
-    boxes: List[List[int]],
-    size: int = 320,
+    boxes: Sequence[Sequence[int]],
+    size: int = DEFAULT_TARGET_SIZE,
 ) -> Tuple[np.ndarray, List[List[float]]]:
     """
-    Resize image to fixed square size and scale bounding boxes accordingly.
+    Resize image to a fixed square size and scale bounding boxes.
 
     Args:
         image (np.ndarray):
-            Input RGB image (H, W, C).
-        boxes (List[List[int]]):
-            Bounding boxes [xmin, ymin, xmax, ymax] in pixel coordinates.
-        size (int, optional):
-            Target size (default: 320).
+            RGB image of shape (H, W, C).
+        boxes (Sequence[Sequence[int]]):
+            Bounding boxes in pixel coordinates:
+            [xmin, ymin, xmax, ymax].
+        size (int):
+            Target square image size.
 
     Returns:
         Tuple[np.ndarray, List[List[float]]]:
-            - resized image (size, size, C)
-            - scaled bounding boxes (pixel coordinates)
+            image_resized:
+                Resized RGB image of shape (size, size, C).
+            boxes_scaled:
+                Bounding boxes scaled to resized image coordinates.
 
     Notes:
-        - No aspect ratio preservation (PhenoBench is square → safe).
+        - Aspect ratio is NOT preserved.
+        - PhenoBench images are square, so distortion is negligible.
         - Output boxes are NOT normalized yet.
     """
     h, w = image.shape[:2]
@@ -140,6 +161,7 @@ def resize_image_and_boxes(
     )
 
     boxes_scaled: List[List[float]] = []
+
     for xmin, ymin, xmax, ymax in boxes:
         boxes_scaled.append([
             xmin * scale_x,
@@ -152,24 +174,22 @@ def resize_image_and_boxes(
 
 
 def normalize_boxes(
-    boxes: List[List[float]],
+    boxes: Sequence[Sequence[float]],
     image_size: int,
 ) -> List[List[float]]:
     """
-    Normalize bounding boxes to [0, 1] range.
+    Normalize bounding boxes to the [0, 1] range.
 
     Args:
-        boxes (List[List[float]]):
-            Bounding boxes in pixel coordinates.
+        boxes (Sequence[Sequence[float]]):
+            Bounding boxes in pixel coordinates:
+            [xmin, ymin, xmax, ymax].
         image_size (int):
-            Size of the (square) image.
+            Square image size.
 
     Returns:
         List[List[float]]:
-            Normalized boxes [xmin, ymin, xmax, ymax].
-
-    Notes:
-        - Required for TensorFlow Object Detection API.
+            Normalized bounding boxes.
     """
     norm_boxes: List[List[float]] = []
 
@@ -188,9 +208,9 @@ def process_sample(
     image: np.ndarray,
     instances: np.ndarray,
     semantics: np.ndarray,
-    size: int = 320,
-    allowed_classes: Tuple[int, ...] = (1, 2),
-    min_area: int = 0,
+    size: int = DEFAULT_TARGET_SIZE,
+    allowed_classes: Tuple[int, ...] = DEFAULT_ALLOWED_CLASSES,
+    min_area: int = DEFAULT_MIN_AREA,
 ):
     """
     Full preprocessing pipeline for one sample.
@@ -212,13 +232,16 @@ def process_sample(
         allowed_classes (Tuple[int, ...]):
             Allowed class IDs.
         min_area (int):
-            Minimum box area.
+            Minimum bounding box area.
 
     Returns:
         Tuple:
-            image_resized (np.ndarray),
-            boxes_normalized (List[List[float]]),
-            labels (List[int])
+            image_resized (np.ndarray):
+                Resized RGB image.
+            boxes_normalized (List[List[float]]):
+                Normalized bounding boxes.
+            labels (List[int]):
+                Class labels.
     """
     boxes, labels = extract_boxes(
         instances,
@@ -233,18 +256,36 @@ def process_sample(
         size=size,
     )
 
-    boxes_normalized = normalize_boxes(boxes_resized, size)
+    boxes_normalized = normalize_boxes(
+        boxes_resized,
+        image_size=size,
+    )
 
     return image_resized, boxes_normalized, labels
 
-import random
 
-
-def split_indices(n, val_ratio=0.5, seed=42):
+def split_indices(
+    n: int,
+    val_ratio: float = 0.5,
+    seed: int = 42,
+):
     """
-    Split indices into val/test.
+    Split indices into validation and test subsets.
 
-    val_ratio = fraction that goes into validation set
+    Args:
+        n (int):
+            Total number of samples.
+        val_ratio (float):
+            Fraction assigned to the validation split.
+        seed (int):
+            Random seed for reproducibility.
+
+    Returns:
+        Tuple[List[int], List[int]]:
+            val_idx:
+                Validation indices.
+            test_idx:
+                Test indices.
     """
     indices = list(range(n))
 
