@@ -236,3 +236,24 @@ def process_sample(
     boxes_normalized = normalize_boxes(boxes_resized, size)
 
     return image_resized, boxes_normalized, labels
+
+import random
+
+
+def split_indices(n, val_ratio=0.5, seed=42):
+    """
+    Split indices into val/test.
+
+    val_ratio = fraction that goes into validation set
+    """
+    indices = list(range(n))
+
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+
+    split = int(n * val_ratio)
+
+    val_idx = indices[:split]
+    test_idx = indices[split:]
+
+    return val_idx, test_idx
