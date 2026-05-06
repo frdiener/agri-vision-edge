@@ -25,7 +25,7 @@ from .common import (
     run_tfod_command,
 )
 
-from agri_vision_edge.evaluation import load_event_scalars
+from ..evaluation.tensorboard import load_event_scalars
 
 
 PathLike = Union[str, Path]
