@@ -21,6 +21,8 @@ from .curves import (
 from .checkpoint import (
     evaluate_checkpoints,
     summarize_checkpoint_metrics,
+    evaluate_checkpoints,
+    find_best_checkpoint,
 )
 
 __all__ = [
@@ -34,5 +36,6 @@ __all__ = [
     "plot_checkpoint_metrics",
     "evaluate_checkpoints",
     "summarize_checkpoint_metrics",
+    "evaluate_checkpoints",
+    "find_best_checkpoint",
 ]
-

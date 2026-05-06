@@ -16,8 +16,6 @@ from .eval import (
     launch_eval,
     list_checkpoints,
     checkpoint_step,
-    evaluate_checkpoints,
-    find_best_checkpoint,
 )
 
 from .export import (
@@ -49,8 +47,6 @@ __all__ = [
     "launch_eval",
     "list_checkpoints",
     "checkpoint_step",
-    "evaluate_checkpoints",
-    "find_best_checkpoint",
 
     #
     # Export
