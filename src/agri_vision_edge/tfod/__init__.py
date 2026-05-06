@@ -8,6 +8,8 @@ from .train import (
     launch_training,
     launch_eval,
 )
+from .export import export_saved_model
+
 
 __all__ = [
     "load_pipeline_config",
@@ -17,4 +19,6 @@ __all__ = [
     "get_tf_models_research_dir",
     "launch_training",
     "launch_eval",
+
+    "export_saved_model",
 ]
