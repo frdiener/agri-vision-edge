@@ -8,6 +8,10 @@ Detection checkpoints and summarizing validation metrics.
 from pathlib import Path
 from typing import Optional, Union, List
 
+import re
+import tempfile
+import shutil
+
 import pandas as pd
 
 from .tensorboard import load_event_scalars
