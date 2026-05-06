@@ -44,7 +44,7 @@ def export_saved_model(
     script = (
         research_dir
         / "object_detection"
-        / "exporter_main_tf2.py"
+        / "exporter_main_v2.py"
     )
 
     args = [
