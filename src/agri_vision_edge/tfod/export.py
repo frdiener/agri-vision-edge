@@ -7,6 +7,8 @@ to TensorFlow SavedModel format.
 
 from pathlib import Path
 from typing import Optional, Union
+import shutil
+import tempfile
 
 from .common import (
     get_tf_models_research_dir,
@@ -35,6 +37,11 @@ def export_saved_model(
     Optionally, a specific checkpoint can be exported
     by providing `checkpoint_path`.
 
+    Since TF-OD's exporter does not support exporting
+    arbitrary checkpoints directly, this helper creates
+    a temporary checkpoint directory containing only the
+    requested checkpoint and its checkpoint state file.
+
     Args:
         pipeline_config_path:
             Path to pipeline.config.
@@ -61,14 +68,56 @@ def export_saved_model(
         / "exporter_main_v2.py"
     )
 
+    trained_checkpoint_dir = Path(
+        trained_checkpoint_dir
+    )
+
     #
-    # TF-OD exporter expects checkpoint path WITHOUT suffix
+    # Optional specific checkpoint export
     #
-    # Example:
-    #   ckpt-12
-    # NOT:
-    #   ckpt-12.index
-    #
+    tmpdir_obj = None
+
+    if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
+
+        #
+        # Create temporary checkpoint directory
+        #
+        tmpdir_obj = tempfile.TemporaryDirectory()
+
+        tmpdir = Path(tmpdir_obj.name)
+
+        #
+        # Copy checkpoint shard files
+        #
+        for suffix in [
+            ".index",
+            ".data-00000-of-00001",
+        ]:
+            src = checkpoint_path.with_suffix(
+                suffix
+            )
+
+            if not src.exists():
+                raise FileNotFoundError(
+                    f"Missing checkpoint file: {src}"
+                )
+
+            dst = tmpdir / src.name
+
+            shutil.copy2(src, dst)
+
+        #
+        # Write TF checkpoint state file
+        #
+        (tmpdir / "checkpoint").write_text(
+            (
+                f'model_checkpoint_path: '
+                f'"{checkpoint_path.name}"\n'
+            )
+        )
+
+        trained_checkpoint_dir = tmpdir
 
     args = [
         "python",
@@ -83,16 +132,16 @@ def export_saved_model(
         str(output_directory),
     ]
 
-    if checkpoint_path is not None:
-        args.extend(
-            [
-                "--checkpoint_path",
-                str(checkpoint_path),
-            ]
+    try:
+        return run_tfod_command(
+            args,
+            log_file=log_file,
+            background=False,
         )
 
-    return run_tfod_command(
-        args,
-        log_file=log_file,
-        background=False,
-    )
+    finally:
+        #
+        # Cleanup temporary checkpoint dir
+        #
+        if tmpdir_obj is not None:
+            tmpdir_obj.cleanup()
