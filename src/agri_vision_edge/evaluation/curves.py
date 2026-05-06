@@ -271,3 +271,55 @@ def plot_steps_per_second(
         save_path=save_path,
         dpi=dpi,
     )
+
+
+def plot_map_curves(
+    df: pd.DataFrame,
+    smoothing: float = 0.0,
+    save_path: Optional[Union[str, Path]] = None,
+    dpi: int = DEFAULT_DPI,
+):
+    """
+    Plot validation mAP metrics.
+    """
+    tags = [
+        "DetectionBoxes_Precision/mAP",
+        "DetectionBoxes_Precision/mAP@.50IOU",
+        "DetectionBoxes_Precision/mAP@.75IOU",
+    ]
+
+    return plot_metric_curves(
+        df=df,
+        tags=tags,
+        title="Validation mAP",
+        ylabel="mAP",
+        smoothing=smoothing,
+        save_path=save_path,
+        dpi=dpi,
+    )
+
+
+def plot_recall_curves(
+    df: pd.DataFrame,
+    smoothing: float = 0.0,
+    save_path: Optional[Union[str, Path]] = None,
+    dpi: int = DEFAULT_DPI,
+):
+    """
+    Plot validation recall metrics.
+    """
+    tags = [
+        "DetectionBoxes_Recall/AR@1",
+        "DetectionBoxes_Recall/AR@10",
+        "DetectionBoxes_Recall/AR@100",
+    ]
+
+    return plot_metric_curves(
+        df=df,
+        tags=tags,
+        title="Validation Recall",
+        ylabel="Average Recall",
+        smoothing=smoothing,
+        save_path=save_path,
+        dpi=dpi,
+    )

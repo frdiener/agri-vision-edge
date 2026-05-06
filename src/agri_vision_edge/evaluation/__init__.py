@@ -14,6 +14,8 @@ from .curves import (
     plot_learning_rate,
     plot_steps_per_second,
     available_tags,
+    plot_map_curves,
+    plot_recall_curves,
 )
 
 __all__ = [
@@ -22,5 +24,7 @@ __all__ = [
     "plot_learning_rate",
     "plot_steps_per_second",
     "available_tags",
+    "plot_map_curves",
+    "plot_recall_curves",
 ]
 
