@@ -16,6 +16,11 @@ from .curves import (
     available_tags,
     plot_map_curves,
     plot_recall_curves,
+    plot_checkpoint_metrics,
+)
+from .checkpoint import (
+    evaluate_checkpoints,
+    summarize_checkpoint_metrics,
 )
 
 __all__ = [
@@ -26,5 +31,8 @@ __all__ = [
     "available_tags",
     "plot_map_curves",
     "plot_recall_curves",
+    "plot_checkpoint_metrics",
+    "evaluate_checkpoints",
+    "summarize_checkpoint_metrics",
 ]
 

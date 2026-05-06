@@ -323,3 +323,52 @@ def plot_recall_curves(
         save_path=save_path,
         dpi=dpi,
     )
+
+def plot_checkpoint_metrics(
+    metrics_df: pd.DataFrame,
+    save_path: Optional[Union[str, Path]] = None,
+):
+    """
+    Plot checkpoint-level validation metrics.
+
+    Args:
+        metrics_df:
+            Output from evaluate_checkpoints().
+        save_path:
+            Optional output path.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    metric_tags = [
+        "DetectionBoxes_Precision/mAP",
+        "DetectionBoxes_Precision/mAP@.50IOU",
+        "DetectionBoxes_Precision/mAP@.75IOU",
+    ]
+
+    for tag in metric_tags:
+        if tag not in metrics_df.columns:
+            continue
+
+        ax.plot(
+            metrics_df["step"],
+            metrics_df[tag],
+            marker="o",
+            label=tag.split("/")[-1],
+        )
+
+    ax.set_title("Validation Detection Metrics")
+    ax.set_xlabel("Checkpoint Step")
+    ax.set_ylabel("Metric Value")
+
+    ax.set_ylim(0.0, 1.0)
+
+    _prepare_axis(ax)
+
+    ax.legend()
+
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+
+    return fig, ax

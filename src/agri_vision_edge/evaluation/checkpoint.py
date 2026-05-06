@@ -1,0 +1,164 @@
+"""
+Checkpoint evaluation and metric aggregation utilities.
+
+Provides helpers for evaluating multiple TensorFlow Object
+Detection checkpoints and summarizing validation metrics.
+"""
+
+from pathlib import Path
+from typing import Optional, Union, List
+
+import pandas as pd
+
+from .tensorboard import load_event_scalars
+from ..tfod.eval import launch_eval
+
+
+PathLike = Union[str, Path]
+
+
+def find_checkpoints(
+    checkpoint_dir: PathLike,
+) -> List[Path]:
+    """
+    Discover TensorFlow checkpoints.
+
+    Args:
+        checkpoint_dir:
+            Directory containing ckpt-* files.
+
+    Returns:
+        Sorted checkpoint base paths.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+
+    checkpoints = []
+
+    for path in checkpoint_dir.glob("ckpt-*.index"):
+        stem = path.with_suffix("")
+        checkpoints.append(stem)
+
+    checkpoints = sorted(
+        checkpoints,
+        key=lambda p: int(p.name.split("-")[-1]),
+    )
+
+    return checkpoints
+
+
+def evaluate_checkpoints(
+    pipeline_config_path: PathLike,
+    checkpoint_dir: PathLike,
+    model_dir: PathLike,
+    metric: str = "DetectionBoxes_Precision/mAP",
+    log_file: Optional[PathLike] = None,
+) -> pd.DataFrame:
+    """
+    Evaluate all checkpoints sequentially.
+
+    Each checkpoint is evaluated independently using
+    TensorFlow Object Detection evaluation mode.
+
+    Args:
+        pipeline_config_path:
+            pipeline.config path.
+        checkpoint_dir:
+            Directory containing checkpoints.
+        model_dir:
+            Output evaluation directory.
+        metric:
+            Primary metric of interest.
+        log_file:
+            Optional evaluation log file.
+
+    Returns:
+        DataFrame containing aggregated metrics.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    model_dir = Path(model_dir)
+
+    checkpoints = find_checkpoints(checkpoint_dir)
+
+    if not checkpoints:
+        raise ValueError(
+            f"No checkpoints found in {checkpoint_dir}"
+        )
+
+    results = []
+
+    for checkpoint in checkpoints:
+        step = int(checkpoint.name.split("-")[-1])
+
+        eval_dir = model_dir / f"eval_ckpt_{step}"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Evaluating checkpoint: {checkpoint.name}")
+
+        launch_eval(
+            pipeline_config_path=pipeline_config_path,
+            checkpoint_dir=checkpoint_dir,
+            model_dir=eval_dir,
+            checkpoint_path=checkpoint,
+            eval_timeout=1,
+            log_file=log_file,
+        )
+
+        eval_event_dir = eval_dir / "eval"
+
+        df = load_event_scalars(eval_event_dir)
+
+        if df.empty:
+            print(f"No metrics found for {checkpoint.name}")
+            continue
+
+        latest_metrics = (
+            df.sort_values("step")
+            .groupby("tag")
+            .tail(1)
+        )
+
+        row = {
+            "checkpoint": str(checkpoint),
+            "step": step,
+        }
+
+        for _, metric_row in latest_metrics.iterrows():
+            row[metric_row["tag"]] = metric_row["value"]
+
+        results.append(row)
+
+    metrics_df = pd.DataFrame(results)
+
+    if metric in metrics_df.columns:
+        metrics_df = metrics_df.sort_values(
+            metric,
+            ascending=False,
+        )
+
+    return metrics_df.reset_index(drop=True)
+
+
+def summarize_checkpoint_metrics(
+    metrics_df: pd.DataFrame,
+    metric: str = "DetectionBoxes_Precision/mAP",
+) -> pd.Series:
+    """
+    Select best checkpoint according to metric.
+
+    Args:
+        metrics_df:
+            Aggregated checkpoint metrics.
+        metric:
+            Metric used for ranking.
+
+    Returns:
+        Best checkpoint row.
+    """
+    if metric not in metrics_df.columns:
+        raise ValueError(
+            f"Metric '{metric}' not found."
+        )
+
+    idx = metrics_df[metric].idxmax()
+
+    return metrics_df.loc[idx]
