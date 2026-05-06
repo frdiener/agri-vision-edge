@@ -1,5 +1,5 @@
 [project]
-name = "ba-project"
+name = "agri-vision-edge"
 version = "0.1.0"
 description = "End-to-end object detection pipeline for precision agriculture on embedded edge platforms (i.MX8MP, i.MX93) using TensorFlow, TFLite, and a fully open-source mainline stack."
 authors = [{ name = "Freimut Diener" }]
