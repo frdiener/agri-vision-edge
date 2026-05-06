@@ -81,18 +81,20 @@ def run_tfod_command(
     """
     env = build_tfod_env()
 
-    stdout = None
-    stderr = None
-
-    if log_file is not None:
-        log_file = Path(log_file)
-
-        log_handle = open(log_file, "w")
-
-        stdout = log_handle
-        stderr = subprocess.STDOUT
+    #
+    # Interactive background mode
+    #
 
     if background:
+        stdout = None
+        stderr = None
+
+        if log_file is not None:
+            log_handle = open(log_file, "w")
+
+            stdout = log_handle
+            stderr = subprocess.STDOUT
+
         return subprocess.Popen(
             args,
             env=env,
@@ -100,13 +102,44 @@ def run_tfod_command(
             stderr=stderr,
         )
 
-    return subprocess.run(
+    #
+    # Blocking streaming mode
+    #
+
+    process = subprocess.Popen(
         args,
         env=env,
-        stdout=stdout,
-        stderr=stderr,
-        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
+
+    log_handle = None
+
+    if log_file is not None:
+        log_handle = open(log_file, "w")
+
+    try:
+        for line in process.stdout:
+            print(line, end="")
+
+            if log_handle is not None:
+                log_handle.write(line)
+
+        process.wait()
+
+    finally:
+        if log_handle is not None:
+            log_handle.close()
+
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            process.returncode,
+            args,
+        )
+
+    return process
 
 
 def launch_training(
