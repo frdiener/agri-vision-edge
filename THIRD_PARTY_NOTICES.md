@@ -10,7 +10,7 @@ This project vendors code from the TensorFlow Models repository:
 * License: Apache License 2.0
 
 The original license and notices are included in:
-third_party/tensorflow_models/LICENSE
+src/agri_vision_edge/third_party/tensorflow_models/LICENSE
 
 This project also vendors code from the PhenoBench repository:
 
@@ -24,4 +24,4 @@ This project also vendors code from the PhenoBench repository:
 * License: MIT License
 
 The original license is included in:
-third_party/phenobench/LICENSE
+src/agri_vision_edge/third_party/phenobench/LICENSE

@@ -3,7 +3,7 @@ Data utilities for PhenoBench preprocessing, TFRecord generation,
 and TFLite representative datasets.
 """
 
-from .phenobench_loader import PhenoBench
+from third_party.phenobench import PhenoBench
 
 from .preprocessing import (
     process_sample,

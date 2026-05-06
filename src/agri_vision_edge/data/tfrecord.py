@@ -34,7 +34,7 @@ from typing import Iterable, Optional, Sequence
 import numpy as np
 import tensorflow as tf
 
-from .phenobench_loader import PhenoBench
+from third_party.phenobench import PhenoBench
 from .preprocessing import process_sample
 
 
