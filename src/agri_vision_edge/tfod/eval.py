@@ -30,6 +30,7 @@ def launch_eval(
     checkpoint_dir: PathLike,
     model_dir: PathLike,
     eval_timeout: int = 1,
+    wait_interval: int = 1,
     log_file: Optional[PathLike] = None,
 ):
     """
@@ -66,6 +67,8 @@ def launch_eval(
         str(checkpoint_dir),
         "--eval_timeout",
         str(eval_timeout),
+        "--wait_interval",
+        str(wait_interval),
         "--alsologtostderr",
     ]
 
