@@ -18,6 +18,7 @@ from .eval import (
 
 from .export import (
     export_saved_model,
+    export_tflite_graph,
 )
 
 
@@ -48,4 +49,5 @@ __all__ = [
     # Export
     #
     "export_saved_model",
+    "export_tflite_graph",
 ]
