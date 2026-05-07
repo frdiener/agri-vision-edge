@@ -21,6 +21,7 @@ def launch_training(
     pipeline_config_path: PathLike,
     model_dir: PathLike,
     checkpoint_every_n: int = 1000,
+    checkpoint_max_to_keep: int = 100,
     log_file: Optional[PathLike] = None,
     background: bool = False,
 ):
@@ -60,6 +61,8 @@ def launch_training(
         "--alsologtostderr",
         "--checkpoint_every_n",
         str(checkpoint_every_n),
+        "--checkpoint_max_to_keep",
+        str(checkpoint_max_to_keep),
     ]
 
     return run_tfod_command(
