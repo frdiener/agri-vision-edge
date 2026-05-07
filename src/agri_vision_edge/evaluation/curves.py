@@ -8,10 +8,20 @@ Provides plots for:
 """
 
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import pandas as pd
+
+
+# =========================================================
+# Global plotting defaults
+# =========================================================
+
+plt.rcParams["axes.spines.top"] = False
+plt.rcParams["axes.spines.right"] = False
+plt.rcParams["figure.dpi"] = 120
+plt.rcParams["savefig.dpi"] = 300
 
 
 DEFAULT_FIGSIZE = (8, 5)
@@ -22,7 +32,12 @@ def _prepare_axis(ax):
     """
     Apply consistent styling to matplotlib axes.
     """
-    ax.grid(True, alpha=0.3)
+    ax.grid(
+        True,
+        alpha=0.25,
+        linewidth=0.8,
+    )
+
     ax.set_axisbelow(True)
 
     ax.spines["top"].set_visible(False)
@@ -324,51 +339,142 @@ def plot_recall_curves(
         dpi=dpi,
     )
 
+
 def plot_checkpoint_metrics(
     metrics_df: pd.DataFrame,
+    figsize=(10, 10),
     save_path: Optional[Union[str, Path]] = None,
+    dpi: int = DEFAULT_DPI,
 ):
     """
     Plot checkpoint-level validation metrics.
 
+    Panels:
+    - Precision metrics
+    - Recall metrics
+    - Loss metrics
+
     Args:
         metrics_df:
             Output from evaluate_checkpoints().
+        figsize:
+            Figure size.
         save_path:
             Optional output path.
-    """
-    fig, ax = plt.subplots(figsize=(8, 5))
+        dpi:
+            Export DPI.
 
-    metric_tags = [
+    Returns:
+        Tuple[Figure, Axes]
+    """
+
+    fig, axes = plt.subplots(
+        3,
+        1,
+        figsize=figsize,
+        sharex=True,
+    )
+
+    precision_ax, recall_ax, loss_ax = axes
+
+    # =========================================================
+    # Precision metrics
+    # =========================================================
+
+    precision_tags = [
         "DetectionBoxes_Precision/mAP",
         "DetectionBoxes_Precision/mAP@.50IOU",
         "DetectionBoxes_Precision/mAP@.75IOU",
     ]
 
-    for tag in metric_tags:
+    for tag in precision_tags:
         if tag not in metrics_df.columns:
             continue
 
-        ax.plot(
+        precision_ax.plot(
             metrics_df["step"],
             metrics_df[tag],
             marker="o",
+            linewidth=2,
             label=tag.split("/")[-1],
         )
 
-    ax.set_title("Validation Detection Metrics")
-    ax.set_xlabel("Checkpoint Step")
-    ax.set_ylabel("Metric Value")
+    precision_ax.set_title("Validation Precision")
+    precision_ax.set_ylabel("mAP")
+    precision_ax.set_ylim(0.0, 1.0)
 
-    ax.set_ylim(0.0, 1.0)
+    _prepare_axis(precision_ax)
 
-    _prepare_axis(ax)
+    precision_ax.legend(frameon=False)
 
-    ax.legend()
+    # =========================================================
+    # Recall metrics
+    # =========================================================
+
+    recall_tags = [
+        "DetectionBoxes_Recall/AR@1",
+        "DetectionBoxes_Recall/AR@10",
+        "DetectionBoxes_Recall/AR@100",
+    ]
+
+    for tag in recall_tags:
+        if tag not in metrics_df.columns:
+            continue
+
+        recall_ax.plot(
+            metrics_df["step"],
+            metrics_df[tag],
+            marker="o",
+            linewidth=2,
+            label=tag.split("/")[-1],
+        )
+
+    recall_ax.set_title("Validation Recall")
+    recall_ax.set_ylabel("Average Recall")
+    recall_ax.set_ylim(0.0, 1.0)
+
+    _prepare_axis(recall_ax)
+
+    recall_ax.legend(frameon=False)
+
+    # =========================================================
+    # Loss metrics
+    # =========================================================
+
+    loss_tags = [
+        "Loss/total_loss",
+        "Loss/classification_loss",
+        "Loss/localization_loss",
+        "Loss/regularization_loss",
+    ]
+
+    for tag in loss_tags:
+        if tag not in metrics_df.columns:
+            continue
+
+        loss_ax.plot(
+            metrics_df["step"],
+            metrics_df[tag],
+            marker="o",
+            linewidth=2,
+            label=tag.split("/")[-1],
+        )
+
+    loss_ax.set_title("Validation Loss")
+    loss_ax.set_xlabel("Checkpoint Step")
+    loss_ax.set_ylabel("Loss")
+
+    _prepare_axis(loss_ax)
+
+    loss_ax.legend(frameon=False)
 
     fig.tight_layout()
 
     if save_path is not None:
-        fig.savefig(save_path, bbox_inches="tight")
+        fig.savefig(
+            save_path,
+            bbox_inches="tight",
+            dpi=dpi,
+        )
 
-    return fig, ax
+    return fig, axes
