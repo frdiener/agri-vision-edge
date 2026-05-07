@@ -34,7 +34,7 @@ from typing import Iterable, List, Optional
 
 import numpy as np
 
-from third_party.phenobench import PhenoBench
+from ..third_party.phenobench import PhenoBench
 from .preprocessing import (
     DEFAULT_ALLOWED_CLASSES,
     DEFAULT_MIN_AREA,
