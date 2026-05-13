@@ -713,6 +713,27 @@ def train_loop(
             manager.save()
             checkpointed_step = int(global_step.value())
 
+            print(f"\nRunning evaluation at step {int(global_step.value())}")
+
+            eval_input = strategy.experimental_distribute_dataset(
+                inputs.eval_input(
+                    eval_config=configs['eval_config'],
+                    eval_input_config=configs['eval_input_configs'][0],
+                    model_config=model_config,
+                    model=detection_model
+                )
+            )
+
+            metrics = eager_eval_loop(
+                detection_model,
+                configs,
+                eval_input,
+                use_tpu=use_tpu,
+                global_step=global_step
+            )
+
+            print(metrics)
+
   # Remove the checkpoint directories of the non-chief workers that
   # MultiWorkerMirroredStrategy forces us to save during sync distributed
   # training.
