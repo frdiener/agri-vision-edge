@@ -17,7 +17,7 @@ from object_detection.protos import pipeline_pb2
 PathLike = Union[str, Path]
 
 
-def load_pipeline_config(config_path: PathLike):
+def load_pipeline_config(config_path: PathLike) -> pipeline_pb2.TrainEvalPipelineConfig:
     """
     Load a TF-OD pipeline config protobuf.
 
@@ -73,6 +73,7 @@ def configure_ssd_pipeline(
     learning_rate_base: float = 0.004,
     warmup_learning_rate: float = 0.001,
     warmup_steps: int = 500,
+    qat_delay: int|None = None,
 ) -> None:
     """
     Configure an SSD-based TF-OD pipeline config.
@@ -111,6 +112,8 @@ def configure_ssd_pipeline(
             Warmup learning rate.
         warmup_steps:
             Warmup schedule length.
+        qat_delay:
+            Steps, after which to start quantization aware training.
     """
     pipeline_config = load_pipeline_config(config_path)
 
@@ -180,6 +183,13 @@ def configure_ssd_pipeline(
     pipeline_config.eval_input_reader[0].tf_record_input_reader.input_path[:] = [
         str(val_record)
     ]
+
+    #
+    # Quantization Aware Training
+    #
+
+    if qat_delay is not None:
+        pipeline_config.graph_rewriter.quantization.delay = qat_delay
 
     save_pipeline_config(
         pipeline_config,
