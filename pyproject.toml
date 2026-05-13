@@ -14,7 +14,7 @@ keywords = [
   "imx8mp",
   "imx93"
 ]
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.8,<3.11"
 dependencies = [
     "apache-beam>=2.73.0",
     "avro-python3>=1.10.2",
