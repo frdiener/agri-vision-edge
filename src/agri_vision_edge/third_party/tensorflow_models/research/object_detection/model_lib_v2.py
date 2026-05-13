@@ -702,18 +702,10 @@ def train_loop(
           if global_step.value() - logged_step >= LOG_EVERY:
             logged_dict_np = {name: value.numpy() for name, value in
                               logged_dict.items()}
-          #   tf.logging.info(
-          #       'Step {} per-step time {:.3f}s'.format(
-          #           global_step.value(), time_taken / num_steps_per_iteration))
-          #   tf.logging.info(pprint.pformat(logged_dict_np, width=40))
-
             print(
-                  f"Step {int(global_step.value())} | "
-                  f"loss={logged_dict_np['Loss/total_loss']:.4f} | "
-                  f"lr={logged_dict_np['learning_rate']:.6f} | "
-                  f"time={time_taken/num_steps_per_iteration:.3f}s"
-            )
-
+                'Step {} per-step time {:.3f}s'.format(
+                    global_step.value(), time_taken / num_steps_per_iteration))
+            print(pprint.pformat(logged_dict_np, width=40))
             logged_step = global_step.value()
 
           if ((int(global_step.value()) - checkpointed_step) >=
