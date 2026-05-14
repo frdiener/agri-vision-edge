@@ -459,7 +459,6 @@ def train_loop(
     eval_metric_key='DetectionBoxes_Precision/mAP',
     early_stopping_patience=10,
     early_stopping_min_delta=0.002,
-    save_best_checkpoint=True,
     save_metrics_history=True,
 
     **kwargs):
