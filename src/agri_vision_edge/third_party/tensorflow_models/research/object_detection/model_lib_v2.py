@@ -806,12 +806,18 @@ def train_loop(
 
                   print(f"\nSaved BEST checkpoint: {best_path}")
 
+                  metrics_float = {
+                      k: float(v.numpy()) if hasattr(v, 'numpy') else float(v)
+                      for k, v in metrics.items()
+                  }
+
                   best_metadata = {
                       'step': int(global_step.value()),
                       'metric_name': eval_metric_key,
                       'metric_value': float(best_metric),
                       'checkpoint': best_path,
-                      'timestamp': time.time()
+                      'timestamp': time.time(),
+                      'all_metrics': metrics_float
                   }
 
                   with open(
