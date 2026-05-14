@@ -17,6 +17,7 @@ from .curves import (
     plot_map_curves,
     plot_recall_curves,
     plot_checkpoint_metrics,
+    plot_metric_curves,
 )
 from .checkpoint import (
     evaluate_checkpoints,
@@ -41,5 +42,5 @@ __all__ = [
     "find_best_checkpoint",
     "list_checkpoints",
     "checkpoint_step",
-
+    "plot_metric_curves",
 ]
