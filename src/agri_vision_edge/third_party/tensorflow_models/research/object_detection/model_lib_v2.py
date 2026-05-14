@@ -636,6 +636,18 @@ def train_loop(
         manager = tf.compat.v2.train.CheckpointManager(
             ckpt, manager_dir, max_to_keep=checkpoint_max_to_keep)
 
+        best_manager = None
+
+        if save_best_checkpoint:
+
+          tf.io.gfile.makedirs(best_ckpt_dir)
+
+          best_manager = tf.compat.v2.train.CheckpointManager(
+              ckpt,
+              best_ckpt_dir,
+              max_to_keep=5
+          )
+
         # We use the following instead of manager.latest_checkpoint because
         # manager_dir does not point to the model directory when we are running
         # in a worker.
@@ -806,12 +818,9 @@ def train_loop(
 
                   if save_best_checkpoint:
 
-                    best_ckpt_prefix = os.path.join(
-                        best_ckpt_dir,
-                        'ckpt'
-                    )
+                    best_path = best_manager.save()
 
-                    ckpt.save(best_ckpt_prefix)
+                    print(f"\nSaved BEST checkpoint: {best_path}")
 
                     with open(
                         os.path.join(best_ckpt_dir, 'best_metric.txt'),
