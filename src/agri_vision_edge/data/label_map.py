@@ -13,7 +13,7 @@ DEFAULT_LABELS = {
 
 def write_label_map(
     target,
-    labels=DEFAULT_LABELS,
+    labels=None,
 ):
     """
     Write a TensorFlow Object Detection API label map.
@@ -24,11 +24,16 @@ def write_label_map(
         labels:
             Mapping from class ID to class name.
     """
+    if labels is None:
+        labels = DEFAULT_LABELS
+
     target = Path(target)
 
     lines = []
 
-    for class_id, class_name in labels.items():
+    for class_id in sorted(labels):
+        class_name = labels[class_id]
+
         lines.extend([
             "item {",
             f"  id: {class_id}",

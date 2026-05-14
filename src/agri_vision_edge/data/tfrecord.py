@@ -47,6 +47,10 @@ CLASS_NAMES = {
     2: b"weed",
 }
 
+DEFAULT_LABEL_MAP = {
+    1: 1,
+    2: 2,
+}
 
 def pil_to_numpy(img) -> np.ndarray:
     """
@@ -67,6 +71,7 @@ def create_tf_example(
     image: np.ndarray,
     boxes: Sequence[Sequence[float]],
     labels: Sequence[int],
+    class_names=CLASS_NAMES,
 ) -> tf.train.Example:
     """
     Create a TensorFlow Example from one preprocessed sample.
@@ -95,7 +100,7 @@ def create_tf_example(
     ymaxs = [float(b[3]) for b in boxes]
 
     classes = [int(label) for label in labels]
-    classes_text = [CLASS_NAMES[label] for label in labels]
+    classes_text = [class_names[label] for label in labels]
 
     feature = {
         "image/height": tf.train.Feature(
@@ -106,6 +111,9 @@ def create_tf_example(
         ),
         "image/encoded": tf.train.Feature(
             bytes_list=tf.train.BytesList(value=[encoded])
+        ),
+        "image/format": tf.train.Feature(
+            bytes_list=tf.train.BytesList(value=[b"jpeg"])
         ),
 
         "image/object/bbox/xmin": tf.train.Feature(
@@ -140,6 +148,10 @@ def build_record(
     indices: Optional[Iterable[int]] = None,
     target_size: int = DEFAULT_TARGET_SIZE,
     with_tqdm: bool = False,
+    allowed_classes = DEFAULT_ALLOWED_CLASSES,
+    skip_empty_samples = False,
+    label_map=DEFAULT_LABEL_MAP,
+    class_names=CLASS_NAMES,
 ):
     """
     Build a TFRecord file from a PhenoBench dataset.
@@ -200,19 +212,26 @@ def build_record(
             instances=instances,
             semantics=semantics,
             size=target_size,
-            allowed_classes=DEFAULT_ALLOWED_CLASSES,
+            allowed_classes=allowed_classes,
             min_area=DEFAULT_MIN_AREA,
         )
 
+        labels = [
+            label_map[label]
+            for label in labels
+        ]
+
         # Skip empty samples
-        if len(boxes) == 0:
-            skipped += 1
-            continue
+        if skip_empty_samples:
+            if len(boxes) == 0:
+                skipped += 1
+                continue
 
         example = create_tf_example(
             image_resized,
             boxes,
             labels,
+            class_names=class_names,
         )
 
         writer.write(example.SerializeToString())
