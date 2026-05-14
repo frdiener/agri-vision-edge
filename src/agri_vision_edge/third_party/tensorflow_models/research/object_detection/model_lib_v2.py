@@ -754,6 +754,9 @@ def train_loop(
                     global_step=global_step
                 )
 
+                detection_model._is_training = True
+                tf.keras.backend.set_learning_phase(True)
+
                 metric_value = float(metrics[eval_metric_key])
 
                 # log metric history
