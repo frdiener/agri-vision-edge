@@ -515,7 +515,6 @@ def train_loop(
   patience_counter = 0
   metrics_history = []
 
-  best_ckpt_dir = os.path.join(model_dir, 'best_ckpt')
   history_path = os.path.join(model_dir, 'metrics_history.json')
   
   configs = get_configs_from_pipeline_file(
@@ -636,18 +635,6 @@ def train_loop(
         manager = tf.compat.v2.train.CheckpointManager(
             ckpt, manager_dir, max_to_keep=checkpoint_max_to_keep)
 
-        best_manager = None
-
-        if save_best_checkpoint:
-
-          tf.io.gfile.makedirs(best_ckpt_dir)
-
-          best_manager = tf.compat.v2.train.CheckpointManager(
-              ckpt,
-              best_ckpt_dir,
-              max_to_keep=5
-          )
-
         # We use the following instead of manager.latest_checkpoint because
         # manager_dir does not point to the model directory when we are running
         # in a worker.
@@ -742,7 +729,6 @@ def train_loop(
             if ((int(global_step.value()) - checkpointed_step) >=
                 checkpoint_every_n):
 
-              manager.save()
               checkpointed_step = int(global_step.value())
 
               print(f"\nRunning evaluation at step {int(global_step.value())}")
@@ -816,19 +802,24 @@ def train_loop(
                       f"{old_best:.5f} -> {best_metric:.5f}"
                   )
 
-                  if save_best_checkpoint:
 
-                    best_path = best_manager.save()
+                  best_path = manager.save()
 
-                    print(f"\nSaved BEST checkpoint: {best_path}")
+                  print(f"\nSaved BEST checkpoint: {best_path}")
 
-                    with open(
-                        os.path.join(best_ckpt_dir, 'best_metric.txt'),
-                        'w'
-                    ) as f:
-                      f.write(
-                          f"{eval_metric_key}: {best_metric}\n"
-                      )
+                  best_metadata = {
+                      'step': int(global_step.value()),
+                      'metric_name': eval_metric_key,
+                      'metric_value': float(best_metric),
+                      'checkpoint': best_path,
+                      'timestamp': time.time()
+                  }
+
+                  with open(
+                      os.path.join(model_dir, 'best_metric.json'),
+                      'w'
+                  ) as f:
+                    json.dump(best_metadata, f, indent=2)
 
                 else:
 
