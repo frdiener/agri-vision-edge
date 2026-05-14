@@ -746,6 +746,9 @@ def train_loop(
 
               with eval_summary_writer.as_default():
 
+                if train_config.optimizer.use_moving_average:
+                  optimizer.swap_weights()
+
                 metrics = eager_eval_loop(
                     detection_model,
                     configs,
@@ -753,6 +756,9 @@ def train_loop(
                     use_tpu=use_tpu,
                     global_step=global_step
                 )
+
+                if train_config.optimizer.use_moving_average:
+                  optimizer.swap_weights()
 
                 detection_model._is_training = True
                 tf.keras.backend.set_learning_phase(True)
