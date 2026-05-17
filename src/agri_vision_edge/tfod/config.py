@@ -234,22 +234,71 @@ def configure_ssd_pipeline(
     # Anchor tuning
     #
 
-    anchor_gen = (
+    anchor_generator = (
         pipeline_config
         .model
         .ssd
         .anchor_generator
-        .ssd_anchor_generator
     )
 
-    anchor_gen.min_scale = anchor_min_scale
-    anchor_gen.max_scale = anchor_max_scale
-
-    del anchor_gen.aspect_ratios[:]
-
-    anchor_gen.aspect_ratios.extend(
-        anchor_aspect_ratios
+    anchor_generator_type = anchor_generator.WhichOneof(
+        "anchor_generator_oneof"
     )
+
+    #
+    # Classic SSD
+    #
+
+    if anchor_generator_type == "ssd_anchor_generator":
+
+        ssd_anchor_gen = anchor_generator.ssd_anchor_generator
+
+        ssd_anchor_gen.min_scale = anchor_min_scale
+        ssd_anchor_gen.max_scale = anchor_max_scale
+
+        del ssd_anchor_gen.aspect_ratios[:]
+
+        ssd_anchor_gen.aspect_ratios.extend(
+            anchor_aspect_ratios
+        )
+
+    #
+    # FPN / RetinaNet-style
+    #
+
+    elif anchor_generator_type == "multiscale_anchor_generator":
+
+        multiscale_anchor_gen = (
+            anchor_generator.multiscale_anchor_generator
+        )
+
+        #
+        # Smaller anchor scale for tiny agricultural objects
+        #
+
+        # multiscale_anchor_gen.anchor_scale = (
+        #     anchor_min_scale * image_size
+        # )
+        multiscale_anchor_gen.anchor_scale = 2.0
+
+        #
+        # Reduce scale density
+        #
+
+        multiscale_anchor_gen.scales_per_octave = 1
+
+        del multiscale_anchor_gen.aspect_ratios[:]
+
+        multiscale_anchor_gen.aspect_ratios.extend(
+            anchor_aspect_ratios
+        )
+
+    else:
+
+        raise ValueError(
+            f"Unsupported anchor generator: "
+            f"{anchor_generator_type}"
+        )
 
     #
     # Matcher Thresholds
