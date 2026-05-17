@@ -81,6 +81,10 @@ def configure_ssd_pipeline(
     matched_threshold: float = 0.4,
     unmatched_threshold: float = 0.4,
     use_random_crop: bool = False,
+    nms_score_threshold: float = 0.05,
+    nms_iou_threshold: float = 0.5,
+    max_detections_per_class: int = 100,
+    max_total_detections: int = 100,
 ) -> None:
     """
     Configure an SSD-based TF-OD pipeline config.
@@ -314,6 +318,23 @@ def configure_ssd_pipeline(
 
     matcher.matched_threshold = matched_threshold
     matcher.unmatched_threshold = unmatched_threshold
+
+    #
+    # Post-processing / NMS
+    #
+
+    nms = (
+        pipeline_config
+        .model
+        .ssd
+        .post_processing
+        .batch_non_max_suppression
+    )
+
+    nms.score_threshold = nms_score_threshold
+    nms.iou_threshold = nms_iou_threshold
+    nms.max_detections_per_class = max_detections_per_class
+    nms.max_total_detections = max_total_detections
 
     save_pipeline_config(
         pipeline_config,
