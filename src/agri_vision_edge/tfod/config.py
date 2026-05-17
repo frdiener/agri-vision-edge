@@ -136,7 +136,10 @@ def configure_ssd_pipeline(
 
             aug_name = aug.WhichOneof("preprocessing_step")
 
-            if aug_name != "ssd_random_crop":
+            if aug_name not in {
+                "ssd_random_crop",
+                "random_crop_image",
+            }:
                 kept_augmentations.append(aug)
 
         del pipeline_config.train_config.data_augmentation_options[:]
