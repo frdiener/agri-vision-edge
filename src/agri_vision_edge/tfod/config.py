@@ -78,6 +78,8 @@ def configure_ssd_pipeline(
     anchor_min_scale: float = 0.03,
     anchor_max_scale: float = 0.35,
     anchor_aspect_ratios: tuple[float, ...] = (1.0,),
+    matched_threshold: float = 0.4,
+    unmatched_threshold: float = 0.4,
     use_random_crop: bool = False,
 ) -> None:
     """
@@ -245,6 +247,22 @@ def configure_ssd_pipeline(
     anchor_gen.aspect_ratios.extend(
         anchor_aspect_ratios
     )
+
+    #
+    # Matcher Thresholds
+    #
+
+    matcher = (
+        pipeline_config
+        .model
+        .ssd
+        .matcher
+        .argmax_matcher
+    )
+
+    matcher.matched_threshold = matched_threshold
+    matcher.unmatched_threshold = unmatched_threshold
+
     save_pipeline_config(
         pipeline_config,
         output_path,
