@@ -74,6 +74,7 @@ def configure_ssd_pipeline(
     warmup_learning_rate: float = 0.001,
     warmup_steps: int = 500,
     qat_delay: int|None = None,
+    image_size: int = 320
 ) -> None:
     """
     Configure an SSD-based TF-OD pipeline config.
@@ -190,6 +191,13 @@ def configure_ssd_pipeline(
 
     if qat_delay is not None:
         pipeline_config.graph_rewriter.quantization.delay = qat_delay
+
+    #
+    # Set input image size
+    #
+
+    pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.height = image_size
+    pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.width = image_size
 
     save_pipeline_config(
         pipeline_config,
