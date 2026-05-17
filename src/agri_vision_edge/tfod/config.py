@@ -74,7 +74,10 @@ def configure_ssd_pipeline(
     warmup_learning_rate: float = 0.001,
     warmup_steps: int = 500,
     qat_delay: int|None = None,
-    image_size: int = 320
+    image_size: int = 320,
+    anchor_min_scale: float = 0.03,
+    anchor_max_scale: float = 0.35,
+    anchor_aspect_ratios: tuple[float, ...] = (1.0,),
 ) -> None:
     """
     Configure an SSD-based TF-OD pipeline config.
@@ -199,6 +202,27 @@ def configure_ssd_pipeline(
     pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.height = image_size
     pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.width = image_size
 
+
+    #
+    # Anchor tuning
+    #
+
+    anchor_gen = (
+        pipeline_config
+        .model
+        .ssd
+        .anchor_generator
+        .ssd_anchor_generator
+    )
+
+    anchor_gen.min_scale = anchor_min_scale
+    anchor_gen.max_scale = anchor_max_scale
+
+    del anchor_gen.aspect_ratios[:]
+
+    anchor_gen.aspect_ratios.extend(
+        anchor_aspect_ratios
+    )
     save_pipeline_config(
         pipeline_config,
         output_path,
