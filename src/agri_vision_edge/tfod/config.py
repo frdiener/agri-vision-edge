@@ -78,6 +78,7 @@ def configure_ssd_pipeline(
     anchor_min_scale: float = 0.03,
     anchor_max_scale: float = 0.35,
     anchor_aspect_ratios: tuple[float, ...] = (1.0,),
+    use_random_crop: bool = False,
 ) -> None:
     """
     Configure an SSD-based TF-OD pipeline config.
@@ -120,6 +121,27 @@ def configure_ssd_pipeline(
             Steps, after which to start quantization aware training.
     """
     pipeline_config = load_pipeline_config(config_path)
+
+    #
+    # Data augmentation
+    #
+
+    if not use_random_crop:
+
+        kept_augmentations = []
+
+        for aug in pipeline_config.train_config.data_augmentation_options:
+
+            aug_name = aug.WhichOneof("preprocessing_step")
+
+            if aug_name != "ssd_random_crop":
+                kept_augmentations.append(aug)
+
+        del pipeline_config.train_config.data_augmentation_options[:]
+
+        pipeline_config.train_config.data_augmentation_options.extend(
+            kept_augmentations
+        )
 
     #
     # Model
