@@ -107,7 +107,12 @@ class PhenoBench:
 
           sample["plant_bboxes"] = []
           for label in [1, 2]:
-            for plant_id in np.unique(plant_instances[semantics == label]):
+            for plant_id in np.unique(
+                plant_instances[
+                    (semantics == label) &
+                    (plant_instances > 0)
+                ]
+            ):
               ys, xs = np.where((plant_instances == plant_id) & (semantics == label))
 
               width, height = np.max(xs) - np.min(xs), np.max(ys) - np.min(ys)
