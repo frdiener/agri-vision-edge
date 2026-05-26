@@ -13,7 +13,7 @@ from typing import Union
 import tensorflow as tf
 from google.protobuf import text_format
 
-from third_party.tensorflow_models.research.object_detection.protos import pipeline_pb2
+from object_detection.protos import pipeline_pb2
 
 from experiment.finetune import FineTuneConfig
 
