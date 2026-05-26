@@ -63,7 +63,7 @@ def capture_system_environment() -> dict[str, Any]:
 
 
 # ============================================================
-# TensorFlow (optional)
+# TensorFlow
 # ============================================================
 
 def capture_tensorflow_environment() -> dict[str, Any] | None:
