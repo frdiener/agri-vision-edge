@@ -232,4 +232,14 @@ def export_coco_annotations(
         f"Wrote COCO annotations: {target}"
     )
 
-    return coco
+    return {
+
+        "images":
+            len(images),
+
+        "annotations":
+            len(annotations),
+
+        "categories":
+            len(dataset_definition.categories),
+    }
