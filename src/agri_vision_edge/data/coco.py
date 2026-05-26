@@ -6,6 +6,14 @@ Provides:
 - COCO annotation export
 - bbox conversion helpers
 - image registry creation
+
+Exports are generated from canonical
+DatasetDefinition objects to support:
+
+- multiclass detection
+- binary detection
+- semantic label remapping
+- framework-independent evaluation
 """
 
 from __future__ import annotations
@@ -41,10 +49,10 @@ def phenobench_bbox_to_xyxy(
     ymax = ymin + height
 
     return [
-        xmin,
-        ymin,
-        xmax,
-        ymax,
+        float(xmin),
+        float(ymin),
+        float(xmax),
+        float(ymax),
     ]
 
 
@@ -65,17 +73,17 @@ def xyxy_to_coco(
     xmin, ymin, xmax, ymax = box
 
     return [
-        xmin,
-        ymin,
-        xmax - xmin,
-        ymax - ymin,
+        float(xmin),
+        float(ymin),
+        float(xmax - xmin),
+        float(ymax - ymin),
     ]
 
 
 def export_coco_annotations(
     target,
     dataset,
-    categories,
+    dataset_definition,
     indices=None,
 ):
     """
@@ -90,8 +98,8 @@ def export_coco_annotations(
 
                 target_types=["plant_bboxes"]
 
-        categories:
-            COCO category definitions.
+        dataset_definition:
+            Canonical dataset definition.
 
         indices:
             Optional subset indices.
@@ -141,6 +149,27 @@ def export_coco_annotations(
 
         for bbox in sample["plant_bboxes"]:
 
+            source_label = int(
+                bbox["label"]
+            )
+
+            #
+            # Skip labels not exported by this
+            # dataset definition
+            #
+
+            if (
+                source_label
+                not in dataset_definition.label_mapping
+            ):
+                continue
+
+            target_label = (
+                dataset_definition.label_mapping[
+                    source_label
+                ]
+            )
+
             xyxy = phenobench_bbox_to_xyxy(
                 bbox
             )
@@ -163,7 +192,7 @@ def export_coco_annotations(
                     int(image_id),
 
                 "category_id":
-                    int(bbox["label"]),
+                    int(target_label),
 
                 "bbox": [
                     float(v)
@@ -176,7 +205,7 @@ def export_coco_annotations(
                 "iscrowd":
                     0,
             })
-            
+
             annotation_id += 1
 
     coco = {
@@ -188,7 +217,7 @@ def export_coco_annotations(
             annotations,
 
         "categories":
-            categories,
+            dataset_definition.categories,
     }
 
     with open(target, "w") as f:

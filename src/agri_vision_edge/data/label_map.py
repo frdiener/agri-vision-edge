@@ -10,10 +10,14 @@ from .categories import (
     build_category_map,
 )
 
+from .datasets import (
+    DatasetDefinition,
+)
+
 
 def write_label_map(
     target,
-    categories,
+    dataset_definition: DatasetDefinition,
 ):
     """
     Write TFOD label map.
@@ -22,12 +26,12 @@ def write_label_map(
         target:
             Output path.
 
-        categories:
-            Category definitions.
+        dataset_definition:
+            Canonical dataset definition.
     """
 
     category_map = build_category_map(
-        categories
+        dataset_definition.categories
     )
 
     target = Path(target)

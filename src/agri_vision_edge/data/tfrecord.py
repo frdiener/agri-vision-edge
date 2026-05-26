@@ -16,6 +16,10 @@ from .categories import (
     build_class_names,
 )
 
+from .datasets import (
+    DatasetDefinition,
+)
+
 from .coco import (
     phenobench_bbox_to_xyxy,
 )
@@ -45,7 +49,21 @@ def create_tf_example(
 ):
     """
     Create TensorFlow Example.
+
+    Args:
+        image:
+            RGB image.
+
+        boxes:
+            Normalized bounding boxes.
+
+        labels:
+            Exported class labels.
+
+        categories:
+            Exported category definitions.
     """
+
     class_names = build_class_names(
         categories
     )
@@ -155,12 +173,28 @@ def create_tf_example(
 def build_record(
     target,
     dataset,
-    categories,
+    dataset_definition: DatasetDefinition,
     indices: Iterable[int] | None = None,
     target_size: int = DEFAULT_TARGET_SIZE,
 ):
     """
     Build TFRecord dataset.
+
+    Args:
+        target:
+            Output TFRecord path.
+
+        dataset:
+            PhenoBench dataset.
+
+        dataset_definition:
+            Canonical dataset definition.
+
+        indices:
+            Optional subset indices.
+
+        target_size:
+            Target image size.
     """
 
     writer = tf.io.TFRecordWriter(
@@ -186,14 +220,35 @@ def build_record(
 
         for bbox in sample["plant_bboxes"]:
 
+            source_label = int(
+                bbox["label"]
+            )
+
+            #
+            # Skip labels not exported
+            # by this dataset definition
+            #
+
+            if (
+                source_label
+                not in dataset_definition.label_mapping
+            ):
+                continue
+
+            target_label = (
+                dataset_definition.label_mapping[
+                    source_label
+                ]
+            )
+
+            labels.append(
+                target_label
+            )
+
             raw_boxes.append(
                 phenobench_bbox_to_xyxy(
                     bbox
                 )
-            )
-
-            labels.append(
-                bbox["label"]
             )
 
         if not raw_boxes:
@@ -213,10 +268,14 @@ def build_record(
         )
 
         example = create_tf_example(
+
             image=image_resized,
+
             boxes=boxes_normalized,
+
             labels=labels,
-            categories=categories,
+
+            categories=dataset_definition.categories,
         )
 
         writer.write(
