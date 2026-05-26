@@ -127,16 +127,16 @@ def export_coco_annotations(
         images.append({
 
             "id":
-                image_id,
+                int(image_id),
 
             "file_name":
-                image_name,
+                str(image_name),
 
             "width":
-                w,
+                int(w),
 
             "height":
-                h,
+                int(h),
         })
 
         for bbox in sample["plant_bboxes"]:
@@ -157,24 +157,26 @@ def export_coco_annotations(
             annotations.append({
 
                 "id":
-                    annotation_id,
+                    int(annotation_id),
 
                 "image_id":
-                    image_id,
+                    int(image_id),
 
                 "category_id":
-                    bbox["label"],
+                    int(bbox["label"]),
 
-                "bbox":
-                    coco_bbox,
+                "bbox": [
+                    float(v)
+                    for v in coco_bbox
+                ],
 
                 "area":
-                    area,
+                    float(area),
 
                 "iscrowd":
                     0,
             })
-
+            
             annotation_id += 1
 
     coco = {
