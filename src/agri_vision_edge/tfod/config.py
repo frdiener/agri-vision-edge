@@ -15,7 +15,7 @@ from google.protobuf import text_format
 
 from object_detection.protos import pipeline_pb2
 
-from experiment.finetune import FineTuneConfig
+from ..experiment.finetune import FineTuneConfig
 
 
 PathLike = Union[str, Path]
