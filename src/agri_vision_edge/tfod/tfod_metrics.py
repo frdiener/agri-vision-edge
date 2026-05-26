@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Union
 
-from evaluation.metrics import CocoMetrics
+from ..evaluation.metrics import CocoMetrics
 
 
 PathLike = Union[str, Path]
