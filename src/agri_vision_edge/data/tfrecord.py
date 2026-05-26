@@ -289,3 +289,12 @@ def build_record(
     print(
         f"{target} → written: {written}"
     )
+
+    return {
+
+        "written":
+            written,
+
+        "target_size":
+            target_size,
+    }
