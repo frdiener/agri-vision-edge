@@ -1,38 +1,44 @@
 """
-Utilities for TensorFlow Object Detection label maps.
+TensorFlow Object Detection label map utilities.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
-
-DEFAULT_LABELS = {
-    1: "crop",
-    2: "weed",
-}
+from .categories import (
+    build_category_map,
+)
 
 
 def write_label_map(
     target,
-    labels=None,
+    categories,
 ):
     """
-    Write a TensorFlow Object Detection API label map.
+    Write TFOD label map.
 
     Args:
         target:
-            Output path for label_map.pbtxt.
-        labels:
-            Mapping from class ID to class name.
+            Output path.
+
+        categories:
+            Category definitions.
     """
-    if labels is None:
-        labels = DEFAULT_LABELS
+
+    category_map = build_category_map(
+        categories
+    )
 
     target = Path(target)
 
     lines = []
 
-    for class_id in sorted(labels):
-        class_name = labels[class_id]
+    for class_id in sorted(category_map):
+
+        class_name = (
+            category_map[class_id]
+        )
 
         lines.extend([
             "item {",
@@ -42,6 +48,10 @@ def write_label_map(
             "",
         ])
 
-    target.write_text("\n".join(lines))
+    target.write_text(
+        "\n".join(lines)
+    )
 
-    print(f"Wrote label map to: {target}")
+    print(
+        f"Wrote label map: {target}"
+    )

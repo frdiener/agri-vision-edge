@@ -1,13 +1,38 @@
 """
-Data utilities for PhenoBench preprocessing, TFRecord generation,
-and TFLite representative datasets.
+Dataset utilities.
+
+Provides:
+
+- TFRecord export
+- COCO export
+- representative datasets
+- preprocessing
+- label maps
 """
 
-from ..third_party.phenobench import PhenoBench
+from ..third_party.phenobench import (
+    PhenoBench,
+)
+
+from .datasets import (
+    DatasetDefinition,
+    PHENOBENCH_MULTICLASS,
+    PHENOBENCH_WEED_ONLY,
+)
+
+from .categories import (
+    build_category_map,
+    build_class_names,
+)
 
 from .preprocessing import (
-    process_sample,
+    resize_image_and_boxes,
+    normalize_boxes,
     split_indices,
+)
+
+from .coco import (
+    export_coco_annotations,
 )
 
 from .tfrecord import (
@@ -15,8 +40,8 @@ from .tfrecord import (
 )
 
 from .rep_dataset import (
-    build_rep_indices,
     representative_dataset,
+    build_rep_indices,
 )
 
 from .label_map import (
@@ -25,14 +50,17 @@ from .label_map import (
 
 __all__ = [
     "PhenoBench",
-
-    "process_sample",
+    "DatasetDefinition",
+    "PHENOBENCH_MULTICLASS",
+    "PHENOBENCH_WEED_ONLY",
+    "build_category_map",
+    "build_class_names",
+    "resize_image_and_boxes",
+    "normalize_boxes",
     "split_indices",
-
+    "export_coco_annotations",
     "build_record",
-
-    "build_rep_indices",
     "representative_dataset",
-
+    "build_rep_indices",
     "write_label_map",
 ]
