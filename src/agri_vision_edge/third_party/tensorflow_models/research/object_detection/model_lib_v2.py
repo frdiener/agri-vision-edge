@@ -837,6 +837,8 @@ def train_loop(
                   print(
                       f"\nNo improvement in "
                       f"{eval_metric_key}. "
+                      f"Best value still "
+                      f"{best_metric}. "
                       f"Patience: "
                       f"{patience_counter}/"
                       f"{early_stopping_patience}"
