@@ -765,8 +765,9 @@ def train_loop(
                 # log metric history
                 metrics_history.append({
                     'step': int(global_step.value()),
-                    'metric': metric_value,
-                    'metrics': {
+                    'key_metric': metric_value,
+                    'train_metrics': logged_dict_np,
+                    'eval_metrics': {
                         k: float(v.numpy()) if hasattr(v, 'numpy') else float(v)
                         for k, v in metrics.items()
                     }
