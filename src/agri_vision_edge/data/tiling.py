@@ -449,6 +449,149 @@ class TiledPhenoBench:
             "tile": self.tiles[tile_index],
         }
 
+    @property
+    def source_dataset(self):
+        return self.dataset
+
+
+class ConcatDataset:
+    """
+    Concatenate multiple datasets.
+
+    Example
+    -------
+
+    full_dataset = PhenoBench(...)
+
+    tiled_dataset = TiledPhenoBench(
+        full_dataset,
+        rows=2,
+        cols=2,
+        overlap=0.25,
+    )
+
+    train_dataset = ConcatDataset(
+        full_dataset,
+        tiled_dataset,
+    )
+
+    len(train_dataset)
+
+    ==
+
+    len(full_dataset)
+    +
+    len(tiled_dataset)
+    """
+
+    def __init__(
+        self,
+        *datasets,
+    ):
+        if not datasets:
+            raise ValueError(
+                "At least one dataset "
+                "must be provided."
+            )
+
+        self.datasets = list(
+            datasets
+        )
+
+        self.cumulative_sizes = []
+
+        total = 0
+
+        for dataset in self.datasets:
+
+            total += len(dataset)
+
+            self.cumulative_sizes.append(
+                total
+            )
+
+    def __len__(self):
+
+        return self.cumulative_sizes[-1]
+
+    def _locate(
+        self,
+        index,
+    ):
+        if index < 0:
+            index += len(self)
+
+        if (
+            index < 0
+            or index >= len(self)
+        ):
+            raise IndexError(index)
+
+        dataset_idx = 0
+
+        while (
+            index
+            >= self.cumulative_sizes[
+                dataset_idx
+            ]
+        ):
+            dataset_idx += 1
+
+        previous = (
+            0
+            if dataset_idx == 0
+            else self.cumulative_sizes[
+                dataset_idx - 1
+            ]
+        )
+
+        sample_idx = (
+            index - previous
+        )
+
+        return (
+            dataset_idx,
+            sample_idx,
+        )
+
+    def __getitem__(
+        self,
+        index,
+    ):
+        dataset_idx, sample_idx = (
+            self._locate(index)
+        )
+
+        return self.datasets[
+            dataset_idx
+        ][
+            sample_idx
+        ]
+
+    def dataset_info(
+        self,
+        index,
+    ):
+        """
+        Debug helper.
+        """
+
+        dataset_idx, sample_idx = (
+            self._locate(index)
+        )
+
+        return {
+            "dataset_index":
+                dataset_idx,
+            "sample_index":
+                sample_idx,
+            "dataset_type":
+                type(
+                    self.datasets[
+                        dataset_idx
+                    ]
+                ).__name__,
+        }
 
 __all__ = [
     "Tile",
@@ -459,4 +602,5 @@ __all__ = [
     "decode_tile_index",
     "tile_sample",
     "TiledPhenoBench",
+    "ConcatDataset"
 ]
