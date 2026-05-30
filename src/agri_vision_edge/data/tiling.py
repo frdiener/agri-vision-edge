@@ -1,33 +1,32 @@
 """
-Dataset tiling utilities.
+PhenoBench tiling utilities.
 
-Provides:
+Tiling is applied before bbox generation.
 
-- tile geometry generation
-- image/mask cropping
-- tiled dataset wrapper
+Bounding boxes are regenerated from
+cropped semantics + plant_instances.
 
-Tiling is performed before bbox extraction.
-
-This allows upstream PhenoBench bbox generation
-to remain the single source of truth.
+The primary filtering criterion is
+instance visibility (pixel count),
+which naturally removes tiny tile-border
+fragments without relying on bbox shape.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
+
 import numpy as np
+from PIL import Image
+
+
+# --------------------------------------------------
+# Geometry
+# --------------------------------------------------
+
 
 @dataclass(frozen=True)
 class Tile:
-    """
-    Image tile.
-
-    Coordinates follow numpy slicing:
-
-        image[y0:y1, x0:x1]
-    """
     x0: int
     y0: int
     x1: int
@@ -35,56 +34,83 @@ class Tile:
 
     @property
     def width(self) -> int:
-
         return self.x1 - self.x0
 
     @property
     def height(self) -> int:
-
         return self.y1 - self.y0
 
-    
+
 def compute_tiles(
     width: int,
     height: int,
     rows: int = 2,
     cols: int = 2,
-):
-    """
-    Partition image into rows × cols tiles.
+    overlap: float = 0.0,
+) -> list[Tile]:
 
-    Returns
-    -------
-    list[Tile]
-    """
+    if rows < 1:
+        raise ValueError("rows must be >= 1")
 
-    xs = np.linspace(
-        0,
-        width,
-        cols + 1,
-        dtype=int,
-    )
+    if cols < 1:
+        raise ValueError("cols must be >= 1")
 
-    ys = np.linspace(
-        0,
-        height,
-        rows + 1,
-        dtype=int,
-    )
+    if not (0.0 <= overlap < 1.0):
+        raise ValueError(
+            "overlap must be in [0, 1)"
+        )
+
+    tile_w = width / cols
+    tile_h = height / rows
+
+    overlap_w = tile_w * overlap
+    overlap_h = tile_h * overlap
 
     tiles = []
 
     for r in range(rows):
-
         for c in range(cols):
 
-            tiles.append(
+            x0 = int(
+                round(
+                    c * tile_w
+                    - overlap_w / 2
+                )
+            )
 
+            y0 = int(
+                round(
+                    r * tile_h
+                    - overlap_h / 2
+                )
+            )
+
+            x1 = int(
+                round(
+                    (c + 1) * tile_w
+                    + overlap_w / 2
+                )
+            )
+
+            y1 = int(
+                round(
+                    (r + 1) * tile_h
+                    + overlap_h / 2
+                )
+            )
+
+            x0 = max(0, x0)
+            y0 = max(0, y0)
+
+            x1 = min(width, x1)
+            y1 = min(height, y1)
+
+            tiles.append(
                 Tile(
-                    x0=int(xs[c]),
-                    y0=int(ys[r]),
-                    x1=int(xs[c + 1]),
-                    y1=int(ys[r + 1]),
+                    x0=x0,
+                    y0=y0,
+                    x1=x1,
+                    y1=y1,
                 )
             )
 
@@ -95,27 +121,137 @@ def crop_array(
     array: np.ndarray,
     tile: Tile,
 ):
-    """
-    Crop image or mask.
-    """
-
     return array[
         tile.y0:tile.y1,
         tile.x0:tile.x1,
     ]
 
 
+# --------------------------------------------------
+# Filtering
+# --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FilterConfig:
+    min_instance_pixels: int = 0
+
+    min_bbox_width: int = 0
+    min_bbox_height: int = 0
+
+    min_bbox_area: int = 0
+
+
+# --------------------------------------------------
+# BBox regeneration
+# --------------------------------------------------
+
+
+def generate_plant_bboxes(
+    semantics: np.ndarray,
+    plant_instances: np.ndarray,
+    filter_config: FilterConfig,
+):
+    """
+    Regenerate plant bboxes from
+    cropped masks.
+
+    Returns bbox dictionaries in the
+    exact format expected by the rest
+    of the codebase.
+    """
+
+    boxes = []
+
+    for label in (1, 2):
+
+        instance_ids = np.unique(
+            plant_instances[
+                (semantics == label)
+                & (plant_instances > 0)
+            ]
+        )
+
+        for instance_id in instance_ids:
+
+            mask = (
+                (plant_instances == instance_id)
+                & (semantics == label)
+            )
+
+            visible_pixels = int(
+                mask.sum()
+            )
+
+            if (
+                visible_pixels
+                < filter_config.min_instance_pixels
+            ):
+                continue
+
+            ys, xs = np.where(mask)
+
+            if len(xs) == 0:
+                continue
+
+            xmin = int(xs.min())
+            xmax = int(xs.max())
+
+            ymin = int(ys.min())
+            ymax = int(ys.max())
+
+            width = xmax - xmin
+            height = ymax - ymin
+
+            area = width * height
+
+            if (
+                width
+                < filter_config.min_bbox_width
+            ):
+                continue
+
+            if (
+                height
+                < filter_config.min_bbox_height
+            ):
+                continue
+
+            if (
+                area
+                < filter_config.min_bbox_area
+            ):
+                continue
+
+            boxes.append(
+                {
+                    "label": int(label),
+                    "corner": (
+                        xmin,
+                        ymin,
+                    ),
+                    "center": (
+                        xmin + width // 2,
+                        ymin + height // 2,
+                    ),
+                    "width": int(width),
+                    "height": int(height),
+                    "visible_pixels": visible_pixels,
+                }
+            )
+
+    return boxes
+
+
+# --------------------------------------------------
+# Dataset indexing
+# --------------------------------------------------
+
+
 def decode_tile_index(
     index: int,
     tiles_per_image: int,
 ):
-    """
-    Global index ->
-
-        image_index
-        tile_index
-    """
-
     image_index = (
         index // tiles_per_image
     )
@@ -124,29 +260,32 @@ def decode_tile_index(
         index % tiles_per_image
     )
 
-    return image_index, tile_index
+    return (
+        image_index,
+        tile_index,
+    )
+
+
+# --------------------------------------------------
+# Sample tiling
+# --------------------------------------------------
 
 
 def tile_sample(
     sample,
     tile: Tile,
+    filter_config: FilterConfig,
 ):
-    """
-    Create tiled sample.
-
-    Expected keys:
-
-        image
-        semantics
-    """
 
     image = np.asarray(
         sample["image"]
     )
 
-    semantics = np.asarray(
-        sample["semantics"]
-    )
+    semantics = sample["semantics"]
+
+    plant_instances = sample[
+        "plant_instances"
+    ]
 
     image_tile = crop_array(
         image,
@@ -158,21 +297,59 @@ def tile_sample(
         tile,
     )
 
+    instances_tile = crop_array(
+        plant_instances,
+        tile,
+    )
+
+    plant_bboxes = (
+        generate_plant_bboxes(
+            semantics_tile,
+            instances_tile,
+            filter_config,
+        )
+    )
+
     result = dict(sample)
 
-    result["image"] = image_tile
+    result["image"] = Image.fromarray(
+        image_tile
+    )
+
     result["semantics"] = semantics_tile
+
+    result["plant_instances"] = (
+        instances_tile
+    )
+
+    result["plant_bboxes"] = (
+        plant_bboxes
+    )
+
+    result["tile"] = tile
 
     return result
 
 
+# --------------------------------------------------
+# Dataset wrapper
+# --------------------------------------------------
 
-class TiledDataset:
+
+class TiledPhenoBench:
     """
-    Generic dataset tiling wrapper.
+    Dataset wrapper that expands
+    each image into rows × cols tiles.
 
-    Produces rows × cols samples
-    per upstream sample.
+    Requires:
+
+        semantics
+        plant_instances
+
+    target_types.
+
+    plant_bboxes are regenerated
+    after tiling.
     """
 
     def __init__(
@@ -180,19 +357,25 @@ class TiledDataset:
         dataset,
         rows: int = 2,
         cols: int = 2,
+        overlap: float = 0.0,
+        filter_config: FilterConfig | None = None,
     ):
         self.dataset = dataset
 
         self.rows = rows
         self.cols = cols
 
+        self.overlap = overlap
+
+        self.filter_config = (
+            filter_config
+            if filter_config is not None
+            else FilterConfig()
+        )
+
         self.tiles_per_image = (
             rows * cols
         )
-
-        #
-        # Determine geometry once.
-        #
 
         first = dataset[0]
 
@@ -207,8 +390,8 @@ class TiledDataset:
             height=h,
             rows=rows,
             cols=cols,
+            overlap=overlap,
         )
-
 
     def __len__(self):
 
@@ -217,12 +400,10 @@ class TiledDataset:
             * self.tiles_per_image
         )
 
-
     def __getitem__(
         self,
         index,
     ):
-
         image_index, tile_index = (
             decode_tile_index(
                 index,
@@ -238,7 +419,44 @@ class TiledDataset:
             tile_index
         ]
 
-        return tile_sample(
+        tiled = tile_sample(
             sample,
             tile,
+            self.filter_config,
         )
+
+        tiled["image_name"] = (
+            f"{sample['image_name']}"
+            f"_tile{tile_index}"
+        )
+
+        return tiled
+
+    def tile_info(
+        self,
+        index,
+    ):
+        image_index, tile_index = (
+            decode_tile_index(
+                index,
+                self.tiles_per_image,
+            )
+        )
+
+        return {
+            "image_index": image_index,
+            "tile_index": tile_index,
+            "tile": self.tiles[tile_index],
+        }
+
+
+__all__ = [
+    "Tile",
+    "FilterConfig",
+    "compute_tiles",
+    "crop_array",
+    "generate_plant_bboxes",
+    "decode_tile_index",
+    "tile_sample",
+    "TiledPhenoBench",
+]
