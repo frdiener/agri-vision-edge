@@ -351,11 +351,12 @@ def checkpoint_step(
 
 
 def eval_checkpoint_on_size(
-        checkpoint,
-        pipeline_config,
-        output_path,
-        size,
-):    
+    checkpoint,
+    pipeline_config,
+    output_path,
+    size,
+    eval_record_path=None,
+):
     with tempfile.TemporaryDirectory() as tmpdir_raw:
         tmpdir = Path(tmpdir_raw)
 
@@ -366,10 +367,14 @@ def eval_checkpoint_on_size(
         cfg.model.ssd.image_resizer.fixed_shape_resizer.height = size
         cfg.model.ssd.image_resizer.fixed_shape_resizer.width = size
 
-        with tf.io.gfile.GFile(tmpdir / 'pipeline.config', "w") as f:
+        if eval_record_path is not None:
+            cfg.eval_input_reader[0].tf_record_input_reader.input_path[:] = [eval_record_path]
+
+        with tf.io.gfile.GFile(str(tmpdir / "pipeline.config"), "w") as f:
             f.write(text_format.MessageToString(cfg))
-        
+
         eval_one_checkpoint(
-            pipeline_config_path=tmpdir / "pipeline.config",
+            pipeline_config_path=str(tmpdir / "pipeline.config"),
             checkpoint_path=checkpoint,
-            model_dir=output_path)
+            model_dir=output_path,
+        )
