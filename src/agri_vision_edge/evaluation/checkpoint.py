@@ -12,7 +12,11 @@ import re
 import tempfile
 import shutil
 
+import tensorflow.compat.v1 as tf
 import pandas as pd
+from google.protobuf import text_format
+from object_detection.protos import pipeline_pb2
+from object_detection.model_lib_v2 import eval_one_checkpoint
 
 from .tensorboard import load_event_scalars
 from ..tfod.eval import launch_eval
@@ -344,3 +348,28 @@ def checkpoint_step(
         )
 
     return int(match.group(1))
+
+
+def eval_checkpoint_on_size(
+        checkpoint,
+        pipeline_config,
+        output_path,
+        size,
+):    
+    with tempfile.TemporaryDirectory() as tmpdir_raw:
+        tmpdir = Path(tmpdir_raw)
+
+        cfg = pipeline_pb2.TrainEvalPipelineConfig()
+        with tf.io.gfile.GFile(pipeline_config, "r") as f:
+            text_format.Merge(f.read(), cfg)
+
+        cfg.model.ssd.image_resizer.fixed_shape_resizer.height = size
+        cfg.model.ssd.image_resizer.fixed_shape_resizer.width = size
+
+        with tf.io.gfile.GFile(tmpdir / 'pipeline.config', "w") as f:
+            f.write(text_format.MessageToString(cfg))
+        
+        eval_one_checkpoint(
+            pipeline_config_path=tmpdir / "pipeline.config",
+            checkpoint_path=checkpoint,
+            model_dir=output_path)
