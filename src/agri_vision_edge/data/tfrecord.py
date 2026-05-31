@@ -209,6 +209,7 @@ def build_record(
         indices = range(len(dataset))
 
     written = 0
+    negatives = 0
 
     for i in indices:
 
@@ -255,8 +256,10 @@ def build_record(
                 )
             )
 
-        if not raw_boxes and skip_negatives:
-            continue
+        if not raw_boxes:
+            negatives += 1
+            if skip_negatives:
+                continue
 
         image_resized, boxes_resized = (
             resize_image_and_boxes(
@@ -291,7 +294,8 @@ def build_record(
     writer.close()
 
     print(
-        f"{target} → written: {written}"
+        f"{target} → written: {written}, {negatives} hard negatives "
+        f"{'skipped' if skip_negatives else 'included'}."
     )
 
     return {
