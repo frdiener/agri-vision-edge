@@ -15,10 +15,196 @@ from google.protobuf import text_format
 
 from object_detection.protos import pipeline_pb2
 
-from ..experiment.finetune import FineTuneConfig
+from ..experiment.finetune import (
+    AugmentationConfig,
+    FineTuneConfig,
+)
 
 
 PathLike = Union[str, Path]
+
+
+def _clear_augmentations(
+    pipeline_config: pipeline_pb2.TrainEvalPipelineConfig,
+) -> None:
+
+    del (
+        pipeline_config
+        .train_config
+        .data_augmentation_options[:]
+    )
+
+
+def _apply_augmentations(
+    pipeline_config: pipeline_pb2.TrainEvalPipelineConfig,
+    config: FineTuneConfig,
+) -> None:
+
+    augmentations = (
+        pipeline_config
+        .train_config
+        .data_augmentation_options
+    )
+
+    aug = config.augmentation
+
+    #
+    # Random crop
+    #
+
+    if aug.random_crop:
+
+        step = augmentations.add()
+
+        crop = (
+            step.random_crop_image
+        )
+
+        crop.min_object_covered = (
+            aug.crop_min_object_covered
+        )
+
+        crop.min_area = (
+            aug.crop_min_area
+        )
+
+        crop.max_area = (
+            aug.crop_max_area
+        )
+
+        crop.overlap_thresh = (
+            aug.crop_overlap_thresh
+        )
+
+    #
+    # Horizontal flip
+    #
+
+    if aug.horizontal_flip:
+
+        step = augmentations.add()
+
+        step.random_horizontal_flip.probability = (
+            aug.horizontal_flip_probability
+        )
+
+    #
+    # Vertical flip
+    #
+
+    if aug.vertical_flip:
+
+        step = augmentations.add()
+
+        step.random_vertical_flip.probability = (
+            aug.vertical_flip_probability
+        )
+
+    #
+    # 90° rotation
+    #
+
+    if aug.rotation90:
+
+        step = augmentations.add()
+
+        step.random_rotation90.probability = (
+            aug.rotation90_probability
+        )
+
+    #
+    # Zoom simulation
+    #
+
+    if aug.zoom_range is not None:
+
+        zoom_min, zoom_max = (
+            aug.zoom_range
+        )
+
+        step = augmentations.add()
+
+        zoom = (
+            step.random_scale_crop_and_pad_to_square
+        )
+
+        zoom.output_size = (
+            config.image_size
+        )
+
+        zoom.scale_min = zoom_min
+        zoom.scale_max = zoom_max
+
+    #
+    # Brightness
+    #
+
+    if aug.brightness_max_delta is not None:
+
+        step = augmentations.add()
+
+        step.random_adjust_brightness.max_delta = (
+            aug.brightness_max_delta
+        )
+
+    #
+    # Contrast
+    #
+
+    if aug.contrast_range is not None:
+
+        contrast_min, contrast_max = (
+            aug.contrast_range
+        )
+
+        step = augmentations.add()
+
+        contrast = (
+            step.random_adjust_contrast
+        )
+
+        contrast.min_delta = contrast_min
+        contrast.max_delta = contrast_max
+
+    #
+    # Saturation
+    #
+
+    if aug.saturation_range is not None:
+
+        saturation_min, saturation_max = (
+            aug.saturation_range
+        )
+
+        step = augmentations.add()
+
+        saturation = (
+            step.random_adjust_saturation
+        )
+
+        saturation.min_delta = saturation_min
+        saturation.max_delta = saturation_max
+
+    #
+    # JPEG robustness
+    #
+
+    if aug.jpeg_quality_range is not None:
+
+        quality_min, quality_max = (
+            aug.jpeg_quality_range
+        )
+
+        step = augmentations.add()
+
+        jpeg = (
+            step.random_jpeg_quality
+        )
+
+        jpeg.random_coef = 0.5
+
+        jpeg.min_jpeg_quality = quality_min
+        jpeg.max_jpeg_quality = quality_max
 
 
 def load_pipeline_config(
@@ -90,38 +276,14 @@ def configure_ssd_pipeline(
     # Data augmentation
     #
 
-    if not config.use_random_crop:
+    _clear_augmentations(
+        pipeline_config
+    )
 
-        kept_augmentations = []
-
-        for aug in (
-            pipeline_config
-            .train_config
-            .data_augmentation_options
-        ):
-
-            aug_name = aug.WhichOneof(
-                "preprocessing_step"
-            )
-
-            if aug_name not in {
-                "ssd_random_crop",
-                "random_crop_image",
-            }:
-                kept_augmentations.append(aug)
-
-        del (
-            pipeline_config
-            .train_config
-            .data_augmentation_options[:]
-        )
-
-        (
-            pipeline_config
-            .train_config
-            .data_augmentation_options
-            .extend(kept_augmentations)
-        )
+    _apply_augmentations(
+        pipeline_config,
+        config,
+    )
 
     #
     # Model
