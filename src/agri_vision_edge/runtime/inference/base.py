@@ -1,3 +1,11 @@
+"""
+Common runtime abstractions.
+
+Defines canonical detection structures and
+runtime interfaces shared across TFLite,
+ExecuTorch, and future runtimes.
+"""
+
 from __future__ import annotations
 
 from abc import ABC
@@ -10,21 +18,39 @@ import numpy as np
 
 @dataclass
 class Detection:
+    """
+    Canonical object detection result.
 
-    class_id: int
+    Bounding boxes use normalized coordinates:
+
+        [ymin, xmin, ymax, xmax]
+
+    compatible with TensorFlow SSD outputs.
+    """
+
+    category_id: int
 
     score: float
-
-    #
-    # COCO-style normalized bbox:
-    #
-    # [ymin, xmin, ymax, xmax]
-    #
 
     bbox: list[float]
 
 
 class BaseRuntime(ABC):
+    """
+    Abstract runtime interface.
+
+    All runtimes should expose a common
+    prediction API returning canonical
+    Detection objects.
+    """
+
+    @property
+    @abstractmethod
+    def input_size(self) -> int:
+        """
+        Square input resolution.
+        """
+        pass
 
     @abstractmethod
     def predict(
@@ -32,18 +58,13 @@ class BaseRuntime(ABC):
         image: np.ndarray,
     ) -> list[Detection]:
         """
-        Run inference on an RGB image.
+        Run inference on an RGB uint8 image.
 
         Args:
             image:
-                RGB uint8 image.
+                RGB image array.
 
         Returns:
             List of detections.
         """
-        pass
-
-    @property
-    @abstractmethod
-    def input_size(self) -> int:
         pass

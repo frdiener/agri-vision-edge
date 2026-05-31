@@ -1,4 +1,18 @@
+"""
+TensorFlow Lite runtime wrapper.
+
+Supports:
+
+- CPU execution
+- optional delegates
+- quantized models
+- float-output models
+- metadata sidecars
+"""
+
 from __future__ import annotations
+
+import json
 
 from pathlib import Path
 
@@ -16,30 +30,36 @@ from .base import (
 )
 
 
+DEFAULT_TEFLON_LIB = (
+    "/usr/lib/libteflon.so"
+)
+
+
 class TFLiteRuntime(BaseRuntime):
+    """
+    TensorFlow Lite inference runtime.
+    """
 
     def __init__(
         self,
         model_path: str | Path,
         *,
-        delegate_path: str | None = None,
+        delegate_path: str | None = DEFAULT_TEFLON_LIB,
         score_threshold: float = 0.3,
     ):
 
+        self.model_path = Path(model_path)
+
         self.score_threshold = score_threshold
 
-        delegates = []
+        self.metadata = self._load_metadata()
 
-        if delegate_path is not None:
-
-            delegate = load_delegate(
-                delegate_path
-            )
-
-            delegates.append(delegate)
+        delegates = self._load_delegates(
+            delegate_path
+        )
 
         self.interpreter = Interpreter(
-            model_path=str(model_path),
+            model_path=str(self.model_path),
 
             experimental_delegates=delegates,
         )
@@ -63,19 +83,109 @@ class TFLiteRuntime(BaseRuntime):
 
         return self._input_size
 
+    #
+    # Metadata
+    #
+
+    def _load_metadata(self):
+
+        metadata_path = (
+            self.model_path.with_suffix(
+                ".runtime.json"
+            )
+        )
+
+        if not metadata_path.exists():
+
+            print(
+                "[runtime] metadata sidecar "
+                "not found"
+            )
+
+            return {}
+
+        with open(metadata_path) as f:
+
+            metadata = json.load(f)
+
+        print(
+            f"[runtime] loaded metadata: "
+            f"{metadata_path.name}"
+        )
+
+        return metadata
+
+    #
+    # Delegates
+    #
+
+    def _load_delegates(
+        self,
+        delegate_path,
+    ):
+
+        delegates = []
+
+        if delegate_path is None:
+            return delegates
+
+        delegate_path = Path(delegate_path)
+
+        if not delegate_path.exists():
+
+            print(
+                "[runtime] delegate not found:"
+                f" {delegate_path}"
+            )
+
+            return delegates
+
+        try:
+
+            delegate = load_delegate(
+                str(delegate_path)
+            )
+
+            delegates.append(delegate)
+
+            print(
+                "[runtime] loaded delegate:"
+                f" {delegate_path}"
+            )
+
+        except Exception as e:
+
+            print(
+                "[runtime] failed to load "
+                f"delegate: {e}"
+            )
+
+        return delegates
+
+    #
+    # Preprocessing
+    #
+
     def preprocess(
         self,
-        image: np.ndarray,
-    ) -> np.ndarray:
+        image,
+    ):
 
         image = cv2.resize(
             image,
-            (self.input_size, self.input_size),
+            (
+                self.input_size,
+                self.input_size,
+            ),
         )
 
         input_detail = self.input_details[0]
 
         dtype = input_detail["dtype"]
+
+        #
+        # INT8
+        #
 
         if dtype == np.int8:
 
@@ -99,6 +209,10 @@ class TFLiteRuntime(BaseRuntime):
 
             image = image.astype(np.int8)
 
+        #
+        # FP32
+        #
+
         else:
 
             image = image.astype(np.float32)
@@ -110,8 +224,12 @@ class TFLiteRuntime(BaseRuntime):
 
         return image
 
+    #
+    # Quantization helpers
+    #
+
+    @staticmethod
     def dequantize(
-        self,
         tensor,
         quantization,
     ):
@@ -123,10 +241,14 @@ class TFLiteRuntime(BaseRuntime):
             - zero_point
         )
 
+    #
+    # Inference
+    #
+
     def predict(
         self,
-        image: np.ndarray,
-    ) -> list[Detection]:
+        image,
+    ):
 
         input_tensor = self.preprocess(
             image
@@ -139,46 +261,91 @@ class TFLiteRuntime(BaseRuntime):
 
         self.interpreter.invoke()
 
-        scores = self.interpreter.get_tensor(
-            self.output_details[0]["index"]
+        raw_scores = (
+            self.interpreter.get_tensor(
+                self.output_details[0]["index"]
+            )
         )
 
-        boxes = self.interpreter.get_tensor(
-            self.output_details[1]["index"]
+        raw_boxes = (
+            self.interpreter.get_tensor(
+                self.output_details[1]["index"]
+            )
         )
 
-        classes = self.interpreter.get_tensor(
-            self.output_details[3]["index"]
+        raw_num = (
+            self.interpreter.get_tensor(
+                self.output_details[2]["index"]
+            )
+        )
+
+        raw_classes = (
+            self.interpreter.get_tensor(
+                self.output_details[3]["index"]
+            )
+        )
+
+        dequantize_outputs = (
+            self.metadata
+            .get("runtime", {})
+            .get(
+                "dequantize_outputs",
+                False,
+            )
         )
 
         #
-        # Dequantize if needed
+        # Quantized outputs
         #
 
-        if (
-            self.output_details[0]["dtype"]
-            == np.int8
-        ):
+        if dequantize_outputs:
 
             scores = self.dequantize(
-                scores,
+                raw_scores,
                 self.output_details[0][
                     "quantization"
                 ],
             )
 
             boxes = self.dequantize(
-                boxes,
+                raw_boxes,
                 self.output_details[1][
                     "quantization"
                 ],
             )
 
             classes = self.dequantize(
-                classes,
+                raw_classes,
                 self.output_details[3][
                     "quantization"
                 ],
+            )
+
+            num = int(
+                np.squeeze(
+                    self.dequantize(
+                        raw_num,
+                        self.output_details[2][
+                            "quantization"
+                        ],
+                    )
+                )
+            )
+
+        #
+        # Float outputs
+        #
+
+        else:
+
+            scores = raw_scores
+
+            boxes = raw_boxes
+
+            classes = raw_classes
+
+            num = int(
+                np.squeeze(raw_num)
             )
 
         scores = scores[0]
@@ -188,12 +355,25 @@ class TFLiteRuntime(BaseRuntime):
             classes[0]
         ).astype(np.int32)
 
+        #
+        # COCO compatibility
+        #
+
+        class_offset = (
+            self.metadata
+            .get("runtime", {})
+            .get(
+                "class_index_offset",
+                1,
+            )
+        )
+
         detections = []
 
         for box, cls_id, score in zip(
-            boxes,
-            classes,
-            scores,
+            boxes[:num],
+            classes[:num],
+            scores[:num],
         ):
 
             score = float(score)
@@ -203,8 +383,13 @@ class TFLiteRuntime(BaseRuntime):
 
             detections.append(
                 Detection(
-                    class_id=int(cls_id),
+                    category_id=(
+                        int(cls_id)
+                        + class_offset
+                    ),
+
                     score=score,
+
                     bbox=box.tolist(),
                 )
             )
