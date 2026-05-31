@@ -175,7 +175,8 @@ def build_record(
     dataset,
     dataset_definition: DatasetDefinition,
     indices: Iterable[int] | None = None,
-    target_size: int = DEFAULT_TARGET_SIZE,
+    target_size: int|None = None,
+    skip_negatives=True,
 ):
     """
     Build TFRecord dataset.
@@ -195,6 +196,9 @@ def build_record(
 
         target_size:
             Target image size.
+
+        skip_negatives:
+            Do not include images without GT instances.
     """
 
     writer = tf.io.TFRecordWriter(
@@ -251,27 +255,28 @@ def build_record(
                 )
             )
 
-        if not raw_boxes:
+        if not raw_boxes and skip_negatives:
             continue
 
-        image_resized, boxes_resized = (
-            resize_image_and_boxes(
-                image,
-                raw_boxes,
-                size=target_size,
+        if target_size is not None:
+            image, boxes = (
+                resize_image_and_boxes(
+                    image,
+                    raw_boxes,
+                    size=target_size,
+                )
             )
-        )
 
-        boxes_normalized = normalize_boxes(
-            boxes_resized,
-            image_size=target_size,
-        )
+            boxes = normalize_boxes(
+                boxes,
+                image_size=target_size,
+            )
 
         example = create_tf_example(
 
-            image=image_resized,
+            image=image,
 
-            boxes=boxes_normalized,
+            boxes=boxes,
 
             labels=labels,
 
