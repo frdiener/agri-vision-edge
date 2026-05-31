@@ -175,7 +175,7 @@ def build_record(
     dataset,
     dataset_definition: DatasetDefinition,
     indices: Iterable[int] | None = None,
-    target_size: int|None = None,
+    target_size: int = DEFAULT_TARGET_SIZE,
     skip_negatives=True,
 ):
     """
@@ -258,25 +258,24 @@ def build_record(
         if not raw_boxes and skip_negatives:
             continue
 
-        if target_size is not None:
-            image, boxes = (
-                resize_image_and_boxes(
-                    image,
-                    raw_boxes,
-                    size=target_size,
-                )
+        image_resized, boxes_resized = (
+            resize_image_and_boxes(
+                image,
+                raw_boxes,
+                size=target_size,
             )
+        )
 
-            boxes = normalize_boxes(
-                boxes,
-                image_size=target_size,
-            )
+        boxes_normalized = normalize_boxes(
+            boxes_resized,
+            image_size=target_size,
+        )
 
         example = create_tf_example(
 
-            image=image,
+            image=image_resized,
 
-            boxes=boxes,
+            boxes=boxes_normalized,
 
             labels=labels,
 
