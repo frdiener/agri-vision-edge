@@ -1309,3 +1309,65 @@ def eval_continuously(
     if global_step.numpy() == configs['train_config'].num_steps:
       tf.logging.info('Exiting evaluation at step %d', global_step.numpy())
       return
+
+
+def eval_one_checkpoint(
+    pipeline_config_path,
+    checkpoint_path,
+    model_dir,
+    config_override=None,
+    save_final_config=False,
+    **kwargs):
+  configs = MODEL_BUILD_UTIL_MAP['get_configs_from_pipeline_file'](
+      pipeline_config_path, config_override=config_override)
+
+  if save_final_config:
+    pipeline_proto = MODEL_BUILD_UTIL_MAP['create_pipeline_proto_from_configs'](
+        configs)
+    config_util.save_pipeline_config(pipeline_proto, model_dir)
+
+  model_config = configs['model']
+  eval_config = configs['eval_config']
+  eval_input_config = configs['eval_input_configs'][0]
+
+  strategy = tf.compat.v2.distribute.get_strategy()
+  with strategy.scope():
+    detection_model = MODEL_BUILD_UTIL_MAP['detection_model_fn_base'](
+        model_config=model_config, is_training=True)
+
+  eval_input = strategy.experimental_distribute_dataset(
+      inputs.eval_input(
+          eval_config=eval_config,
+          eval_input_config=eval_input_config,
+          model_config=model_config,
+          model=detection_model))
+
+  global_step = tf.compat.v2.Variable(0, trainable=False, dtype=tf.int64)
+
+  optimizer, _ = optimizer_builder.build(
+      configs['train_config'].optimizer, global_step=global_step)
+
+  ckpt = tf.compat.v2.train.Checkpoint(
+      step=global_step, model=detection_model, optimizer=optimizer)
+
+  if eval_config.use_moving_averages:
+    _ensure_model_is_built(detection_model, eval_input,
+                           eval_config.batch_size == 1)
+    optimizer.shadow_copy(detection_model)
+
+  ckpt.restore(checkpoint_path).expect_partial()
+
+  if eval_config.use_moving_averages:
+    optimizer.swap_weights()
+
+  writer = tf.compat.v2.summary.create_file_writer(
+      os.path.join(model_dir, 'eval', eval_input_config.name))
+
+  with writer.as_default():
+    eager_eval_loop(
+        detection_model,
+        configs,
+        eval_input,
+        use_tpu=False,
+        postprocess_on_cpu=False,
+        global_step=global_step)
