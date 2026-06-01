@@ -670,7 +670,7 @@ def train_loop(
               global_step=global_step
           )
 
-        if train_config.enable_qat_backbone:
+        if enable_qat_backbone:
           print("Adding fake quantization nodes to the backbone...")
           from agri_vision_edge.tfod.qat import quantize_backbone
           feature_extractor = detection_model.feature_extractor
