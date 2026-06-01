@@ -461,6 +461,8 @@ def train_loop(
     early_stopping_min_delta=0,
     save_metrics_history=True,
 
+    reset_optimizer=False,
+
     **kwargs):
   """Trains a model using eager + functions.
 
@@ -658,6 +660,15 @@ def train_loop(
             use_tpu=False,
             global_step=global_step
         )
+
+        if reset_optimizer:
+          print("Resetting the optimizer...")
+          global_step.assign(0)
+          optimizer, (learning_rate,) = optimizer_builder.build(
+              train_config.optimizer,
+              global_step=global_step
+          )
+        print("Beginning training...")
 
         def train_step_fn(features, labels):
           """Single train step."""
