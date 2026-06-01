@@ -669,6 +669,8 @@ def train_loop(
               global_step=global_step
           )
         print("Beginning training...")
+        import IPython
+        IPython.embed()
 
         def train_step_fn(features, labels):
           """Single train step."""
