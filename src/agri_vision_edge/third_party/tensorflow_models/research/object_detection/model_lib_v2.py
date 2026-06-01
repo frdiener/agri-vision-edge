@@ -679,6 +679,14 @@ def train_loop(
               feature_extractor.classification_backbone
             )
           )
+          print("Evaluating initial quantized configuration...")
+          metrics = eager_eval_loop(
+              detection_model,
+              configs,
+              eval_input,
+              use_tpu=False,
+              global_step=global_step
+          )
 
         print("Beginning training...")
 
