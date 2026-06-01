@@ -462,6 +462,7 @@ def train_loop(
     save_metrics_history=True,
 
     reset_optimizer=False,
+    enable_qat_backbone=False,
 
     **kwargs):
   """Trains a model using eager + functions.
@@ -668,6 +669,17 @@ def train_loop(
               train_config.optimizer,
               global_step=global_step
           )
+
+        if train_config.enable_qat_backbone:
+          print("Adding fake quantization nodes to the backbone...")
+          from agri_vision_edge.tfod.qat import quantize_backbone
+          feature_extractor = detection_model.feature_extractor
+          feature_extractor.classification_backbone = (
+            quantize_backbone(
+              feature_extractor.classification_backbone
+            )
+          )
+
         print("Beginning training...")
 
         def train_step_fn(features, labels):
