@@ -640,6 +640,25 @@ def train_loop(
         latest_checkpoint = tf.train.latest_checkpoint(model_dir)
         ckpt.restore(latest_checkpoint)
 
+        print("Evaluating restored checkpoint...")
+
+        eval_input = strategy.experimental_distribute_dataset(
+            inputs.eval_input(
+                eval_config=configs['eval_config'],
+                eval_input_config=configs['eval_input_configs'][0],
+                model_config=model_config,
+                model=detection_model
+            )
+        )
+
+        metrics = eager_eval_loop(
+            detection_model,
+            configs,
+            eval_input,
+            use_tpu=False,
+            global_step=global_step
+        )
+
         def train_step_fn(features, labels):
           """Single train step."""
 
