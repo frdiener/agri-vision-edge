@@ -359,6 +359,16 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
       ckpt, trained_checkpoint_dir, max_to_keep=1)
 
   if qat_export:
+
+    dummy = tf.zeros([1, 320, 320, 3], dtype=tf.float32)
+
+    image, shapes = detection_model.preprocess(dummy)
+
+    prediction_dict = detection_model.predict(
+        image,
+        shapes
+    )
+    
     for v in detection_model.variables[:20]:
         print(v.name, v.shape)
 
