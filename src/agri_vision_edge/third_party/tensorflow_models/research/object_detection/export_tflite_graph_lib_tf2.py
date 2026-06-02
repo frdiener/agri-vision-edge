@@ -197,115 +197,6 @@ class SSDModule(tf.Module):
                                                        class_predictions,
                                                        anchors)[::-1]
 
-
-class CenterNetModule(tf.Module):
-  """Inference Module for TFLite-friendly CenterNet models.
-
-  The exported CenterNet model includes the preprocessing and postprocessing
-  logics so the caller should pass in the raw image pixel values. It supports
-  both object detection and keypoint estimation task.
-  """
-
-  def __init__(self, pipeline_config, max_detections, include_keypoints,
-               label_map_path=''):
-    """Initialization.
-
-    Args:
-      pipeline_config: The original pipeline_pb2.TrainEvalPipelineConfig
-      max_detections: Max detections desired from the TFLite model.
-      include_keypoints: If set true, the output dictionary will include the
-        keypoint coordinates and keypoint confidence scores.
-      label_map_path: Path to the label map which is used by CenterNet keypoint
-        estimation task. If provided, the label_map_path in the configuration
-        will be replaced by this one.
-    """
-    self._max_detections = max_detections
-    self._include_keypoints = include_keypoints
-    self._process_config(pipeline_config)
-    if include_keypoints and label_map_path:
-      pipeline_config.model.center_net.keypoint_label_map_path = label_map_path
-    self._pipeline_config = pipeline_config
-    self._model = model_builder.build(
-        self._pipeline_config.model, is_training=False)
-
-  def get_model(self):
-    return self._model
-
-  def _process_config(self, pipeline_config):
-    self._num_classes = pipeline_config.model.center_net.num_classes
-
-    center_net_config = pipeline_config.model.center_net
-    image_resizer_config = center_net_config.image_resizer
-    image_resizer = image_resizer_config.WhichOneof('image_resizer_oneof')
-    self._num_channels = _DEFAULT_NUM_CHANNELS
-
-    if image_resizer == 'fixed_shape_resizer':
-      self._height = image_resizer_config.fixed_shape_resizer.height
-      self._width = image_resizer_config.fixed_shape_resizer.width
-      if image_resizer_config.fixed_shape_resizer.convert_to_grayscale:
-        self._num_channels = 1
-    else:
-      raise ValueError(
-          'Only fixed_shape_resizer'
-          'is supported with tflite. Found {}'.format(image_resizer))
-
-    center_net_config.object_center_params.max_box_predictions = (
-        self._max_detections)
-
-    if not self._include_keypoints:
-      del center_net_config.keypoint_estimation_task[:]
-
-  def input_shape(self):
-    """Returns shape of TFLite model input."""
-    return [1, self._height, self._width, self._num_channels]
-
-  @tf.function
-  def inference_fn(self, image):
-    """Encapsulates CenterNet inference for TFLite conversion.
-
-    Args:
-      image: a float32 tensor of shape [1, image_height, image_width, channel]
-        denoting the image pixel values.
-
-    Returns:
-      A dictionary of predicted tensors:
-        classes: a float32 tensor with shape [1, max_detections] denoting class
-          ID for each detection.
-        scores: a float32 tensor with shape [1, max_detections] denoting score
-          for each detection.
-        boxes: a float32 tensor with shape [1, max_detections, 4] denoting
-          coordinates of each detected box.
-        keypoints: a float32 with shape [1, max_detections, num_keypoints, 2]
-          denoting the predicted keypoint coordinates (normalized in between
-          0-1). Note that [:, :, :, 0] represents the y coordinates and
-          [:, :, :, 1] represents the x coordinates.
-        keypoint_scores: a float32 with shape [1, max_detections, num_keypoints]
-          denoting keypoint confidence scores.
-    """
-    image = tf.cast(image, tf.float32)
-    image, shapes = self._model.preprocess(image)
-    prediction_dict = self._model.predict(image, None)
-    detections = self._model.postprocess(
-        prediction_dict, true_image_shapes=shapes)
-
-    field_names = fields.DetectionResultFields
-    classes_field = field_names.detection_classes
-    classes = tf.cast(detections[classes_field], tf.float32)
-    num_detections = tf.cast(detections[field_names.num_detections], tf.float32)
-
-    if self._include_keypoints:
-      model_outputs = (detections[field_names.detection_boxes], classes,
-                       detections[field_names.detection_scores], num_detections,
-                       detections[field_names.detection_keypoints],
-                       detections[field_names.detection_keypoint_scores])
-    else:
-      model_outputs = (detections[field_names.detection_boxes], classes,
-                       detections[field_names.detection_scores], num_detections)
-
-    # tf.function@ seems to reverse order of inputs, so reverse them here.
-    return model_outputs[::-1]
-
-
 def export_tflite_model(pipeline_config, trained_checkpoint_dir,
                         output_directory, max_detections, use_regular_nms,
                         include_keypoints=False, label_map_path='', qat_export=False):
@@ -345,13 +236,8 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
     detection_module = SSDModule(pipeline_config, detection_model,
                                  max_detections, use_regular_nms)
-  elif pipeline_config.model.WhichOneof('model') == 'center_net':
-    detection_module = CenterNetModule(
-        pipeline_config, max_detections, include_keypoints,
-        label_map_path=label_map_path)
-    ckpt = tf.train.Checkpoint(model=detection_module.get_model())
   else:
-    raise ValueError('Only ssd or center_net models are supported in tflite. '
+    raise ValueError('Only ssd or center_net (see upstream for center_net) models are supported in tflite. '
                      'Found {} in config'.format(
                          pipeline_config.model.WhichOneof('model')))
 
