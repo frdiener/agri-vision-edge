@@ -14,27 +14,27 @@ keywords = [
   "imx8mp",
   "imx93"
 ]
-requires-python = ">=3.8,<3.11"
-dependencies = [
-    "apache-beam>=2.73.0",
-    "avro-python3>=1.10.2",
-    "contextlib2>=21.6.0",
-    "cython>=3.2.4",
-    "lvis>=0.5.3",
-    "lxml>=6.1.0",
-    "matplotlib>=3.10.6",
-    "pandas>=2.3.3",
-    "pillow>=12.2.0",
-    "pycocotools>=2.0.11",
-    "pyparsing==2.4.7",
-    "sacrebleu<=2.2.0",
-    "scipy>=1.15.3",
-    "six>=1.17.0",
-    "tensorflow-io>=0.37.1",
-    "tf-models-official>=2.15,<2.16",
-    "tensorflow>=2.15,<2.16",
-    "tf-slim>=1.1.0",
-]
+requires-python = ">=3.10"
+# dependencies = [
+#     "apache-beam>=2.73.0",
+#     "avro-python3>=1.10.2",
+#     "contextlib2>=21.6.0",
+#     "cython>=3.2.4",
+#     "lvis>=0.5.3",
+#     "lxml>=6.1.0",
+#     "matplotlib>=3.10.6",
+#     "pandas>=2.3.3",
+#     "pillow>=12.2.0",
+#     "pycocotools>=2.0.11",
+#     "pyparsing==2.4.7",
+#     "sacrebleu<=2.2.0",
+#     "scipy>=1.15.3",
+#     "six>=1.17.0",
+#     "tensorflow-io>=0.37.1",
+#     "tf-models-official>=2.15,<2.16",
+#     "tensorflow>=2.15,<2.16",
+#     "tf-slim>=1.1.0",
+# ]
 
 [dependency-groups]
 dev = [
@@ -42,4 +42,11 @@ dev = [
     "basedpyright>=1.39.0",
     "ruff>=0.15.10",
     "pytest>=8.4",
+    "ipython>=8.39.0",
+]
+inference = [
+    "opencv-python-headless>=4.13.0.92",
+    "pillow>=12.2.0",
+    "tensorflow>=2.21.0",
+    "tflite-runtime>=2.14.0",
 ]
