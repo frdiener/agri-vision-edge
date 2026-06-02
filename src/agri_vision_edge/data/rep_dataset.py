@@ -73,6 +73,8 @@ def representative_dataset(
             )
         )
 
+        print(f"Yielding image {i}")
+        
         image_resized = (
             image_resized.astype(
                 np.float32
