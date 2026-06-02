@@ -44,3 +44,34 @@ def quantize_backbone(backbone):
         )
 
     return qat_backbone
+
+
+def ensure_model_is_built_for_qat(
+    detection_model,
+    pipeline_config
+):
+    ssd_config = pipeline_config.model.ssd
+
+    h = (
+        ssd_config.image_resizer
+        .fixed_shape_resizer
+        .height
+    )
+
+    w = (
+        ssd_config.image_resizer
+        .fixed_shape_resizer
+        .width
+    )
+
+    dummy = tf.zeros(
+        [1, h, w, 3],
+        dtype=tf.float32
+    )
+
+    image, shapes = detection_model.preprocess(dummy)
+
+    detection_model.predict(
+        image,
+        shapes
+    )

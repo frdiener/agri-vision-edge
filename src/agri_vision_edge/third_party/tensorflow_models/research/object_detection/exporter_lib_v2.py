@@ -251,8 +251,17 @@ def export_inference_graph(input_type,
       ckpt, trained_checkpoint_dir, max_to_keep=1)
 
   if qat_export:
-    from agri_vision_edge.tfod.qat import quantize_backbone
-    feature_extractor = detection_model.feature_extractor
+    from agri_vision_edge.tfod.qat import (
+      ensure_model_is_built_for_qat,
+      quantize_backbone,
+    )
+    ensure_model_is_built_for_qat(
+        detection_model,
+        pipeline_config,
+    )
+    feature_extractor = (
+        detection_model.feature_extractor
+    )
     feature_extractor.classification_backbone = (
         quantize_backbone(
             feature_extractor.classification_backbone
