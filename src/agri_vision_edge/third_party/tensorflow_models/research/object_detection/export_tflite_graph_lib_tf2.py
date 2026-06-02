@@ -308,7 +308,7 @@ class CenterNetModule(tf.Module):
 
 def export_tflite_model(pipeline_config, trained_checkpoint_dir,
                         output_directory, max_detections, use_regular_nms,
-                        include_keypoints=False, label_map_path=''):
+                        include_keypoints=False, label_map_path='', qat_export=False):
   """Exports inference SavedModel for TFLite conversion.
 
   NOTE: Only supports SSD meta-architectures for now, and the output model will
@@ -357,6 +357,19 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
 
   manager = tf.train.CheckpointManager(
       ckpt, trained_checkpoint_dir, max_to_keep=1)
+
+  if qat_export:
+    for v in detection_model.variables[:20]:
+        print(v.name, v.shape)
+
+    from agri_vision_edge.tfod.qat import quantize_backbone
+    feature_extractor = detection_model.feature_extractor
+    feature_extractor.classification_backbone = (
+        quantize_backbone(
+            feature_extractor.classification_backbone
+        )
+    )
+    
   status = ckpt.restore(manager.latest_checkpoint).expect_partial()
 
   # Getting the concrete function traces the graph and forces variables to

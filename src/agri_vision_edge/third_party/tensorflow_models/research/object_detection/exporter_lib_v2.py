@@ -215,7 +215,8 @@ def export_inference_graph(input_type,
                            use_side_inputs=False,
                            side_input_shapes='',
                            side_input_types='',
-                           side_input_names=''):
+                           side_input_names='',
+                           qat_export=False):
   """Exports inference graph for the model specified in the pipeline config.
 
   This function creates `output_directory` if it does not already exist,
@@ -248,6 +249,19 @@ def export_inference_graph(input_type,
       model=detection_model)
   manager = tf.train.CheckpointManager(
       ckpt, trained_checkpoint_dir, max_to_keep=1)
+
+  if qat_export:
+    for v in detection_model.variables[:20]:
+        print(v.name, v.shape)
+
+    from agri_vision_edge.tfod.qat import quantize_backbone
+    feature_extractor = detection_model.feature_extractor
+    feature_extractor.classification_backbone = (
+        quantize_backbone(
+            feature_extractor.classification_backbone
+        )
+    )
+
   status = ckpt.restore(manager.latest_checkpoint).expect_partial()
 
   if input_type not in DETECTION_MODULE_MAP:

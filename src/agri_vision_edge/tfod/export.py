@@ -213,6 +213,7 @@ def export_saved_model_v2(
     output_dir,
     input_type="image_tensor",
     config_override="",
+    qat_export=False,
 ):
     """
     Export standard TF2 SavedModel.
@@ -240,6 +241,7 @@ def export_saved_model_v2(
         side_input_shapes=None,
         side_input_types=None,
         side_input_names=None,
+        qat_export=qat_export,
     )
 
     return output_dir
@@ -254,6 +256,7 @@ def export_tflite_graph_v2(
     ssd_use_regular_nms=False,
     centernet_include_keypoints=False,
     keypoint_label_map_path=None,
+    qat_export=False,
 ):
     """
     Export TF2 TFLite-ready graph.
@@ -286,6 +289,7 @@ def export_tflite_graph_v2(
         label_map_path=(
             keypoint_label_map_path or ""
         ),
+        qat_export=qat_export,
     )
 
     return output_dir
@@ -299,10 +303,11 @@ def export_all(
     input_type="image_tensor",
 
     # TFLite export options
-    max_detections=10,
+    max_detections=100,
     ssd_use_regular_nms=False,
     centernet_include_keypoints=False,
     keypoint_label_map_path=None,
+    qat_export=False,
 ):
     """
     Export BOTH:
@@ -337,6 +342,7 @@ def export_all(
         output_dir=saved_model_dir,
         input_type=input_type,
         config_override=config_override,
+        qat_export=qat_export,
     )
 
     # =========================================================
@@ -356,6 +362,7 @@ def export_all(
         keypoint_label_map_path=(
             keypoint_label_map_path
         ),
+        qat_export=qat_export,
     )
 
     return {
