@@ -251,9 +251,6 @@ def export_inference_graph(input_type,
       ckpt, trained_checkpoint_dir, max_to_keep=1)
 
   if qat_export:
-    for v in detection_model.variables[:20]:
-        print(v.name, v.shape)
-
     from agri_vision_edge.tfod.qat import quantize_backbone
     feature_extractor = detection_model.feature_extractor
     feature_extractor.classification_backbone = (
