@@ -367,8 +367,13 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
         detection_model,
         pipeline_config,
     )
+
     feature_extractor = (
         detection_model.feature_extractor
+    )
+    assert (
+        feature_extractor.classification_backbone
+        is not None
     )
     feature_extractor.classification_backbone = (
         quantize_backbone(

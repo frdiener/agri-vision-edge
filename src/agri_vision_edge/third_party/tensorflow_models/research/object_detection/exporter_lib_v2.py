@@ -262,6 +262,10 @@ def export_inference_graph(input_type,
     feature_extractor = (
         detection_model.feature_extractor
     )
+    assert (
+        feature_extractor.classification_backbone
+        is not None
+    )
     feature_extractor.classification_backbone = (
         quantize_backbone(
             feature_extractor.classification_backbone
