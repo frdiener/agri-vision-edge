@@ -232,6 +232,14 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
   if pipeline_config.model.WhichOneof('model') == 'ssd':
     detection_model = model_builder.build(
         pipeline_config.model, is_training=False)
+    if qat_export:
+      from agri_vision_edge.tfod.qat import (
+        ensure_model_is_built_for_qat, quantize_backbone)
+      ensure_model_is_built_for_qat(detection_model, pipeline_config)
+      feature_extractor = (detection_model.feature_extractor)
+      assert (feature_extractor.classification_backbone is not None)
+      feature_extractor.classification_backbone = (
+          quantize_backbone(feature_extractor.classification_backbone))
     ckpt = tf.train.Checkpoint(model=detection_model)
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
     detection_module = SSDModule(pipeline_config, detection_model,
@@ -242,31 +250,7 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
                          pipeline_config.model.WhichOneof('model')))
 
   manager = tf.train.CheckpointManager(
-      ckpt, trained_checkpoint_dir, max_to_keep=1)
-
-  if qat_export:
-    from agri_vision_edge.tfod.qat import (
-      ensure_model_is_built_for_qat,
-      quantize_backbone,
-    )
-    ensure_model_is_built_for_qat(
-        detection_model,
-        pipeline_config,
-    )
-
-    feature_extractor = (
-        detection_model.feature_extractor
-    )
-    assert (
-        feature_extractor.classification_backbone
-        is not None
-    )
-    feature_extractor.classification_backbone = (
-        quantize_backbone(
-            feature_extractor.classification_backbone
-        )
-    )
-    
+      ckpt, trained_checkpoint_dir, max_to_keep=1)    
   status = ckpt.restore(manager.latest_checkpoint).expect_partial()
 
   # Getting the concrete function traces the graph and forces variables to
