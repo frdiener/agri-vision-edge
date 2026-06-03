@@ -1,9 +1,9 @@
 import tensorflow as tf
 import tensorflow_model_optimization as tfmot
-from tensorflow_model_optimization.python.core.quantization.keras import quantize_config, quantize_layer
-from tensorflow.keras.utils import register_keras_serializable
 
 from object_detection.core.freezable_batch_norm import FreezableBatchNorm
+from tensorflow_model_optimization.python.core.quantization.keras import quantize_config, quantize_layer
+from tensorflow.keras.utils import register_keras_serializable
 
 
 @register_keras_serializable(package='CustomQuant', name='ConvWeightOnlyQuantizeConfig')
@@ -65,7 +65,7 @@ class ConvWeightOnlyQuantizeConfig(quantize_config.QuantizeConfig):
         return cls(**config)
 
 
-def _annotate_layer(layer, quantize_config):
+def _annotate_layer(layer, quantize_config=None):
     if isinstance(
         layer,
         (
@@ -125,6 +125,30 @@ def quantize_backbone(backbone, per_axis=False, symmetric=True, num_bits=8):
             )
         )
     
+    return qat_backbone
+
+def quantize_backbone_full(backbone):
+    """
+    Convert a TFOD MobileNetV2 backbone into a
+    TF-MOT QAT backbone while preserving weights.
+    """
+
+    with tfmot.quantization.keras.quantize_scope(
+        {
+            "FreezableBatchNorm": FreezableBatchNorm,
+        }
+    ):
+        annotated = tf.keras.models.clone_model(
+            backbone,
+            clone_function=_annotate_layer,
+        )
+
+        qat_backbone = (
+            tfmot.quantization.keras.quantize_apply(
+                annotated
+            )
+        )
+
     return qat_backbone
 
 
