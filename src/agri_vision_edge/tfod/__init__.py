@@ -22,6 +22,10 @@ from .export import (
     export_all,
 )
 
+from .mobilenetv2_bn_folding import (
+    fold_mobilenetv2_backbone
+)
+
 
 __all__ = [
     #
@@ -52,4 +56,9 @@ __all__ = [
     "export_saved_model",
     "export_tflite_graph",
     "export_all",
+
+    #
+    # QAT
+    #
+    "fold_mobilenetv2_backbone"
 ]
