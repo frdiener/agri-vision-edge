@@ -671,14 +671,30 @@ def train_loop(
           )
 
         if enable_qat_backbone:
-          print("Adding fake quantization nodes to the backbone...")
-          from agri_vision_edge.tfod.qat import quantize_backbone
           feature_extractor = detection_model.feature_extractor
-          feature_extractor.classification_backbone = (
-            quantize_backbone(
-              feature_extractor.classification_backbone
+          if enable_qat_backbone == 'folded':
+            from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
+            import tensorflow_model_optimization as tfmot
+            print("Folding batchnorms into the convolutions...")
+            folded_backbone = fold(feature_extractor.classification_backbone)
+          
+            print("Adding fake quantization nodes to the backbone...")
+            annotated = tfmot.quantization.keras.quantize_annotate_model(
+                folded_backbone
             )
-          )
+            qat_backbone = (
+                tfmot.quantization.keras.quantize_apply(
+                    annotated
+                )
+            )
+          else:
+            print("quantizing convolution wheights")
+            from agri_vision_edge.tfod.qat import quantize_backbone
+            feature_extractor = detection_model.feature_extractor
+            qat_backbone = quantize_backbone(
+                feature_extractor.classification_backbone
+              )
+          feature_extractor.classification_backbone = qat_backbone
           print("Evaluating initial quantized configuration...")
           metrics = eager_eval_loop(
               detection_model,
