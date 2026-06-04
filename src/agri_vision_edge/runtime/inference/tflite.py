@@ -74,6 +74,32 @@ class TFLiteRuntime(BaseRuntime):
             self.interpreter.get_output_details()
         )
 
+        print("\n=== OUTPUT DETAILS ===")
+
+        for detail in self.output_details:
+
+            print(
+                detail["name"],
+                detail["dtype"],
+                detail["quantization"],
+                detail["shape"],
+            )
+
+        if len(self.output_details) != 4:
+
+            output_names = [
+                d.get("name", "<unknown>")
+                for d in self.output_details
+            ]
+
+            raise RuntimeError(
+                "Unsupported TFLite detector.\n"
+                "Expected SSD-style outputs "
+                f"(boxes,scores,num,classes),\n"
+                f"got {len(self.output_details)} "
+                f"output tensor(s): {output_names}"
+            )
+        
         self._input_size = int(
             self.input_details[0]["shape"][1]
         )
