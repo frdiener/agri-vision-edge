@@ -14,39 +14,47 @@ keywords = [
   "imx8mp",
   "imx93"
 ]
-requires-python = ">=3.10"
-# dependencies = [
-#     "apache-beam>=2.73.0",
-#     "avro-python3>=1.10.2",
-#     "contextlib2>=21.6.0",
-#     "cython>=3.2.4",
-#     "lvis>=0.5.3",
-#     "lxml>=6.1.0",
-#     "matplotlib>=3.10.6",
-#     "pandas>=2.3.3",
-#     "pillow>=12.2.0",
-#     "pycocotools>=2.0.11",
-#     "pyparsing==2.4.7",
-#     "sacrebleu<=2.2.0",
-#     "scipy>=1.15.3",
-#     "six>=1.17.0",
-#     "tensorflow-io>=0.37.1",
-#     "tf-models-official>=2.15,<2.16",
-#     "tensorflow>=2.15,<2.16",
-#     "tf-slim>=1.1.0",
-# ]
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "tensorflow==2.12.0",
+    "tf-models-official>=2.12.0",
+    "tensorflow-model-optimization==0.7.5",
+    "tensorflow-text==2.12.*",
+    "tensorflow-hub==0.13.*",
+    # TFOD ecosystem
+    "tf-slim==1.1.0",
+    "pycocotools==2.0.7",
+    "lxml==5.2.2",
+    "contextlib2==21.6.0",
+    "pillow==10.3.0",
+    "matplotlib==3.8.4",
+    # Core numerical stack
+    "numpy==1.23.5",
+    "scipy==1.10.1",
+    "pandas==2.0.3",
+    # TF Models requirements
+    "protobuf==3.20.3",
+    "absl-py==1.4.0",
+    "six==1.16.0",
+    "Cython==3.0.10",
+    # Utilities
+    "opencv-python==4.9.0.80",
+    "tflite-support>=0.4.4",
+    "tensorflow-io>=0.37.1",
+    "tensorflow-addons==0.20.0",
+    "lvis>=0.5.3",
+    "tflite-runtime>=2.14.0",
+    # "netron>=9.1.0",
+]
 
 [dependency-groups]
 dev = [
     "reuse>=5.1.1",
     "basedpyright>=1.39.0",
-    "ruff>=0.15.10",
+    "ruff>=0.15.15",
     "pytest>=8.4",
     "ipython>=8.39.0",
-]
-inference = [
-    "opencv-python-headless>=4.13.0.92",
-    "pillow>=12.2.0",
-    "tensorflow>=2.21.0",
-    "tflite-runtime>=2.14.0",
+    "pydantic-ai>=0.0.51",
+    "jupyterlab==4.2.1",
+    "ipykernel==6.29.4",
 ]
