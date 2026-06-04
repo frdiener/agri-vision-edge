@@ -4,6 +4,7 @@ import tensorflow_model_optimization as tfmot
 from object_detection.core.freezable_batch_norm import FreezableBatchNorm
 from tensorflow_model_optimization.python.core.quantization.keras import quantize_config, quantize_layer
 from tensorflow.keras.utils import register_keras_serializable
+from tensorflow_model_optimization.quantization.keras import default_8bit
 
 
 @register_keras_serializable(package='CustomQuant', name='ConvWeightOnlyQuantizeConfig')
@@ -145,7 +146,8 @@ def quantize_backbone_full(backbone):
 
         qat_backbone = (
             tfmot.quantization.keras.quantize_apply(
-                annotated
+                annotated,
+                scheme=default_8bit.Default8BitQuantizationScheme(disable_per_axis=True)
             )
         )
 

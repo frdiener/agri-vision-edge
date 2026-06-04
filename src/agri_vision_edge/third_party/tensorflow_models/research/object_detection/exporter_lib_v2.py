@@ -260,6 +260,7 @@ def export_inference_graph(input_type,
     if qat_export == 'folded':
       from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
       import tensorflow_model_optimization as tfmot
+      from tensorflow_model_optimization.quantization.keras import default_8bit
       print("Folding batchnorms into the convolutions...")
       folded_backbone = fold(feature_extractor.classification_backbone)
 
@@ -269,7 +270,8 @@ def export_inference_graph(input_type,
       )
       qat_backbone = (
           tfmot.quantization.keras.quantize_apply(
-              annotated
+              annotated,
+              scheme=default_8bit.Default8BitQuantizationScheme(disable_per_axis=True)
           )
       )
     else:
