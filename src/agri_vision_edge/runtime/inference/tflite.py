@@ -19,10 +19,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from tflite_runtime.interpreter import (
-    Interpreter,
-    load_delegate,
-)
+import tensorflow as tf
+
+# Try tflite_runtime, but fallback to tf.lite
+try:
+    from tflite_runtime.interpreter import Interpreter, load_delegate
+except (ImportError, Exception):
+    Interpreter = tf.lite.Interpreter
+    load_delegate = tf.lite.experimental.load_delegate
 
 from .base import (
     BaseRuntime,
@@ -45,7 +49,7 @@ class TFLiteRuntime(BaseRuntime):
         model_path: str | Path,
         *,
         delegate_path: str | None = DEFAULT_TEFLON_LIB,
-        score_threshold: float = 0.3,
+        score_threshold: float = 0.0,
     ):
 
         self.model_path = Path(model_path)
@@ -215,17 +219,15 @@ class TFLiteRuntime(BaseRuntime):
 
         if dtype == np.int8:
 
-            scale, zero_point = (
-                input_detail["quantization"]
+            image = image.astype(
+                np.float32
             )
 
-            image = image.astype(np.float32)
+            image = image - 128.0
 
-            image = (
-                image / scale
-            ) + zero_point
-
-            image = np.round(image)
+            image = np.round(
+                image
+            )
 
             image = np.clip(
                 image,
@@ -233,7 +235,9 @@ class TFLiteRuntime(BaseRuntime):
                 127,
             )
 
-            image = image.astype(np.int8)
+            image = image.astype(
+                np.int8
+            )
 
         #
         # FP32
@@ -377,9 +381,17 @@ class TFLiteRuntime(BaseRuntime):
         scores = scores[0]
         boxes = boxes[0]
 
-        classes = np.round(
-            classes[0]
-        ).astype(np.int32)
+        classes_float = classes[0]
+
+        num = max(
+            0,
+            min(
+                num,
+                len(scores),
+                len(boxes),
+                len(classes_float),
+            ),
+        )
 
         #
         # COCO compatibility
@@ -396,21 +408,45 @@ class TFLiteRuntime(BaseRuntime):
 
         detections = []
 
+        kept = 0
+
+        rejected_score = 0
+        rejected_nan_score = 0
+        rejected_nan_class = 0
+
         for box, cls_id, score in zip(
             boxes[:num],
-            classes[:num],
+            classes_float[:num],
             scores[:num],
         ):
+
+            if np.isnan(score):
+
+                rejected_nan_score += 1
+                continue
+
+            if np.isnan(cls_id):
+
+                rejected_nan_class += 1
+                continue
 
             score = float(score)
 
             if score < self.score_threshold:
+
+                rejected_score += 1
                 continue
+
+            cls_id = int(
+                np.round(cls_id)
+            )
+
+            kept += 1
 
             detections.append(
                 Detection(
                     category_id=(
-                        int(cls_id)
+                        cls_id
                         + class_offset
                     ),
 
