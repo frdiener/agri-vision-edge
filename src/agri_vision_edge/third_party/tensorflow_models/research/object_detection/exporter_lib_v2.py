@@ -271,7 +271,7 @@ def export_inference_graph(input_type,
       qat_backbone = (
           tfmot.quantization.keras.quantize_apply(
               annotated,
-              scheme=default_8bit.Default8BitQuantizationScheme(disable_per_axis=True)
+              scheme=default_8bit.Default8BitQuantizeScheme(disable_per_axis=True)
           )
       )
     else:

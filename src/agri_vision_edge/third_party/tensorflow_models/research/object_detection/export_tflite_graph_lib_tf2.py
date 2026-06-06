@@ -253,7 +253,7 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
         qat_backbone = (
             tfmot.quantization.keras.quantize_apply(
                 annotated,
-                scheme=default_8bit.Default8BitQuantizationScheme(disable_per_axis=True)
+                scheme=default_8bit.Default8BitQuantizeScheme(disable_per_axis=True)
             )
         )
       else:
