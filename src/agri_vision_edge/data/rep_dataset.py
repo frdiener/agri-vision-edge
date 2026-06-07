@@ -73,8 +73,6 @@ def representative_dataset(
             )
         )
 
-        print(f"Yielding image {i}")
-        
         image_resized = (
             image_resized.astype(
                 np.float32
@@ -89,6 +87,24 @@ def representative_dataset(
         ]
 
         count += 1
+
+def normalized_representative_dataset():
+    """
+    Normalized Representative Dataset for use with raw backbone quantization without full SSD wrapper.
+    """
+    for sample in representative_dataset(
+        dataset=train_dataset,
+        indices=rep_ds_indices,
+        num_samples=200,
+        size=IMAGE_SIZE,
+    ):
+        x = sample[0]
+
+        x = (
+            2.0 / 255.0
+        ) * x - 1.0
+
+        yield [x]
 
 
 def build_rep_indices(
