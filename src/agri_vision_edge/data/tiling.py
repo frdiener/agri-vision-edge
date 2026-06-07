@@ -128,6 +128,31 @@ def crop_array(
     ]
 
 
+def compute_instance_areas(
+    semantics: np.ndarray,
+    plant_instances: np.ndarray,
+):
+    areas = {}
+
+    for label in (1, 2):
+        ids = np.unique(
+            plant_instances[
+                (semantics == label)
+                & (plant_instances > 0)
+            ]
+        )
+
+        for instance_id in ids:
+            areas[(label, int(instance_id))] = int(
+                (
+                    (plant_instances == instance_id)
+                    & (semantics == label)
+                ).sum()
+            )
+
+    return areas
+
+
 # --------------------------------------------------
 # Filtering
 # --------------------------------------------------
@@ -142,6 +167,8 @@ class FilterConfig:
 
     min_bbox_area: int = 0
 
+    min_visible_fraction: float = 0.0
+
 
 # --------------------------------------------------
 # BBox regeneration
@@ -152,14 +179,18 @@ def generate_plant_bboxes(
     semantics: np.ndarray,
     plant_instances: np.ndarray,
     filter_config: FilterConfig,
+    instance_areas: dict[
+        tuple[int, int],
+        int,
+    ] | None = None,
 ):
     """
-    Regenerate plant bboxes from
-    cropped masks.
+    Regenerate plant bboxes from cropped masks.
 
-    Returns bbox dictionaries in the
-    exact format expected by the rest
-    of the codebase.
+    If instance_areas is provided, visibility
+    fractions are computed against the original
+    uncropped instance area and can be filtered
+    via filter_config.min_visible_fraction.
     """
 
     boxes = []
@@ -189,6 +220,32 @@ def generate_plant_bboxes(
                 < filter_config.min_instance_pixels
             ):
                 continue
+
+            visible_fraction = None
+
+            if instance_areas is not None:
+
+                original_pixels = instance_areas.get(
+                    (
+                        int(label),
+                        int(instance_id),
+                    )
+                )
+
+                if (
+                    original_pixels is not None
+                    and original_pixels > 0
+                ):
+                    visible_fraction = (
+                        visible_pixels
+                        / original_pixels
+                    )
+
+                    if (
+                        visible_fraction
+                        < filter_config.min_visible_fraction
+                    ):
+                        continue
 
             ys, xs = np.where(mask)
 
@@ -224,22 +281,29 @@ def generate_plant_bboxes(
             ):
                 continue
 
-            boxes.append(
-                {
-                    "label": int(label),
-                    "corner": (
-                        xmin,
-                        ymin,
-                    ),
-                    "center": (
-                        xmin + width // 2,
-                        ymin + height // 2,
-                    ),
-                    "width": int(width),
-                    "height": int(height),
-                    "visible_pixels": visible_pixels,
-                }
-            )
+            bbox = {
+                "label": int(label),
+                "corner": (
+                    xmin,
+                    ymin,
+                ),
+                "center": (
+                    xmin + width // 2,
+                    ymin + height // 2,
+                ),
+                "width": int(width),
+                "height": int(height),
+                "visible_pixels": visible_pixels,
+            }
+
+            if visible_fraction is not None:
+                bbox[
+                    "visible_fraction"
+                ] = float(
+                    visible_fraction
+                )
+
+            boxes.append(bbox)
 
     return boxes
 
@@ -303,12 +367,16 @@ def tile_sample(
         tile,
     )
 
-    plant_bboxes = (
-        generate_plant_bboxes(
-            semantics_tile,
-            instances_tile,
-            filter_config,
-        )
+    instance_areas = compute_instance_areas(
+        semantics,
+        plant_instances,
+    )
+
+    plant_bboxes = generate_plant_bboxes(
+        semantics_tile,
+        instances_tile,
+        filter_config,
+        instance_areas=instance_areas,
     )
 
     result = dict(sample)
