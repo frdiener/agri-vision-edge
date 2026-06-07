@@ -305,4 +305,7 @@ def build_record(
 
         "target_size":
             target_size,
+
+        "hard_negatives":
+            negatives if not skip_negatives else 0,
     }
