@@ -19,12 +19,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-import tensorflow as tf
-
 # Try tflite_runtime, but fallback to tf.lite
 try:
     from tflite_runtime.interpreter import Interpreter, load_delegate
 except (ImportError, Exception):
+    import tensorflow as tf
     Interpreter = tf.lite.Interpreter
     load_delegate = tf.lite.experimental.load_delegate
 
