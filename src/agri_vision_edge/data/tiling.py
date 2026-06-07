@@ -14,6 +14,7 @@ fragments without relying on bbox shape.
 
 from __future__ import annotations
 
+from pathlib import Path
 from dataclasses import dataclass
 
 import numpy as np
@@ -425,9 +426,10 @@ class TiledPhenoBench:
             self.filter_config,
         )
 
+        image_path = Path(sample["image_name"])
+
         tiled["image_name"] = (
-            f"{sample['image_name']}"
-            f"_tile{tile_index}"
+            f"{image_path.stem}_tile{tile_index}{image_path.suffix}"
         )
 
         return tiled
