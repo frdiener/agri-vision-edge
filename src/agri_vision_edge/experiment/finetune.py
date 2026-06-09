@@ -88,6 +88,11 @@ class AugmentationConfig:
         1.2,
     )
 
+    # Hue adjustment.
+    #
+    # None disables brightness augmentation.
+    hue_max_delta: float | None = 0.2
+
     #
     # Compression robustness
     #

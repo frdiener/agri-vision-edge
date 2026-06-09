@@ -185,6 +185,19 @@ def _apply_augmentations(
         saturation.min_delta = saturation_min
         saturation.max_delta = saturation_max
 
+
+    #
+    # Hue
+    #
+
+    if aug.hue_max_delta is not None:
+
+        step = augmentations.add()
+
+        step.random_adjust_hue.max_delta = (
+            aug.hue_max_delta
+        )
+
     #
     # JPEG robustness
     #
