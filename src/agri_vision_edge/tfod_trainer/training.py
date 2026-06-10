@@ -90,6 +90,9 @@ def train(
         .num_steps
     )
 
+    print("Making trainstep_fn...")
+    train_step_fn = make_train_step(runtime)
+
     for _ in range(
         int(runtime.global_step.numpy()),
         train_steps,
@@ -97,15 +100,12 @@ def train(
 
         start = time.time()
 
-        print("Making trainstep_fn...")
-        train_step_fn = make_train_step(runtime)
 
         print("Running train step...")
         losses = train_step_fn(
             detection_model,
             iterator,
         )
-        print("completed train step")
 
         duration = time.time() - start
 
