@@ -252,34 +252,29 @@ def export_inference_graph(input_type,
 
   if qat_export:
     from agri_vision_edge.tfod.qat import (
-      ensure_model_is_built_for_qat)
+      ensure_model_is_built_for_qat,
+      quantize_backbone,
+    )
     ensure_model_is_built_for_qat(detection_model, pipeline_config)
     feature_extractor = (detection_model.feature_extractor)
     assert (feature_extractor.classification_backbone is not None)
 
     if qat_export == 'folded':
       from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
-      import tensorflow_model_optimization as tfmot
-      from tensorflow_model_optimization.quantization.keras import default_8bit
       print("Folding batchnorms into the convolutions...")
       folded_backbone = fold(feature_extractor.classification_backbone)
 
       print("Adding fake quantization nodes to the backbone...")
-      annotated = tfmot.quantization.keras.quantize_annotate_model(
-          folded_backbone
-      )
-      qat_backbone = (
-          tfmot.quantization.keras.quantize_apply(
-              annotated,
-              scheme=default_8bit.Default8BitQuantizeScheme(disable_per_axis=True)
-          )
+      qat_backbone = quantize_backbone(
+          folded_backbone,
+          scheme="full"
       )
     else:
       print("quantizing convolution wheights")
-      from agri_vision_edge.tfod.qat import quantize_backbone
       feature_extractor = detection_model.feature_extractor
       qat_backbone = quantize_backbone(
-          feature_extractor.classification_backbone
+          feature_extractor.classification_backbone,
+          scheme="wheights"
         )
     feature_extractor.classification_backbone = qat_backbone
 
