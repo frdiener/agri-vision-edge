@@ -151,7 +151,7 @@ def train(
         eval_input = inputs.eval_input(
                 eval_config=runtime.configs['eval_config'],
                 eval_input_config=runtime.configs['eval_input_config'],
-                model_config=runtime.configs['model_config'],
+                model_config=runtime.configs['model'],
                 model=detection_model)
         metrics_ref = eager_eval_loop(
             detection_model,
