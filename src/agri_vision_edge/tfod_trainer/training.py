@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import time
 
+from agri_vision_edge.tfod_trainer.setup import Runtime
 import tensorflow as tf
 
 from object_detection import inputs
 
 from object_detection.model_lib_v2 import (
     eager_train_step,
+    eager_eval_loop,
 )
 
 from .state import TrainerState
@@ -144,6 +146,21 @@ def train(
             )
         )
 
+        print("\nRunning reference evaluator...")
+
+        eval_input = inputs.eval_input(
+                eval_config=runtime.configs['eval_config'],
+                eval_input_config=runtime.configs['eval_input_config'],
+                model_config=runtime.configs['model_config'],
+                model=detection_model)
+        metrics_ref = eager_eval_loop(
+            detection_model,
+            runtime.configs,
+            eval_input,
+            use_tpu=False,
+            global_step=runtime.global_step,
+        )
+        
         metrics = evaluate(
             detection_model,
             create_eval_dataset(
