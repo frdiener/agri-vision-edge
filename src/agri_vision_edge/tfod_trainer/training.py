@@ -100,8 +100,6 @@ def train(
 
         start = time.time()
 
-
-        print("Running train step...")
         losses = train_step_fn(
             detection_model,
             iterator,
