@@ -671,11 +671,10 @@ def train_loop(
           )
 
         if enable_qat_backbone:
+          from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
+          from agri_vision_edge.tfod.qat import quantize_backbone
           feature_extractor = detection_model.feature_extractor
           if enable_qat_backbone == 'folded':
-            from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
-            import tensorflow_model_optimization as tfmot
-            from tensorflow_model_optimization.quantization.keras import default_8bit
             print("Folding batchnorms into the convolutions...")
             folded_backbone = fold(feature_extractor.classification_backbone)
           
@@ -686,7 +685,6 @@ def train_loop(
               )
           else:
             print("quantizing convolution wheights")
-            from agri_vision_edge.tfod.qat import quantize_backbone
             feature_extractor = detection_model.feature_extractor
             qat_backbone = quantize_backbone(
                 feature_extractor.classification_backbone
