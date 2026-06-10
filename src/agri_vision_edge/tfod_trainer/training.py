@@ -136,6 +136,16 @@ def train(
             "steps_per_sec"
         ] = 1.0 / duration
 
+        print(
+            f"Step {current_step}: "
+            + " | ".join(
+                [
+                    f"{k}={v:.4f}"
+                    for k, v in train_metrics.items()
+                ]
+            )
+        )
+
         metrics = evaluate(
             detection_model,
             create_eval_dataset(
@@ -152,6 +162,10 @@ def train(
         )
 
         if metric_value > state.best_metric:
+            print(
+                f"Metric improved: {metric_value} > {state.best_metric}."
+                f" saving checkpoint..."
+            )
 
             state.best_metric = (
                 metric_value
@@ -175,6 +189,10 @@ def train(
             )
 
         else:
+            print(
+                f"Metric did not improve: {metric_value} <= {state.best_metric} |"
+                f" (patience {state.patience_counter}/{trainer_cfg.early_stopping_patience})"
+            )
             state.patience_counter += 1
 
         if (
