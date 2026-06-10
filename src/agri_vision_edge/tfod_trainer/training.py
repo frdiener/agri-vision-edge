@@ -26,31 +26,34 @@ from .utils import (
 )
 
 
-@tf.function
-def train_step(
-    detection_model,
-    runtime,
-    iterator,
-):
-    features, labels = next(iterator)
+def make_train_step(runtime):
 
-    losses = eager_train_step(
+    @tf.function
+    def train_step(
         detection_model,
-        features,
-        labels,
-        runtime.unpad_groundtruth_tensors,
-        runtime.optimizer,
-        training_step=runtime.global_step,
-        add_regularization_loss=
-            runtime.add_regularization_loss,
-        clip_gradients_value=
-            runtime.clip_gradients_value,
-        num_replicas=1,
-    )
+        iterator,
+    ):
+        features, labels = next(iterator)
 
-    runtime.global_step.assign_add(1)
+        losses = eager_train_step(
+            detection_model,
+            features,
+            labels,
+            runtime.unpad_groundtruth_tensors,
+            runtime.optimizer,
+            training_step=runtime.global_step,
+            add_regularization_loss=
+                runtime.add_regularization_loss,
+            clip_gradients_value=
+                runtime.clip_gradients_value,
+            num_replicas=1,
+        )
 
-    return losses
+        runtime.global_step.assign_add(1)
+
+        return losses
+
+    return train_step
 
 
 def create_train_dataset(
@@ -94,9 +97,10 @@ def train(
 
         start = time.time()
 
-        losses = train_step(
+        train_step_fn = make_train_step(runtime)
+
+        losses = train_step_fn(
             detection_model,
-            runtime,
             iterator,
         )
 
