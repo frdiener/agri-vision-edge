@@ -26,6 +26,25 @@ from tensorflow_model_optimization.quantization.keras import default_8bit
 
 
 @register_keras_serializable()
+class FixedRelu6Quantizer(
+    tfmot.quantization.keras.quantizers.Quantizer
+):
+    def build(self, tensor_shape, name, layer):
+        return {}
+
+    def __call__(self, inputs, training, weights, **kwargs):
+        return tf.quantization.fake_quant_with_min_max_vars(
+            inputs,
+            min=0.0,
+            max=6.0,
+            num_bits=8,
+            narrow_range=False,
+        )
+
+    def get_config(self):
+        return {}
+
+@register_keras_serializable()
 class BaseQuantConfig(
     tfmot.quantization.keras.QuantizeConfig,
 ):
@@ -150,15 +169,7 @@ class FullQuantConfig(
     """
 
     def _activation_quantizer(self):
-        return (
-            tfmot.quantization.keras.quantizers
-            .MovingAverageQuantizer(
-                num_bits=8,
-                per_axis=False,
-                symmetric=False,
-                narrow_range=False,
-            )
-        )
+        return FixedRelu6Quantizer()
 
     def get_activations_and_quantizers(
         self,
