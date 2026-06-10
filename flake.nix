@@ -18,6 +18,8 @@
             protobuf_25
             yaml-language-server
             nodejs  # marimo copilot
+            netron
+            microcom
 
             uv
 
