@@ -680,15 +680,10 @@ def train_loop(
             folded_backbone = fold(feature_extractor.classification_backbone)
           
             print("Adding fake quantization nodes to the backbone...")
-            annotated = tfmot.quantization.keras.quantize_annotate_model(
-                folded_backbone
-            )
-            qat_backbone = (
-                tfmot.quantization.keras.quantize_apply(
-                    annotated,
-                    scheme=default_8bit.Default8BitQuantizeScheme(disable_per_axis=True)
-                )
-            )
+            qat_backbone = quantize_backbone(
+              folded_backbone,
+                scheme="full"
+              )
           else:
             print("quantizing convolution wheights")
             from agri_vision_edge.tfod.qat import quantize_backbone

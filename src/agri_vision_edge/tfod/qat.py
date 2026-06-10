@@ -1,72 +1,209 @@
+"""
+Quantization-aware training utilities for folded TFOD MobileNetV2 backbones.
+
+Three quantization schemes are supported:
+
+    * "legacy"
+        TFMOT's default MobileNetV2 quantization strategy.
+
+    * "weights"
+        Explicit per-tensor quantization of convolution weights.
+
+    * "full"
+        Explicit per-tensor quantization of convolution weights
+        and activations.
+
+The custom schemes preserve quantization metadata for all
+Conv2D and DepthwiseConv2D layers, enabling deployment on
+accelerators that do not support per-channel quantization.
+"""
+
 import tensorflow as tf
 import tensorflow_model_optimization as tfmot
-
 from object_detection.core.freezable_batch_norm import FreezableBatchNorm
-from tensorflow_model_optimization.python.core.quantization.keras import quantize_config, quantize_layer
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow_model_optimization.quantization.keras import default_8bit
 
 
-@register_keras_serializable(package='CustomQuant', name='ConvWeightOnlyQuantizeConfig')
-class ConvWeightOnlyQuantizeConfig(quantize_config.QuantizeConfig):
+@register_keras_serializable()
+class BaseQuantConfig(
+    tfmot.quantization.keras.QuantizeConfig,
+):
     """
-    Quantize only Conv weights, not activations between Conv and BatchNorm.
-    This allows the TFLite converter to fold BatchNorm into Conv.
+    Shared quantization configuration for convolutional layers.
     """
-    
-    def __init__(self, quant_min=-128, quant_max=127, symmetric=True, per_axis=False):
-        self.quant_min = quant_min
-        self.quant_max = quant_max
-        self.symmetric = symmetric
+
+    def __init__(
+        self,
+        *,
+        per_axis: bool,
+        symmetric: bool,
+    ):
         self.per_axis = per_axis
-    
-    def get_quantize_layer(self, layer, quantize_layer_name):
-        return quantize_layer.QuantizeLayer(
-            layer,
-            quantize_config=self,
-            name=quantize_layer_name
+        self.symmetric = symmetric
+
+    def _weight_quantizer(self):
+        return (
+            tfmot.quantization.keras.quantizers
+            .LastValueQuantizer(
+                num_bits=8,
+                per_axis=self.per_axis,
+                symmetric=self.symmetric,
+                narrow_range=True,
+            )
         )
-    
-    def get_weight_quantizers(self, layer):
-        return [tfmot.quantization.keras.quantizers.LastValueQuantizer(
-            num_bits=8,
-            symmetric=self.symmetric,
-            narrow_range=False,
-            per_axis=self.per_axis
-        )]
-    
-    def get_output_quantizers(self, layer):
-        return []
-    
-    def get_activations_and_quantizers(self, layer):
-        return []
-    
-    def get_weights_and_quantizers(self, layer):
-        weight_vars = layer.weights
-        quantizer = self.get_weight_quantizers(layer)[0]
-        return [(w, quantizer) for w in weight_vars]
-    
-    def set_quantize_activations(self, layer, activations):
-        # No-op: we don't quantize activations between layers
-        pass
-    
-    def set_quantize_weights(self, layer, weight_quantizers):
-        layer.quantize_config = self
-    
+
+    def _kernel(self, layer):
+        if isinstance(
+            layer,
+            tf.keras.layers.DepthwiseConv2D,
+        ):
+            return layer.depthwise_kernel
+
+        if isinstance(
+            layer,
+            tf.keras.layers.Conv2D,
+        ):
+            return layer.kernel
+
+        raise TypeError(
+            f"Unsupported layer: {type(layer)}"
+        )
+
+    def get_weights_and_quantizers(
+        self,
+        layer,
+    ):
+        return [
+            (
+                self._kernel(layer),
+                self._weight_quantizer(),
+            )
+        ]
+
+    def set_quantize_weights(
+        self,
+        layer,
+        quantize_weights,
+    ):
+        if isinstance(
+            layer,
+            tf.keras.layers.DepthwiseConv2D,
+        ):
+            layer.depthwise_kernel = (
+                quantize_weights[0]
+            )
+        else:
+            layer.kernel = (
+                quantize_weights[0]
+            )
+
     def get_config(self):
         return {
-            'quant_min': self.quant_min,
-            'quant_max': self.quant_max,
-            'symmetric': self.symmetric,
-            'per_axis': self.per_axis
+            "per_axis": self.per_axis,
+            "symmetric": self.symmetric,
         }
-    
+
     @classmethod
     def from_config(cls, config):
         return cls(**config)
 
 
-def _annotate_layer(layer, quantize_config=None):
+@register_keras_serializable()
+class WeightOnlyQuantConfig(
+    BaseQuantConfig,
+):
+    """
+    Quantize convolution weights only.
+
+    Activations remain unquantized except for any
+    additional TFMOT wrappers inserted by graph
+    transforms.
+    """
+
+    def get_activations_and_quantizers(
+        self,
+        layer,
+    ):
+        return []
+
+    def set_quantize_activations(
+        self,
+        layer,
+        quantize_activations,
+    ):
+        pass
+
+    def get_output_quantizers(
+        self,
+        layer,
+    ):
+        return []
+
+
+@register_keras_serializable()
+class FullQuantConfig(
+    BaseQuantConfig,
+):
+    """
+    Quantize convolution weights and activations.
+    """
+
+    def _activation_quantizer(self):
+        return (
+            tfmot.quantization.keras.quantizers
+            .MovingAverageQuantizer(
+                num_bits=8,
+                per_axis=False,
+                symmetric=False,
+                narrow_range=False,
+            )
+        )
+
+    def get_activations_and_quantizers(
+        self,
+        layer,
+    ):
+        if (
+            layer.activation
+            is tf.keras.activations.linear
+        ):
+            return []
+
+        return [
+            (
+                layer.activation,
+                self._activation_quantizer(),
+            )
+        ]
+
+    def set_quantize_activations(
+        self,
+        layer,
+        quantize_activations,
+    ):
+        if quantize_activations:
+            layer.activation = (
+                quantize_activations[0]
+            )
+
+    def get_output_quantizers(
+        self,
+        layer,
+    ):
+        return [
+            self._activation_quantizer(),
+        ]
+
+
+def annotate_conv_layers(
+    layer,
+    quantize_config,
+):
+    """
+    Annotate convolution layers for QAT.
+    """
+
     if isinstance(
         layer,
         (
@@ -74,84 +211,139 @@ def _annotate_layer(layer, quantize_config=None):
             tf.keras.layers.DepthwiseConv2D,
         ),
     ):
-        return tfmot.quantization.keras.quantize_annotate_layer(
-            layer,
-            quantize_config=quantize_config
+        return (
+            tfmot.quantization.keras
+            .quantize_annotate_layer(
+                layer,
+                quantize_config=quantize_config,
+            )
         )
-    
+
     return layer
 
 
-def quantize_backbone(backbone, per_axis=False, symmetric=True, num_bits=8):
-    """
-    Convert a TFOD MobileNetV2 backbone into a
-    TF-MOT QAT backbone while preserving weights.
-    
-    Only quantizes Conv weights, NOT activations between Conv and BatchNorm.
-    This allows BatchNorm folding and avoids MUL/ADD in TFLite.
-    
-    Args:
-        backbone: The original Keras backbone model
-        per_axis: Whether to use per-axis quantization. Set to False for Vivante NPU.
-        symmetric: Whether to use symmetric quantization
-        num_bits: Number of bits for quantization (default 8)
-    
-    Returns:
-        QAT-enabled backbone model
-    """
-    
-    quantize_config = ConvWeightOnlyQuantizeConfig(
-        per_axis=per_axis,
-        symmetric=symmetric
+def _quantize_backbone_legacy(
+    backbone,
+    *,
+    per_axis: bool,
+):
+    annotated = (
+        tfmot.quantization.keras
+        .quantize_annotate_model(
+            backbone
+        )
     )
-    
-    # Create a wrapper function that captures the quantize_config
-    def _annotate_layer_with_config(layer):
-        return _annotate_layer(layer, quantize_config)
-    
-    with tfmot.quantization.keras.quantize_scope(
-        {
-            "FreezableBatchNorm": FreezableBatchNorm,
-            "CustomQuant_ConvWeightOnlyQuantizeConfig": ConvWeightOnlyQuantizeConfig,
-        }
-    ):
-        annotated = tf.keras.models.clone_model(
-            backbone,
-            clone_function=_annotate_layer_with_config,
-        )
-        
-        qat_backbone = (
-            tfmot.quantization.keras.quantize_apply(
-                annotated
-            )
-        )
-    
-    return qat_backbone
-
-def quantize_backbone_full(backbone):
-    """
-    Convert a TFOD MobileNetV2 backbone into a
-    TF-MOT QAT backbone while preserving weights.
-    """
 
     with tfmot.quantization.keras.quantize_scope(
         {
-            "FreezableBatchNorm": FreezableBatchNorm,
+            "FreezableBatchNorm":
+                FreezableBatchNorm,
         }
     ):
-        annotated = tf.keras.models.clone_model(
-            backbone,
-            clone_function=_annotate_layer,
-        )
-
-        qat_backbone = (
-            tfmot.quantization.keras.quantize_apply(
+        return (
+            tfmot.quantization.keras
+            .quantize_apply(
                 annotated,
-                scheme=default_8bit.Default8BitQuantizeScheme(disable_per_axis=True)
+                scheme=default_8bit
+                .Default8BitQuantizeScheme(
+                    disable_per_axis=not per_axis,
+                ),
             )
         )
 
-    return qat_backbone
+    
+def _quantize_backbone_tfmot(
+    backbone,
+    *,
+    per_axis: bool,
+):
+    annotated = tfmot.quantization.keras.quantize_annotate_model(
+        backbone
+    )
+    return tfmot.quantization.keras.quantize_apply(
+        annotated,
+        scheme=default_8bit.Default8BitQuantizeScheme(
+            disable_per_axis=per_axis
+        )
+    )
+
+
+def quantize_backbone(
+    backbone,
+    *,
+    scheme: str = "weights",
+    per_axis: bool = False,
+    symmetric: bool = True,
+):
+    """
+    Convert a backbone model to a QAT-enabled model.
+
+    Supported schemes:
+
+        weights
+            Custom weight-only quantization.
+
+        full
+            Custom weight and activation quantization.
+
+        default_8bit
+            TFMOT Default8BitQuantizeScheme.
+
+        annotate_all
+            TFMOT default annotation and quantization.
+    """
+
+    tfmot_schemes = {
+        "default_8bit": _quantize_backbone_legacy,
+        "annotate_all": _quantize_backbone_tfmot,
+    }
+
+    if scheme in tfmot_schemes:
+        return tfmot_schemes[scheme](
+            backbone,
+            per_axis=per_axis,
+        )
+
+    custom_configs = {
+        "weights": WeightOnlyQuantConfig,
+        "full": FullQuantConfig,
+    }
+
+    try:
+        config_cls = custom_configs[scheme]
+    except KeyError as exc:
+        valid = [
+            *tfmot_schemes,
+            *custom_configs,
+        ]
+        raise ValueError(
+            f"Unknown quantization scheme '{scheme}'. "
+            f"Expected one of: {', '.join(valid)}."
+        ) from exc
+
+    quantize_config = config_cls(
+        per_axis=per_axis,
+        symmetric=symmetric,
+    )
+
+    with tfmot.quantization.keras.quantize_scope(
+        {
+            "FreezableBatchNorm": FreezableBatchNorm,
+            "WeightOnlyQuantConfig": WeightOnlyQuantConfig,
+            "FullQuantConfig": FullQuantConfig,
+        }
+    ):
+        annotated = tf.keras.models.clone_model(
+            backbone,
+            clone_function=lambda layer: annotate_conv_layers(
+                layer,
+                quantize_config,
+            ),
+        )
+
+        return tfmot.quantization.keras.quantize_apply(
+            annotated
+        )
 
 
 def ensure_model_is_built_for_qat(
