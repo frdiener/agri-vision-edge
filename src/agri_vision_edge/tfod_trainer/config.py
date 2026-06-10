@@ -25,7 +25,7 @@ class TrainerConfig:
     pipeline_config: Path
     train_dir: Path
 
-    log_every: int = 1000
+    log_every: int = 100
 
     checkpoint_max_to_keep: int = 3
 
