@@ -161,7 +161,7 @@ class WeightOnlyQuantConfig(
 
 
 @register_keras_serializable()
-class FullQuantConfig(
+class FullQuantFixedReLUConfig(
     BaseQuantConfig,
 ):
     """
@@ -170,6 +170,60 @@ class FullQuantConfig(
 
     def _activation_quantizer(self):
         return FixedRelu6Quantizer()
+
+    def get_activations_and_quantizers(
+        self,
+        layer,
+    ):
+        if (
+            layer.activation
+            is tf.keras.activations.linear
+        ):
+            return []
+
+        return [
+            (
+                layer.activation,
+                self._activation_quantizer(),
+            )
+        ]
+
+    def set_quantize_activations(
+        self,
+        layer,
+        quantize_activations,
+    ):
+        if quantize_activations:
+            layer.activation = (
+                quantize_activations[0]
+            )
+
+    def get_output_quantizers(
+        self,
+        layer,
+    ):
+        return [
+            self._activation_quantizer(),
+        ]
+
+
+@register_keras_serializable()
+class FullQuantConfig(
+    BaseQuantConfig,
+):
+    """
+    Quantize convolution weights and activations.
+    """
+
+    def _activation_quantizer(self):
+        return (
+            tfmot.quantization.keras.quantizers
+            .MovingAverageQuantizer(
+                num_bits=8,
+                per_axis=False,
+                symmetric=False,
+                narrow_range=False,
+            ))
 
     def get_activations_and_quantizers(
         self,
@@ -318,6 +372,7 @@ def quantize_backbone(
     custom_configs = {
         "weights": WeightOnlyQuantConfig,
         "full": FullQuantConfig,
+        "fixed": FullQuantFixedReLUConfig
     }
 
     try:
@@ -342,6 +397,7 @@ def quantize_backbone(
             "FreezableBatchNorm": FreezableBatchNorm,
             "WeightOnlyQuantConfig": WeightOnlyQuantConfig,
             "FullQuantConfig": FullQuantConfig,
+            "FullQuantFixedReLUConfig": FullQuantFixedReLUConfig,
         }
     ):
         annotated = tf.keras.models.clone_model(
