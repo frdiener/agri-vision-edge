@@ -8,8 +8,8 @@ import collections
 
 import tensorflow as tf
 
-from object_detection import model_lib
 from object_detection import inputs
+from object_detection import model_lib
 from object_detection.core import standard_fields as fields
 
 from object_detection.model_lib_v2 import (
@@ -22,13 +22,87 @@ from object_detection.model_lib_v2 import (
 def create_eval_dataset(
     detection_model,
     configs,
+    cache=True,
 ):
-    return inputs.eval_input(
+    """
+    Build the TFOD evaluation dataset.
+
+    When cache=True the fully preprocessed dataset is cached after
+    the first pass, which is beneficial when evaluating many
+    checkpoints on the same validation set.
+    """
+
+    dataset = inputs.eval_input(
         eval_config=configs["eval_config"],
         eval_input_config=
             configs["eval_input_configs"][0],
         model_config=configs["model"],
         model=detection_model,
+    )
+
+    if cache:
+        dataset = dataset.cache()
+
+    dataset = dataset.prefetch(
+        tf.data.AUTOTUNE
+    )
+
+    return dataset
+
+
+def materialize_eval_dataset(
+    eval_dataset,
+):
+    """
+    Convert the dataset into an in-memory list.
+
+    Useful when repeatedly evaluating many checkpoints against the
+    same validation set.
+
+    Returns:
+        list[(features, labels)]
+    """
+
+    return list(eval_dataset)
+
+
+@tf.function(
+    reduce_retracing=True,
+)
+def _eval_step(
+    detection_model,
+    features,
+    labels_unstacked,
+    add_regularization_loss,
+):
+    """
+    Compiled evaluation step.
+    """
+
+    losses_dict, prediction_dict = (
+        compute_losses_and_predictions_dicts(
+            detection_model,
+            features,
+            labels_unstacked,
+            training_step=None,
+            add_regularization_loss=
+                add_regularization_loss,
+        )
+    )
+
+    prediction_dict = (
+        detection_model.postprocess(
+            prediction_dict,
+            features[
+                fields.InputDataFields
+                .true_image_shape
+            ],
+        )
+    )
+
+    return (
+        losses_dict,
+        prediction_dict,
     )
 
 
@@ -39,6 +113,11 @@ def evaluate(
 ):
     """
     Run one complete evaluation pass.
+
+    eval_dataset may be either:
+        - tf.data.Dataset
+        - materialized list returned by
+          materialize_eval_dataset()
     """
 
     detection_model._is_training = False
@@ -59,23 +138,11 @@ def evaluate(
         )
 
         losses_dict, prediction_dict = (
-            compute_losses_and_predictions_dicts(
+            _eval_step(
                 detection_model,
                 features,
                 labels_unstacked,
-                training_step=None,
-                add_regularization_loss=
-                    runtime.add_regularization_loss,
-            )
-        )
-
-        prediction_dict = (
-            detection_model.postprocess(
-                prediction_dict,
-                features[
-                    fields.InputDataFields
-                    .true_image_shape
-                ],
+                runtime.add_regularization_loss,
             )
         )
 
@@ -86,7 +153,9 @@ def evaluate(
         )
 
         for evaluator in runtime.evaluators:
-            evaluator.add_eval_dict(eval_dict)
+            evaluator.add_eval_dict(
+                eval_dict
+            )
 
         for k, v in losses_dict.items():
             losses[k].append(v)
