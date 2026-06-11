@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import time
 
-from agri_vision_edge.tfod_trainer.setup import Runtime
+from agri_vision_edge.tfod_trainer.setup import (
+    Runtime,
+    maybe_load_fine_tune_checkpoint,
+)
 import tensorflow as tf
 
 from object_detection import inputs
@@ -83,6 +86,13 @@ def train(
     train_ds = create_train_dataset(
         detection_model,
         runtime.configs,
+    )
+
+    # Load pretrained weights before training (cold start only).
+    maybe_load_fine_tune_checkpoint(
+        detection_model,
+        runtime,
+        train_ds,
     )
 
     iterator = iter(train_ds)

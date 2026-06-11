@@ -20,7 +20,10 @@ from object_detection.protos import pipeline_pb2
 from object_detection.builders import model_builder
 from object_detection.builders import optimizer_builder
 from object_detection.utils import label_map_util
+from object_detection.utils import config_util
+from object_detection.utils import variables_helper
 from object_detection import eval_util
+from object_detection.model_lib_v2 import load_fine_tune_checkpoint
 
 
 @dataclass(slots=True)
@@ -116,6 +119,12 @@ def create_runtime(
     checkpoint_max_to_keep=3,
 ) -> Runtime:
 
+    # Resolve `fine_tune_checkpoint_type` from the deprecated
+    # `from_detection_checkpoint` field when it is not set explicitly.
+    config_util.update_fine_tune_checkpoint_type(
+        configs["train_config"]
+    )
+
     global_step = tf.Variable(
         0,
         trainable=False,
@@ -172,4 +181,62 @@ def create_runtime(
             .unpad_groundtruth_tensors
         ),
         clip_gradients_value=clip_gradients_value,
+    )
+
+
+def maybe_load_fine_tune_checkpoint(
+    detection_model,
+    runtime,
+    train_dataset,
+):
+    """
+    Restore pretrained weights from the pipeline's fine-tune checkpoint.
+
+    Mirrors ``object_detection.model_lib_v2.train_loop``: on a cold start
+    (no checkpoint in the train directory yet) the pretrained
+    detection/classification checkpoint referenced by the pipeline config is
+    loaded, so training fine-tunes from those weights instead of starting
+    from random initialization. Skipped when resuming an existing train-dir
+    checkpoint, since those weights were already restored in
+    ``create_runtime``.
+
+    ``train_dataset`` is required to build the model variables (via a dummy
+    forward pass) before the object-based restore.
+    """
+
+    if runtime.manager.latest_checkpoint:
+        # Resuming: weights already restored from the train directory.
+        return
+
+    train_config = runtime.configs["train_config"]
+
+    if not train_config.fine_tune_checkpoint:
+        print(
+            "No fine_tune_checkpoint set; "
+            "training from scratch."
+        )
+        return
+
+    print(
+        "Loading fine-tune checkpoint "
+        f"({train_config.fine_tune_checkpoint_type}): "
+        f"{train_config.fine_tune_checkpoint}"
+    )
+
+    variables_helper.ensure_checkpoint_supported(
+        train_config.fine_tune_checkpoint,
+        train_config.fine_tune_checkpoint_type,
+        runtime.manager.directory,
+    )
+
+    load_fine_tune_checkpoint(
+        detection_model,
+        train_config.fine_tune_checkpoint,
+        train_config.fine_tune_checkpoint_type,
+        train_config.fine_tune_checkpoint_version,
+        # Force the dummy forward pass so all model variables exist before
+        # the object-based restore matches them.
+        True,
+        train_dataset,
+        runtime.unpad_groundtruth_tensors,
     )
