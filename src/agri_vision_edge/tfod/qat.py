@@ -1,21 +1,27 @@
 """
 Quantization-aware training utilities for folded TFOD MobileNetV2 backbones.
 
-Three quantization schemes are supported:
+The deployment accelerator only supports PER-TENSOR int8 quantization, so the
+core job here is to emit per-tensor weights reliably. TFMOT's built-in
+Default8BitQuantizeScheme ("default_8bit" / "annotate_all" below) cannot be
+trusted for this: annotating the whole model inserts fake-quant no-ops at some
+points, and those make the TFLite converter ignore the per-tensor
+(disable_per_channel) request and silently emit per-channel weights. To avoid
+that, the custom schemes annotate ONLY Conv2D / DepthwiseConv2D layers and pin
+per-tensor quantization explicitly via LastValueQuantizer(per_axis=False).
 
-    * "legacy"
-        TFMOT's default MobileNetV2 quantization strategy.
+Custom (recommended) schemes - see ``quantize_backbone`` for the full list and
+per-scheme caveats:
 
-    * "weights"
-        Explicit per-tensor quantization of convolution weights.
+    * "weights"  - per-tensor weights only.
+    * "full"     - weights + MovingAverage activation ranges.
+    * "fixed"    - weights + fixed [0, 6] activation ranges.
+    * "full_av"  - weights + AllValues activation ranges.
+    * "mixed"    - per-layer: fixed [0, 6] for conv->ReLU6, AllValues for
+                   signed convs. RECOMMENDED.
 
-    * "full"
-        Explicit per-tensor quantization of convolution weights
-        and activations.
-
-The custom schemes preserve quantization metadata for all
-Conv2D and DepthwiseConv2D layers, enabling deployment on
-accelerators that do not support per-channel quantization.
+Legacy/comparison schemes ("default_8bit", "annotate_all") use the TFMOT
+default scheme and suffer the per-channel leakage described above.
 """
 
 import tensorflow as tf
@@ -366,6 +372,21 @@ def _quantize_backbone_legacy(
     *,
     per_axis: bool,
 ):
+    """
+    TFMOT Default8BitQuantizeScheme path (disable_per_axis controls
+    per-tensor vs per-channel weight quantization).
+
+    KNOWN PROBLEM: this scheme annotates the whole model, which inserts
+    fake-quant no-ops at some points (e.g. around add / passthrough ops).
+    Those extra nodes make the TFLite converter ignore the per-tensor
+    (disable_per_channel) request, so weights silently come out per-channel -
+    which the deployment accelerator does not support. The custom
+    QuantizeConfig schemes ("weights"/"full"/"fixed"/"full_av"/"mixed") were
+    introduced to avoid this: they annotate only Conv/DepthwiseConv and pin
+    per-tensor quantization explicitly via LastValueQuantizer(per_axis=False).
+    Prefer those; keep this only for comparison.
+    """
+
     annotated = (
         tfmot.quantization.keras
         .quantize_annotate_model(
@@ -396,6 +417,14 @@ def _quantize_backbone_tfmot(
     *,
     per_axis: bool,
 ):
+    """
+    Plain TFMOT default annotation + apply. Same KNOWN PROBLEM as
+    ``_quantize_backbone_legacy``: whole-model annotation inserts fake-quant
+    no-ops that make the converter ignore the per-tensor request and emit
+    per-channel weights (unsupported on the target). Kept for comparison;
+    prefer the custom QuantizeConfig schemes.
+    """
+
     annotated = tfmot.quantization.keras.quantize_annotate_model(
         backbone
     )
@@ -574,10 +603,14 @@ def quantize_backbone(
             needed. RECOMMENDED. See _quantize_backbone_mixed.
 
         default_8bit
-            TFMOT Default8BitQuantizeScheme.
+            TFMOT Default8BitQuantizeScheme. LEGACY/comparison only - its
+            whole-model annotation inserts fake-quant no-ops that make the
+            converter ignore the per-tensor request and emit per-channel
+            weights (unsupported on the target). See _quantize_backbone_legacy.
 
         annotate_all
-            TFMOT default annotation and quantization.
+            TFMOT default annotation and quantization. Same per-channel
+            leakage problem as "default_8bit". See _quantize_backbone_tfmot.
     """
 
     tfmot_schemes = {
