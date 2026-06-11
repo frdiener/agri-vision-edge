@@ -172,12 +172,15 @@ class FullQuantFixedReLUConfig(
     op only when the output tensor's effective dequantized range,
     (quantized_max - zero_point) * scale, stays <= 6.0 + RELU6_EPSILON. The
     learned-range schemes (MovingAverage in ``FullQuantConfig``, AllValues in
-    ``FullQuantAllValuesConfig``) derive scale/zero_point from observed
-    activations, so this computed range can exceed 6 and the op is rejected.
-    A hard [0, 6] range makes the dequantized range exactly 6, accepted by
-    any delegate. (The current target runs a patched mesa with a larger
-    RELU6_EPSILON, so the learned-range schemes also deploy there - but
-    "fixed" remains the portable, stock-delegate-safe option.)
+    ``FullQuantAllValuesConfig``) are asymmetric (symmetric=False), so on a
+    post-ReLU6 tensor they learn a min that dips slightly *below* 0. The
+    zero-point is then nudged to keep 0 exactly representable, which pushes
+    the dequantized max (quantized_max - zero_point) * scale just *above* 6
+    and the op is rejected. A hard [0, 6] range pins min=0 exactly, so the
+    dequantized range is exactly 6 and the op is accepted by any delegate.
+    (The current target runs a patched mesa with a larger RELU6_EPSILON, so
+    the learned-range schemes also deploy there - but "fixed" remains the
+    portable, stock-delegate-safe option.)
 
     KNOWN PROBLEM: the same fixed [0, 6] range is also applied as the OUTPUT
     quantizer of *linear* (signed) convolutions - e.g. the inverted-residual
@@ -305,14 +308,16 @@ class FullQuantAllValuesConfig(
     ~1 step, so the signed dynamic range of the backbone features is
     preserved and the scores are no longer capped.
 
-    KNOWN CAVEAT: like MovingAverage - and unlike
-    ``FullQuantFixedReLUConfig`` - the learned scale/zero_point on post-ReLU6
-    tensors can make the effective dequantized range,
-    (quantized_max - zero_point) * scale, exceed 6.0. A stock delegate
-    rejects the ReLU6 op when that range is above 6 + RELU6_EPSILON (the
-    exact reason the "fixed" scheme was added). The current target runs a
-    PATCHED mesa with a larger RELU6_EPSILON, so this scheme is expected to
-    deploy there; on a stock/unpatched delegate, fall back to "fixed".
+    KNOWN CAVEAT: this quantizer is asymmetric (symmetric=False), like
+    MovingAverage and unlike ``FullQuantFixedReLUConfig``. On a post-ReLU6
+    tensor it learns a min slightly below 0; the zero-point nudge then pushes
+    the dequantized max (quantized_max - zero_point) * scale just above 6. A
+    stock delegate rejects the ReLU6 op when that exceeds 6 + RELU6_EPSILON
+    (the exact reason the "fixed" scheme was added). The current target runs
+    a PATCHED mesa with a larger RELU6_EPSILON, so this scheme is expected to
+    deploy there; on a stock/unpatched delegate, fall back to "fixed". Note
+    the overshoot is only legitimately roundable to [0, 6] when it is within
+    one int8 step (RELU6_EPSILON < scale ~= 6/255).
 
     Inherits the activation / output wiring from ``FullQuantConfig`` and only
     swaps the quantizer.
@@ -431,10 +436,10 @@ def quantize_backbone(
         full_av
             Like "full" but uses AllValues activation ranges, which
             calibrate immediately and preserve signed dynamic range (fixes
-            the ~0.5 score collapse). Its post-ReLU6 dequantized range
-            (quantized_max - zero_point) * scale can exceed 6 and be rejected
-            by a stock delegate (ok on the patched mesa). See
-            FullQuantAllValuesConfig.
+            the ~0.5 score collapse). Being asymmetric, its post-ReLU6 min
+            undershoots 0 and the zero-point nudge pushes the dequantized max
+            just above 6, so a stock delegate rejects the ReLU6 op (ok on the
+            patched mesa). See FullQuantAllValuesConfig.
 
         default_8bit
             TFMOT Default8BitQuantizeScheme.
