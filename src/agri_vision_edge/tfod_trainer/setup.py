@@ -300,3 +300,90 @@ def restore_weights(
         runtime,
         train_dataset,
     )
+
+
+def apply_graph_modifications(
+    detection_model,
+    runtime,
+    trainer_cfg,
+    train_dataset,
+):
+    """
+    Apply optimizer reset, BatchNorm folding and backbone QAT.
+
+    Functionally mirrors the corresponding block in
+    ``object_detection.model_lib_v2.train_loop``, in the same order:
+
+      1. ``reset_optimizer``: zero the global step and rebuild the optimizer
+         from the pipeline config.
+      2. ``fold_bn``: fold BatchNorm layers into the preceding convolutions.
+      3. ``qat_scheme``: insert fake-quantization nodes into the backbone
+         using ``agri_vision_edge.tfod.qat.quantize_backbone``.
+
+    Must run after ``restore_weights`` (so the loaded weights are folded /
+    quantized) and before the train step is traced (so the rebuilt optimizer
+    and modified backbone are captured). Mutates ``runtime`` and
+    ``detection_model`` in place.
+
+    Returns:
+        bool: True if the backbone graph was modified (folding or QAT), so
+        the caller can run an initial evaluation of the new configuration.
+    """
+
+    train_config = runtime.configs["train_config"]
+
+    if trainer_cfg.reset_optimizer:
+        print("Resetting the optimizer...")
+        runtime.global_step.assign(0)
+        optimizer, (learning_rate,) = (
+            optimizer_builder.build(
+                train_config.optimizer,
+                global_step=runtime.global_step,
+            )
+        )
+        runtime.optimizer = optimizer
+        runtime.learning_rate = learning_rate
+
+    if not (trainer_cfg.fold_bn or trainer_cfg.qat_enabled):
+        return False
+
+    # Folding and cloning require the backbone variables to exist.
+    _ensure_model_is_built(
+        detection_model,
+        train_dataset,
+        runtime.unpad_groundtruth_tensors,
+    )
+
+    feature_extractor = detection_model.feature_extractor
+
+    if trainer_cfg.fold_bn:
+        # Imported lazily to mirror train_loop and avoid import cycles.
+        from agri_vision_edge.tfod import (
+            fold_mobilenetv2_backbone,
+        )
+
+        print("Folding batchnorms into the convolutions...")
+        feature_extractor.classification_backbone = (
+            fold_mobilenetv2_backbone(
+                feature_extractor.classification_backbone
+            )
+        )
+
+    if trainer_cfg.qat_enabled:
+        from agri_vision_edge.tfod.qat import (
+            quantize_backbone,
+        )
+
+        scheme = trainer_cfg.qat_scheme.value
+        print(
+            "Adding fake quantization nodes to the "
+            f"backbone (scheme={scheme})..."
+        )
+        feature_extractor.classification_backbone = (
+            quantize_backbone(
+                feature_extractor.classification_backbone,
+                scheme=scheme,
+            )
+        )
+
+    return True

@@ -9,6 +9,7 @@ import time
 from agri_vision_edge.tfod_trainer.setup import (
     Runtime,
     restore_weights,
+    apply_graph_modifications,
 )
 import tensorflow as tf
 
@@ -94,6 +95,34 @@ def train(
         runtime,
         train_ds,
     )
+
+    # Apply optimizer reset / BN folding / backbone QAT before the train
+    # step is traced, so the modified optimizer and backbone are captured.
+    graph_modified = apply_graph_modifications(
+        detection_model,
+        runtime,
+        trainer_cfg,
+        train_ds,
+    )
+
+    if graph_modified:
+        print(
+            "\nEvaluating initial modified "
+            "configuration..."
+        )
+        eval_input = inputs.eval_input(
+            eval_config=runtime.configs['eval_config'],
+            eval_input_config=runtime.configs['eval_input_config'],
+            model_config=runtime.configs['model'],
+            model=detection_model,
+        )
+        eager_eval_loop(
+            detection_model,
+            runtime.configs,
+            eval_input,
+            use_tpu=False,
+            global_step=runtime.global_step,
+        )
 
     iterator = iter(train_ds)
 

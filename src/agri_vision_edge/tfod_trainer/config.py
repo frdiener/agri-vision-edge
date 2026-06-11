@@ -10,9 +10,20 @@ from pathlib import Path
 
 
 class QATScheme(str, Enum):
-    FULL = "full"
+    """
+    Backbone quantization schemes supported by
+    ``agri_vision_edge.tfod.qat.quantize_backbone``.
+    """
+
+    # Custom QuantizeConfig schemes.
     WEIGHTS = "weights"
-    FOLDED = "folded"
+    FULL = "full"
+    FIXED = "fixed"
+
+    # TFMOT Default8BitQuantizeScheme variants.
+    DEFAULT_8BIT = "default_8bit"
+    ANNOTATE_ALL = "annotate_all"
+
 
 @dataclass(slots=True)
 class TrainerConfig:
@@ -39,7 +50,14 @@ class TrainerConfig:
     save_metrics_history: bool = True
 
     reset_optimizer: bool = False
-    qat_scheme: QATScheme = QATScheme.FOLDED
+
+    # Fold BatchNorm into the preceding convolutions before training
+    # (mirrors `fold_bn` in object_detection.model_lib_v2.train_loop).
+    fold_bn: bool = False
+
+    # Backbone quantization scheme, or None to disable QAT
+    # (mirrors `qat_backbone` in train_loop).
+    qat_scheme: QATScheme | None = None
 
     def __post_init__(self):
         if isinstance(self.qat_scheme, str):

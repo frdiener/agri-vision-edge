@@ -1,4 +1,4 @@
-from .config import TrainerConfig
+from .config import TrainerConfig, QATScheme
 from .state import TrainerState
 
 from .setup import (
@@ -8,6 +8,7 @@ from .setup import (
     create_runtime,
     maybe_load_fine_tune_checkpoint,
     restore_weights,
+    apply_graph_modifications,
 )
 
 from .training import train
