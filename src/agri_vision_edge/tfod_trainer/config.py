@@ -18,9 +18,6 @@ class QATScheme(str, Enum):
     # Custom QuantizeConfig schemes.
     WEIGHTS = "weights"
     FULL = "full"
-    FIXED = "fixed"
-    FULL_AV = "full_av"
-    MIXED = "mixed"
 
     # TFMOT Default8BitQuantizeScheme variants.
     DEFAULT_8BIT = "default_8bit"
