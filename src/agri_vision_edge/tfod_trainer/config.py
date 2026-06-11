@@ -20,6 +20,7 @@ class QATScheme(str, Enum):
     FULL = "full"
     FIXED = "fixed"
     FULL_AV = "full_av"
+    MIXED = "mixed"
 
     # TFMOT Default8BitQuantizeScheme variants.
     DEFAULT_8BIT = "default_8bit"

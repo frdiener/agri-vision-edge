@@ -407,6 +407,132 @@ def _quantize_backbone_tfmot(
     )
 
 
+def _relu6_fed_conv_names(backbone):
+    """
+    Names of Conv2D / DepthwiseConv2D layers whose output feeds a ReLU6
+    (max_value == 6), following through BatchNorm / ZeroPadding.
+
+    These convs fuse into a conv+ReLU6 op whose output is genuinely [0, 6]
+    (non-negative), so a min-pinned [0, 6] quantizer is appropriate. Every
+    other conv (e.g. the inverted-residual projection / bottleneck convs)
+    produces a signed output and wants a signed quantizer instead.
+    """
+
+    def is_relu6(layer):
+        return (
+            isinstance(layer, tf.keras.layers.ReLU)
+            and getattr(layer, "max_value", None) == 6
+        )
+
+    passthrough = (
+        tf.keras.layers.BatchNormalization,
+        FreezableBatchNorm,
+        tf.keras.layers.ZeroPadding2D,
+    )
+
+    consumers = {l.name: [] for l in backbone.layers}
+    for layer in backbone.layers:
+        for node in layer._outbound_nodes:
+            consumers[layer.name].append(node.outbound_layer)
+
+    def feeds_relu6(layer):
+        for consumer in consumers[layer.name]:
+            nxt = consumer
+            while isinstance(nxt, passthrough):
+                downstream = consumers[nxt.name]
+                if not downstream:
+                    break
+                nxt = downstream[0]
+            if is_relu6(nxt):
+                return True
+        return False
+
+    return {
+        layer.name
+        for layer in backbone.layers
+        if isinstance(
+            layer,
+            (
+                tf.keras.layers.Conv2D,
+                tf.keras.layers.DepthwiseConv2D,
+            ),
+        )
+        and feeds_relu6(layer)
+    }
+
+
+def _quantize_backbone_mixed(
+    backbone,
+    *,
+    per_axis: bool,
+    symmetric: bool,
+):
+    """
+    Per-layer scheme that avoids both known QAT problems without a mesa patch:
+
+      * convs feeding a ReLU6 -> FixedRelu6 [0, 6] quantizer. min is pinned at
+        0, so there is no zero-point undershoot and the fused conv+ReLU6 op's
+        dequantized range is exactly 6 (accepted by a stock delegate).
+      * all other (signed) convs -> AllValues quantizer, preserving the signed
+        dynamic range (no ~±6 clamp, so detection scores do not collapse).
+
+    See FullQuantFixedReLUConfig / FullQuantAllValuesConfig for the underlying
+    configs and the problems each one addresses.
+    """
+
+    relu6_fed = _relu6_fed_conv_names(backbone)
+
+    fixed_cfg = FullQuantFixedReLUConfig(
+        per_axis=per_axis,
+        symmetric=symmetric,
+    )
+    signed_cfg = FullQuantAllValuesConfig(
+        per_axis=per_axis,
+        symmetric=symmetric,
+    )
+
+    def clone_function(layer):
+        if isinstance(
+            layer,
+            (
+                tf.keras.layers.Conv2D,
+                tf.keras.layers.DepthwiseConv2D,
+            ),
+        ):
+            config = (
+                fixed_cfg
+                if layer.name in relu6_fed
+                else signed_cfg
+            )
+            return (
+                tfmot.quantization.keras
+                .quantize_annotate_layer(
+                    layer,
+                    quantize_config=config,
+                )
+            )
+
+        return layer
+
+    with tfmot.quantization.keras.quantize_scope(
+        {
+            "FreezableBatchNorm": FreezableBatchNorm,
+            "WeightOnlyQuantConfig": WeightOnlyQuantConfig,
+            "FullQuantConfig": FullQuantConfig,
+            "FullQuantFixedReLUConfig": FullQuantFixedReLUConfig,
+            "FullQuantAllValuesConfig": FullQuantAllValuesConfig,
+        }
+    ):
+        annotated = tf.keras.models.clone_model(
+            backbone,
+            clone_function=clone_function,
+        )
+
+        return tfmot.quantization.keras.quantize_apply(
+            annotated
+        )
+
+
 def quantize_backbone(
     backbone,
     *,
@@ -441,6 +567,12 @@ def quantize_backbone(
             just above 6, so a stock delegate rejects the ReLU6 op (ok on the
             patched mesa). See FullQuantAllValuesConfig.
 
+        mixed
+            Per-layer combination: FixedRelu6 [0, 6] for convs feeding a
+            ReLU6, AllValues for signed convs. Avoids both the ~0.5 score
+            collapse and the stock-delegate ReLU6 rejection - no mesa patch
+            needed. RECOMMENDED. See _quantize_backbone_mixed.
+
         default_8bit
             TFMOT Default8BitQuantizeScheme.
 
@@ -459,6 +591,13 @@ def quantize_backbone(
             per_axis=per_axis,
         )
 
+    if scheme == "mixed":
+        return _quantize_backbone_mixed(
+            backbone,
+            per_axis=per_axis,
+            symmetric=symmetric,
+        )
+
     custom_configs = {
         "weights": WeightOnlyQuantConfig,
         "full": FullQuantConfig,
@@ -472,6 +611,7 @@ def quantize_backbone(
         valid = [
             *tfmot_schemes,
             *custom_configs,
+            "mixed",
         ]
         raise ValueError(
             f"Unknown quantization scheme '{scheme}'. "
