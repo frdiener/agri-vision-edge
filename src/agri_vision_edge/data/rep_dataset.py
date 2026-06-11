@@ -88,23 +88,29 @@ def representative_dataset(
 
         count += 1
 
-def normalized_representative_dataset():
+def normalized_representative_dataset(
+    dataset,
+    indices=None,
+    num_samples=100,
+    size=320,
+):
     """
-    Normalized Representative Dataset for use with raw backbone quantization without full SSD wrapper.
+    Representative dataset yielding inputs normalized to [-1, 1].
+
+    Use this whenever the converted graph expects already-preprocessed input,
+    e.g. ``SSDModule.inference_fn`` (which calls ``model.predict`` WITHOUT the
+    SSD preprocessing step) or a raw backbone without the full SSD wrapper.
+    Feeding the raw [0, 255] ``representative_dataset`` to such a graph
+    saturates calibration and collapses detection scores to sigmoid(0) = 0.5.
     """
+
     for sample in representative_dataset(
-        dataset=train_dataset,
-        indices=rep_ds_indices,
-        num_samples=200,
-        size=IMAGE_SIZE,
+        dataset=dataset,
+        indices=indices,
+        num_samples=num_samples,
+        size=size,
     ):
-        x = sample[0]
-
-        x = (
-            2.0 / 255.0
-        ) * x - 1.0
-
-        yield [x]
+        yield [(2.0 / 255.0) * sample[0] - 1.0]
 
 
 def build_rep_indices(

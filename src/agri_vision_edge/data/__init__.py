@@ -41,6 +41,7 @@ from .tfrecord import (
 
 from .rep_dataset import (
     representative_dataset,
+    normalized_representative_dataset,
     build_rep_indices,
 )
 
@@ -61,6 +62,7 @@ __all__ = [
     "export_coco_annotations",
     "build_record",
     "representative_dataset",
+    "normalized_representative_dataset",
     "build_rep_indices",
     "write_label_map",
 ]
