@@ -165,7 +165,26 @@ class FullQuantFixedReLUConfig(
     BaseQuantConfig,
 ):
     """
-    Quantize convolution weights and activations.
+    Quantize convolution weights and activations, pinning activation /
+    output ranges to a fixed [0, 6].
+
+    Why this exists: the deployment delegate (teflon/mesa) accepts a ReLU6
+    op only when the output tensor's effective dequantized range,
+    (quantized_max - zero_point) * scale, stays <= 6.0 + RELU6_EPSILON. The
+    learned-range schemes (MovingAverage in ``FullQuantConfig``, AllValues in
+    ``FullQuantAllValuesConfig``) derive scale/zero_point from observed
+    activations, so this computed range can exceed 6 and the op is rejected.
+    A hard [0, 6] range makes the dequantized range exactly 6, accepted by
+    any delegate. (The current target runs a patched mesa with a larger
+    RELU6_EPSILON, so the learned-range schemes also deploy there - but
+    "fixed" remains the portable, stock-delegate-safe option.)
+
+    KNOWN PROBLEM: the same fixed [0, 6] range is also applied as the OUTPUT
+    quantizer of *linear* (signed) convolutions - e.g. the inverted-residual
+    projection / bottleneck convs, which have no ReLU and produce negative
+    values. Those negatives are clamped to 0, discarding half the signal.
+    Deployment-safe but lossy; expect reduced accuracy versus a signed
+    quantizer.
     """
 
     def _activation_quantizer(self):
@@ -212,7 +231,18 @@ class FullQuantConfig(
     BaseQuantConfig,
 ):
     """
-    Quantize convolution weights and activations.
+    Quantize convolution weights and activations with a MovingAverage
+    (EMA) range for activations / outputs.
+
+    KNOWN PROBLEM: MovingAverageQuantizer initialises its range to [-6, 6]
+    and expands it through a slow EMA. Over a typical QAT fine-tune
+    (hundreds to low-thousands of steps) the range barely moves off [-6, 6],
+    so every quantized activation / output - including the signed backbone
+    feature maps feeding the SSD head - is effectively hard-clamped to ~±6.
+    That squashes the logits and detection scores saturate near
+    sigmoid(0) = 0.5. It only calibrates properly after many thousands of
+    steps. Prefer ``FullQuantAllValuesConfig`` ("full_av"), which calibrates
+    in ~1 step. See that class for the deployment caveat.
     """
 
     def _activation_quantizer(self):
@@ -259,6 +289,45 @@ class FullQuantConfig(
         return [
             self._activation_quantizer(),
         ]
+
+
+@register_keras_serializable()
+class FullQuantAllValuesConfig(
+    FullQuantConfig,
+):
+    """
+    Full quantization (weights + activations) using an AllValues range for
+    activations / outputs instead of a MovingAverage EMA.
+
+    Motivation: ``FullQuantConfig`` clamps activations to ~±6 during normal
+    fine-tunes (see its docstring), collapsing detection scores to ~0.5.
+    AllValuesQuantizer tracks the true observed min/max and calibrates within
+    ~1 step, so the signed dynamic range of the backbone features is
+    preserved and the scores are no longer capped.
+
+    KNOWN CAVEAT: like MovingAverage - and unlike
+    ``FullQuantFixedReLUConfig`` - the learned scale/zero_point on post-ReLU6
+    tensors can make the effective dequantized range,
+    (quantized_max - zero_point) * scale, exceed 6.0. A stock delegate
+    rejects the ReLU6 op when that range is above 6 + RELU6_EPSILON (the
+    exact reason the "fixed" scheme was added). The current target runs a
+    PATCHED mesa with a larger RELU6_EPSILON, so this scheme is expected to
+    deploy there; on a stock/unpatched delegate, fall back to "fixed".
+
+    Inherits the activation / output wiring from ``FullQuantConfig`` and only
+    swaps the quantizer.
+    """
+
+    def _activation_quantizer(self):
+        return (
+            tfmot.quantization.keras.quantizers
+            .AllValuesQuantizer(
+                num_bits=8,
+                per_axis=False,
+                symmetric=False,
+                narrow_range=False,
+            )
+        )
 
 
 def annotate_conv_layers(
@@ -349,7 +418,23 @@ def quantize_backbone(
             Custom weight-only quantization.
 
         full
-            Custom weight and activation quantization.
+            Custom weight and activation quantization (MovingAverage
+            activation range). NOTE: clamps activations to ~±6 during
+            normal-length fine-tunes -> scores collapse to ~0.5. See
+            FullQuantConfig.
+
+        fixed
+            Like "full" but pins activation ranges to a fixed [0, 6] so
+            conv+ReLU6 ops stay fusible on the deployment delegate. Clamps
+            signed conv outputs. See FullQuantFixedReLUConfig.
+
+        full_av
+            Like "full" but uses AllValues activation ranges, which
+            calibrate immediately and preserve signed dynamic range (fixes
+            the ~0.5 score collapse). Its post-ReLU6 dequantized range
+            (quantized_max - zero_point) * scale can exceed 6 and be rejected
+            by a stock delegate (ok on the patched mesa). See
+            FullQuantAllValuesConfig.
 
         default_8bit
             TFMOT Default8BitQuantizeScheme.
@@ -372,7 +457,8 @@ def quantize_backbone(
     custom_configs = {
         "weights": WeightOnlyQuantConfig,
         "full": FullQuantConfig,
-        "fixed": FullQuantFixedReLUConfig
+        "fixed": FullQuantFixedReLUConfig,
+        "full_av": FullQuantAllValuesConfig,
     }
 
     try:
@@ -398,6 +484,7 @@ def quantize_backbone(
             "WeightOnlyQuantConfig": WeightOnlyQuantConfig,
             "FullQuantConfig": FullQuantConfig,
             "FullQuantFixedReLUConfig": FullQuantFixedReLUConfig,
+            "FullQuantAllValuesConfig": FullQuantAllValuesConfig,
         }
     ):
         annotated = tf.keras.models.clone_model(
