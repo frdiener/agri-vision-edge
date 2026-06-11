@@ -199,7 +199,7 @@ class SSDModule(tf.Module):
 
 def export_tflite_model(pipeline_config, trained_checkpoint_dir,
                         output_directory, max_detections, use_regular_nms,
-                        include_keypoints=False, label_map_path='', qat_export=False):
+                        include_keypoints=False, label_map_path='', qat_backbone='', fold_bn=False):
   """Exports inference SavedModel for TFLite conversion.
 
   NOTE: Only supports SSD meta-architectures for now, and the output model will
@@ -232,33 +232,29 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
   if pipeline_config.model.WhichOneof('model') == 'ssd':
     detection_model = model_builder.build(
         pipeline_config.model, is_training=False)
-    if qat_export:
-      from agri_vision_edge.tfod.qat import (
-        ensure_model_is_built_for_qat,
-        quantize_backbone,
-      )
+    
+    if qat_backbone or fold_bn:
+      from agri_vision_edge.tfod.qat import ensure_model_is_built_for_qat
       ensure_model_is_built_for_qat(detection_model, pipeline_config)
-      feature_extractor = (detection_model.feature_extractor)
-      assert (feature_extractor.classification_backbone is not None)
-      
-      if qat_export == 'folded':
-        from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
-        print("Folding batchnorms into the convolutions...")
-        folded_backbone = fold(feature_extractor.classification_backbone)
+      assert (
+        detection_model.feature_extractor.classification_backbone is not None
+      )
 
-        print("Adding fake quantization nodes to the backbone...")
-        qat_backbone = quantize_backbone(
-            folded_backbone,
-            scheme="full"
+    if fold_bn:
+      print("Folding batchnorms into the convolutions...")
+      from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
+      detection_model.feature_extractor.classification_backbone = fold(
+        detection_model.feature_extractor.classification_backbone
+      )
+
+    if qat_backbone:
+      from agri_vision_edge.tfod.qat import quantize_backbone
+      print("Adding fake quantization nodes to the backbone...")
+
+      detection_model.feature_extractor.classification_backbone = quantize_backbone(
+        detection_model.feature_extractor.classification_backbone,
+          scheme=qat_backbone
         )
-      else:
-        print("quantizing convolution wheights")
-        feature_extractor = detection_model.feature_extractor
-        qat_backbone = quantize_backbone(
-            feature_extractor.classification_backbone,
-            scheme="weights",
-          )
-      feature_extractor.classification_backbone = qat_backbone
 
     ckpt = tf.train.Checkpoint(model=detection_model)
     # The module helps build a TF SavedModel appropriate for TFLite conversion.

@@ -216,7 +216,9 @@ def export_inference_graph(input_type,
                            side_input_shapes='',
                            side_input_types='',
                            side_input_names='',
-                           qat_export=False):
+                           qat_backbone='',
+                           fold_bn=False,
+                         ):
   """Exports inference graph for the model specified in the pipeline config.
 
   This function creates `output_directory` if it does not already exist,
@@ -250,33 +252,28 @@ def export_inference_graph(input_type,
   manager = tf.train.CheckpointManager(
       ckpt, trained_checkpoint_dir, max_to_keep=1)
 
-  if qat_export:
-    from agri_vision_edge.tfod.qat import (
-      ensure_model_is_built_for_qat,
-      quantize_backbone,
-    )
+  if qat_backbone or fold_bn:
+    from agri_vision_edge.tfod.qat import ensure_model_is_built_for_qat
     ensure_model_is_built_for_qat(detection_model, pipeline_config)
-    feature_extractor = (detection_model.feature_extractor)
-    assert (feature_extractor.classification_backbone is not None)
+    assert (
+      detection_model.feature_extractor.classification_backbone is not None
+    )
 
-    if qat_export == 'folded':
-      from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
-      print("Folding batchnorms into the convolutions...")
-      folded_backbone = fold(feature_extractor.classification_backbone)
+  if fold_bn:
+    print("Folding batchnorms into the convolutions...")
+    from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
+    detection_model.feature_extractor.classification_backbone = fold(
+      detection_model.feature_extractor.classification_backbone
+    )
 
-      print("Adding fake quantization nodes to the backbone...")
-      qat_backbone = quantize_backbone(
-          folded_backbone,
-          scheme="full"
+  if qat_backbone:
+    from agri_vision_edge.tfod.qat import quantize_backbone
+    print("Adding fake quantization nodes to the backbone...")
+
+    detection_model.feature_extractor.classification_backbone = quantize_backbone(
+      detection_model.feature_extractor.classification_backbone,
+        scheme=qat_backbone
       )
-    else:
-      print("quantizing convolution wheights")
-      feature_extractor = detection_model.feature_extractor
-      qat_backbone = quantize_backbone(
-          feature_extractor.classification_backbone,
-          scheme="wheights"
-        )
-    feature_extractor.classification_backbone = qat_backbone
 
   status = ckpt.restore(manager.latest_checkpoint).expect_partial()
 

@@ -462,7 +462,8 @@ def train_loop(
     save_metrics_history=True,
 
     reset_optimizer=False,
-    enable_qat_backbone=False,
+    qat_backbone='',
+    fold_bn=False,
 
     **kwargs):
   """Trains a model using eager + functions.
@@ -670,26 +671,22 @@ def train_loop(
               global_step=global_step
           )
 
-        if enable_qat_backbone:
+        if fold_bn:
+          print("Folding batchnorms into the convolutions...")
           from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
-          from agri_vision_edge.tfod.qat import quantize_backbone
-          feature_extractor = detection_model.feature_extractor
-          if enable_qat_backbone == 'folded':
-            print("Folding batchnorms into the convolutions...")
-            folded_backbone = fold(feature_extractor.classification_backbone)
+          detection_model.feature_extractor.classification_backbone = fold(
+            detection_model.feature_extractor.classification_backbone
+          )
           
-            print("Adding fake quantization nodes to the backbone...")
-            qat_backbone = quantize_backbone(
-              folded_backbone,
-                scheme="full"
-              )
-          else:
-            print("quantizing convolution wheights")
-            feature_extractor = detection_model.feature_extractor
-            qat_backbone = quantize_backbone(
-                feature_extractor.classification_backbone
-              )
-          feature_extractor.classification_backbone = qat_backbone
+        if qat_backbone:
+          from agri_vision_edge.tfod.qat import quantize_backbone
+          print("Adding fake quantization nodes to the backbone...")
+
+          detection_model.feature_extractor.classification_backbone = quantize_backbone(
+            detection_model.feature_extractor.classification_backbone,
+              scheme=qat_backbone
+            )
+          
           print("Evaluating initial quantized configuration...")
           metrics = eager_eval_loop(
               detection_model,
