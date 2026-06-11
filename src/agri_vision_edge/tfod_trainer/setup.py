@@ -23,7 +23,10 @@ from object_detection.utils import label_map_util
 from object_detection.utils import config_util
 from object_detection.utils import variables_helper
 from object_detection import eval_util
-from object_detection.model_lib_v2 import load_fine_tune_checkpoint
+from object_detection.model_lib_v2 import (
+    load_fine_tune_checkpoint,
+    _ensure_model_is_built,
+)
 
 
 @dataclass(slots=True)
@@ -40,6 +43,8 @@ class Runtime:
 
     global_step: tf.Variable
 
+    ckpt: tf.train.Checkpoint
+
     manager: tf.train.CheckpointManager
 
     evaluators: list
@@ -49,6 +54,8 @@ class Runtime:
     unpad_groundtruth_tensors: bool
 
     clip_gradients_value: float | None
+
+    use_moving_average: bool
 
 
 def load_pipeline_configs(
@@ -163,13 +170,17 @@ def create_runtime(
         max_to_keep=checkpoint_max_to_keep,
     )
 
-    ckpt.restore(manager.latest_checkpoint)
+    # NOTE: weights are restored later in `restore_weights` (called from
+    # `train`), once the train dataset is available. With EMA enabled the
+    # optimizer's shadow variables must be created before any restore, and
+    # creating them requires building the model on a real input batch.
 
     return Runtime(
         configs=configs,
         optimizer=optimizer,
         learning_rate=learning_rate,
         global_step=global_step,
+        ckpt=ckpt,
         manager=manager,
         evaluators=create_evaluators(configs),
         add_regularization_loss=(
@@ -181,6 +192,10 @@ def create_runtime(
             .unpad_groundtruth_tensors
         ),
         clip_gradients_value=clip_gradients_value,
+        use_moving_average=(
+            configs["train_config"]
+            .optimizer.use_moving_average
+        ),
     )
 
 
@@ -197,15 +212,14 @@ def maybe_load_fine_tune_checkpoint(
     detection/classification checkpoint referenced by the pipeline config is
     loaded, so training fine-tunes from those weights instead of starting
     from random initialization. Skipped when resuming an existing train-dir
-    checkpoint, since those weights were already restored in
-    ``create_runtime``.
+    checkpoint (handled by ``restore_weights``).
 
     ``train_dataset`` is required to build the model variables (via a dummy
     forward pass) before the object-based restore.
     """
 
     if runtime.manager.latest_checkpoint:
-        # Resuming: weights already restored from the train directory.
+        # Resuming is handled by restore_weights via ckpt.restore.
         return
 
     train_config = runtime.configs["train_config"]
@@ -239,4 +253,50 @@ def maybe_load_fine_tune_checkpoint(
         True,
         train_dataset,
         runtime.unpad_groundtruth_tensors,
+    )
+
+
+def restore_weights(
+    detection_model,
+    runtime,
+    train_dataset,
+):
+    """
+    Initialize model weights before training.
+
+    Order mirrors ``object_detection.model_lib_v2.train_loop``:
+
+      1. When EMA (``optimizer.use_moving_average``) is enabled, build the
+         model and create the optimizer's shadow variables *first*, so they
+         exist before any restore and are themselves restored on resume.
+      2. If a checkpoint already exists in the train directory, resume from
+         it (this restores model, optimizer, shadow variables and step).
+      3. Otherwise, load the pretrained fine-tune checkpoint.
+
+    ``train_dataset`` is required to build the model on a real input batch.
+    """
+
+    if runtime.use_moving_average:
+        print("EMA enabled: creating optimizer shadow variables...")
+        _ensure_model_is_built(
+            detection_model,
+            train_dataset,
+            runtime.unpad_groundtruth_tensors,
+        )
+        runtime.optimizer.shadow_copy(detection_model)
+
+    if runtime.manager.latest_checkpoint:
+        print(
+            "Resuming from checkpoint: "
+            f"{runtime.manager.latest_checkpoint}"
+        )
+        runtime.ckpt.restore(
+            runtime.manager.latest_checkpoint
+        )
+        return
+
+    maybe_load_fine_tune_checkpoint(
+        detection_model,
+        runtime,
+        train_dataset,
     )

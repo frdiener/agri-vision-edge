@@ -8,7 +8,7 @@ import time
 
 from agri_vision_edge.tfod_trainer.setup import (
     Runtime,
-    maybe_load_fine_tune_checkpoint,
+    restore_weights,
 )
 import tensorflow as tf
 
@@ -88,8 +88,8 @@ def train(
         runtime.configs,
     )
 
-    # Load pretrained weights before training (cold start only).
-    maybe_load_fine_tune_checkpoint(
+    # Restore weights before training (resume, fine-tune, and EMA setup).
+    restore_weights(
         detection_model,
         runtime,
         train_ds,
@@ -156,6 +156,12 @@ def train(
             )
         )
 
+        # With EMA enabled, evaluate the moving-average weights by swapping
+        # them in, then swap the raw training weights back before saving
+        # (matches object_detection.model_lib_v2.train_loop).
+        if runtime.use_moving_average:
+            runtime.optimizer.swap_weights()
+
         print("\nRunning reference evaluator...")
 
         eval_input = inputs.eval_input(
@@ -170,7 +176,7 @@ def train(
             use_tpu=False,
             global_step=runtime.global_step,
         )
-        
+
         metrics = evaluate(
             detection_model,
             create_eval_dataset(
@@ -179,6 +185,9 @@ def train(
             ),
             runtime,
         )
+
+        if runtime.use_moving_average:
+            runtime.optimizer.swap_weights()
 
         metric_value = float(
             metrics[
