@@ -12,3 +12,10 @@ from .setup import (
 )
 
 from .training import train
+
+from .run import (
+    FinetuneRunConfig,
+    RunResult,
+    write_pipeline,
+    run_finetune,
+)
