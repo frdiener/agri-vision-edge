@@ -7,11 +7,62 @@ Provides plots for:
 - TensorFlow Object Detection API metrics
 """
 
+import json
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import pandas as pd
+
+
+def load_history_scalars(
+    history: Union[str, Path, list[dict]],
+) -> pd.DataFrame:
+    """
+    Load scalar metrics from a tfod_trainer training history.
+
+    This is the plain-metrics counterpart to
+    :func:`agri_vision_edge.evaluation.tensorboard.load_event_scalars`:
+    the trainer no longer writes TensorBoard event files, it appends one
+    flat record per logged step to ``metrics_history.json``. This turns
+    that into the same tidy long-format frame, so every ``plot_*`` helper
+    below works unchanged.
+
+    Args:
+        history:
+            Either the in-memory list of per-step records (each a flat
+            ``{"step": int, "<tag>": value, ...}`` dict) or a path to the
+            ``metrics_history.json`` the trainer writes.
+
+    Returns:
+        pd.DataFrame with columns ``step``, ``tag``, ``value``.
+    """
+    if isinstance(history, (str, Path)):
+        history = json.loads(Path(history).read_text())
+
+    rows = []
+
+    for record in history:
+        step = record.get("step")
+
+        for tag, value in record.items():
+            if tag == "step":
+                continue
+
+            rows.append({
+                "step": step,
+                "tag": tag,
+                "value": value,
+            })
+
+    df = pd.DataFrame(rows)
+
+    if not df.empty:
+        df = df.sort_values(
+            ["tag", "step"]
+        ).reset_index(drop=True)
+
+    return df
 
 
 # =========================================================

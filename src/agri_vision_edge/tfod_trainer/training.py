@@ -218,6 +218,21 @@ def train(
         if runtime.use_moving_average:
             runtime.optimizer.swap_weights()
 
+        # Record this step's metrics for later plotting. Eval metrics go in
+        # first so the training Loss/* values (and LR / throughput) from
+        # train_metrics shadow the eval losses under the same keys, matching
+        # what agri_vision_edge.evaluation.curves expects.
+        record = {"step": current_step}
+        record.update(metrics_to_float(metrics))
+        record.update(train_metrics)
+        state.metrics_history.append(record)
+
+        if trainer_cfg.save_metrics_history:
+            write_json(
+                trainer_cfg.history_path,
+                state.metrics_history,
+            )
+
         metric_value = float(
             metrics[
                 trainer_cfg.metric_name
@@ -244,7 +259,9 @@ def train(
                 trainer_cfg.best_metric_path,
                 {
                     "step": current_step,
-                    "metric":
+                    "metric_name":
+                        trainer_cfg.metric_name,
+                    "metric_value":
                         metric_value,
                     "checkpoint":
                         checkpoint_path,

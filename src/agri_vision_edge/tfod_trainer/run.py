@@ -63,10 +63,13 @@ class FinetuneRunConfig:
     metric_name: str = "DetectionBoxes_Precision/mAP"
     save_metrics_history: bool = True
 
-    # QAT / graph modifications (all off => plain finetune).
-    reset_optimizer: bool = False
-    fold_bn: bool = False
+    # QAT / graph modifications. qat_scheme=None => plain finetune. fold_bn and
+    # reset_optimizer are tri-state: None ("auto") resolves to True when a QAT
+    # scheme is set and False otherwise, since QAT normally wants the BatchNorms
+    # folded and the optimizer state reset. Explicit True/False is respected.
     qat_scheme: QATScheme | None = None
+    fold_bn: bool | None = None
+    reset_optimizer: bool | None = None
 
     def __post_init__(self):
         self.model_path = Path(self.model_path)
@@ -75,6 +78,12 @@ class FinetuneRunConfig:
 
         if isinstance(self.qat_scheme, str):
             self.qat_scheme = QATScheme(self.qat_scheme.lower())
+
+        qat_enabled = self.qat_scheme is not None
+        if self.fold_bn is None:
+            self.fold_bn = qat_enabled
+        if self.reset_optimizer is None:
+            self.reset_optimizer = qat_enabled
 
     # --- derived paths -------------------------------------------------
 
