@@ -191,21 +191,6 @@ def train(
         if runtime.use_moving_average:
             runtime.optimizer.swap_weights()
 
-        print("\nRunning reference evaluator...")
-
-        eval_input = inputs.eval_input(
-                eval_config=runtime.configs['eval_config'],
-                eval_input_config=runtime.configs['eval_input_config'],
-                model_config=runtime.configs['model'],
-                model=detection_model)
-        metrics_ref = eager_eval_loop(
-            detection_model,
-            runtime.configs,
-            eval_input,
-            use_tpu=False,
-            global_step=runtime.global_step,
-        )
-
         metrics = evaluate(
             detection_model,
             create_eval_dataset(
