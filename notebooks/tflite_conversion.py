@@ -4,113 +4,133 @@ __generated_with = "0.23.9"
 app = marimo.App(width="full", app_title="")
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(Path):
     import marimo as mo
 
     ARTIFACTS_DIR = Path("artifacts")
-    models = list((ARTIFACTS_DIR / "tf").iterdir())
+    models = sorted(list((ARTIFACTS_DIR / "tf").iterdir()))
 
     model_root = mo.ui.dropdown(
         options={str(p.name): p for p in models},
         value=str(models[1].name),
-        label="Model Root",
+        label="Model",
     )
+    model_root
     return ARTIFACTS_DIR, mo, model_root
 
 
 @app.cell(hide_code=True)
-def configuration(ARTIFACTS_DIR, Path, mo, model_root):
-    _finetune_config = _load_pipeline_config(
-        next(Path(model_root.value).iterdir()) / "pipeline.config"
+def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
+    try:
+        _finetune_config = _load_pipeline_config(
+            Path(model_root.value) / "ptq" / "pipeline.config"
+        )
+    except Exception as e:
+        _finetune_config = None
+
+    _original_dataset = (
+        Path(
+            str(
+                _finetune_config.train_input_reader.tf_record_input_reader.input_path
+            )
+        ).parent.name
+        if _finetune_config
+        else "not found"
     )
 
-    _original_dataset = Path(
-        str(_finetune_config.train_input_reader.tf_record_input_reader.input_path)
-    ).parent.name
+    fp32_map = {}
+    for schema in ["ptq", "qat0", "qat1", "qat2"]:
+        try:
+            fp32_map[schema] = json.loads(
+                (model_root.value / schema / "best_metric.json").read_text()
+            )["metric_value"]
+        except Exception:
+            fp32_map[schema] = -1
 
     TFLITE_MODELS_DIR = ARTIFACTS_DIR / "tflite"
     TFLITE_MODELS_DIR.mkdir(parents=True, exist_ok=True)
     DATASETS_DIR = Path("datasets")
 
-    config_form = mo.md("""
+    config_form = (
+        mo.md("""
     **TFLite Conversion**
 
-    - {model_root}
-    - {model}
     - {dataset}
       {tiled}
       {classes}
     - {quantization}
       {precision} {per_channel}
-    """).batch(
-        model_root=model_root,
-        model=mo.ui.dropdown(
-            options={
-                "SSD MobileNet v2": "mnv2",
-                "SSD MobileNet v2 FPNlite": "mnv1_fpnlite",
-            },
-            value="SSD MobileNet v2",
-            label="Model",
-        ),
-        dataset=mo.ui.dropdown(
-            options={
-                "Phenobench": "phenobench",
-            },
-            value="Phenobench",
-            label="Dataset",
-        ),
-        tiled=mo.ui.switch(
-            value=False,
-            label="Tiled 2x2",
-        ),
-        classes=mo.ui.radio(
-            options={
-                "Single class (Weeds)": "sc",
-                "Multiclass (Crops vs Weeds)": "mc",
-            },
-            value="Single class (Weeds)",
-        ),
-        quantization=mo.ui.dropdown(
-            options={
-                "Finetuned": "ptq",
-                "Finetuned with full QAT": "qat0",
-                "Finetuned with QAT (Quantized Weights only)": "qat1",
-                "Finetuned with QAT (Prefolded Batchnorms)": "qat2",
-            },
-            value="Finetuned",
-            label="Checkpoint",
-        ),
-        precision=mo.ui.dropdown(
-            options={
-                "int8": "int8",
-                "fp32": "fp32",
-            },
-            value="int8",
-            label="Precision",
-        ),
-        per_channel=mo.ui.switch(
-            value=False,
-            label="Per Channel Quantization",
-        ),
-    ).form(bordered=False, submit_button_label="Convert & Evaluate")
+    """)
+        .batch(
+            dataset=mo.ui.dropdown(
+                options={
+                    "Phenobench": "phenobench",
+                },
+                value="Phenobench",
+                label="Dataset",
+            ),
+            tiled=mo.ui.switch(
+                value=True if "tiled" in model_root.value.name else False,
+                label="Tiled 2x2",
+            ),
+            classes=mo.ui.radio(
+                options={
+                    "Single class (Weeds)": "sc",
+                    "Multiclass (Crops vs Weeds)": "mc",
+                },
+                value="Single class (Weeds)"
+                if "_sc_" in model_root.value.name
+                else "Multiclass (Crops vs Weeds)",
+            ),
+            quantization=mo.ui.dropdown(
+                options={
+                    "Finetuned": "ptq",
+                    "Finetuned with full QAT": "qat0",
+                    "Finetuned with QAT (Quantized Weights only)": "qat1",
+                    "Finetuned with QAT (Prefolded Batchnorms)": "qat2",
+                },
+                value="Finetuned",
+                label="Checkpoint",
+            ),
+            precision=mo.ui.dropdown(
+                options={
+                    "int8": "int8",
+                    "fp32": "fp32",
+                },
+                value="int8",
+                label="Precision",
+            ),
+            per_channel=mo.ui.switch(
+                value=False,
+                label="Per Channel Quantization",
+            ),
+        )
+        .form(bordered=False, submit_button_label="Convert & Evaluate")
+    )
 
     summary = mo.md(f"""
     Dataset:
 
     | Setting | Value |
-    |----------|----------|
+    |:----------|----------|
     | Dataset | {_original_dataset} |
-    | Tiled | {'tile' in _original_dataset} |
-    | Labels | {'Single Class' if _finetune_config.model.ssd.num_classes == 1 else 'Multi Class'} |
-    | Resolution | {_finetune_config.model.ssd.image_resizer.fixed_shape_resizer.width} |
+    | Tiled | {"tile" in _original_dataset} |
+    | Labels | {("Single Class" if _finetune_config.model.ssd.num_classes == 1 else "Multi Class") if _finetune_config else "not found"} |
+    | Resolution | {(_finetune_config.model.ssd.image_resizer.fixed_shape_resizer.width) if _finetune_config else "not found"} |
+    | FP32 PTQ mAP | {fp32_map['ptq']:.4f} |
+    | FP32 QAT0 mAP | {fp32_map['qat0']:.4f} |
+    | FP32 QAT1 mAP | {fp32_map['qat1']:.4f} |
+    | FP32 QAT2 mAP | {fp32_map['qat2']:.4f} |
     """)
 
-    mo.hstack([
-        config_form,
-        summary,
-    ])
-    return DATASETS_DIR, TFLITE_MODELS_DIR, config_form
+    mo.hstack(
+        [
+            config_form,
+            summary,
+        ]
+    )
+    return DATASETS_DIR, TFLITE_MODELS_DIR, config_form, fp32_map
 
 
 @app.cell(hide_code=True)
@@ -185,6 +205,7 @@ def dataset___conversion_helpers(
     config_form,
     json,
     mo,
+    model_root,
 ):
     mo.stop(
         config_form.value is None,
@@ -194,7 +215,7 @@ def dataset___conversion_helpers(
     )
     config = config_form.value
 
-    MODEL_ROOT = config['model_root']
+    MODEL_ROOT = config['model_root'] = model_root.value
     CHECKPOINT = MODEL_ROOT / config["quantization"] / "checkpoint"
     PIPELINE_CONFIG = _load_pipeline_config(
         CHECKPOINT.parent / "pipeline.config"
@@ -274,20 +295,6 @@ def dataset___conversion_helpers(
     )
 
 
-@app.cell
-def _():
-    from tensorflow_model_optimization.python.core.quantization.keras.default_8bit.default_8bit_quantize_configs import (
-        NoOpQuantizeConfig,
-    )
-
-    return
-
-
-@app.cell
-def _():
-    return
-
-
 @app.cell(hide_code=True)
 def _(
     CHECKPOINT,
@@ -353,7 +360,7 @@ def _(
     return concrete_function, detection_module, qat_backbone
 
 
-@app.cell
+@app.cell(disabled=True)
 def _(qat_backbone):
     for layer in qat_backbone.layers:
         print(layer.name)
@@ -418,7 +425,7 @@ def tflite_conversion(
     # calibration and mis-calibrates the (non-QAT) class head: the class-logit
     # tensor's max gets pinned to 0, capping every detection score at
     # sigmoid(0) = 0.5. (Independent of the QAT scheme.)
-    def _nordmalized_rep_dataset():
+    def _normalized_rep_dataset():
         for sample in representative_dataset(
             dataset=train_dataset,
             indices=rep_ds_indices,
@@ -763,7 +770,7 @@ def _(interpreter, np):
 
             mesa_range = (qmax - zp) * float(scale)
 
-            if mesa_range > 6.0:
+            if mesa_range > 6.0000003:
                 failed = True
 
             print(
@@ -775,13 +782,7 @@ def _(interpreter, np):
             )
 
         if failed:
-            print("     <-- FAILS MESA RELU6 CHECK")
-    return
-
-
-@app.cell
-def _(dataset_dir):
-    dataset_dir
+            print("     ^^^ FAILS MESA RELU6 CHECK")
     return
 
 
@@ -858,7 +859,7 @@ def _(result):
 
 
 @app.cell(hide_code=True)
-def _(annotations_path, output_dir):
+def _(annotations_path, config, fp32_map, output_dir):
     from agri_vision_edge.evaluation.coco import (
         evaluate_predictions,
         save_metrics,
@@ -885,6 +886,11 @@ def _(annotations_path, output_dir):
     )
 
     print()
+
+    print(
+        f"FP32 mAP:  "
+        f"{fp32_map[config['quantization']]:.4f}"
+    )
 
     print(
         f"mAP:  "
