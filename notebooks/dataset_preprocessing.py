@@ -281,12 +281,6 @@ def _(config):
 
 
 @app.cell
-def _(config):
-    config["tiling"] and config["bundle_type"] == "Source Dataset"
-    return
-
-
-@app.cell
 def _(
     DEST_ROOT,
     Image,
@@ -556,14 +550,14 @@ def _(
 
 
 @app.cell
-def _(DEST_ROOT, SEED, build_rep_indices, f, json, train_dataset):
+def _(DEST_ROOT, SEED, build_rep_indices, json, train_dataset):
     rep_indices = build_rep_indices(
         dataset=train_dataset,
         num_samples=200,
         seed=SEED,
     )
 
-    (DEST_ROOT / "rep_dataset.json").write_text(json.dump(rep_indices, f))
+    (DEST_ROOT / "rep_dataset.json").write_text(json.dumps(rep_indices))
     return (rep_indices,)
 
 
@@ -582,7 +576,6 @@ def _(
     DEST_ROOT,
     IMAGE_SIZE,
     SEED,
-    f,
     json,
     rep_indices,
     test_stats,
@@ -609,7 +602,7 @@ def _(
         "test_stats": test_stats,
     }
 
-    (DEST_ROOT / "dataset_metadata.json").write_text(json.dump(metadata, f, indent=2,))
+    (DEST_ROOT / "dataset_metadata.json").write_text(json.dumps(metadata, indent=2,))
     return (metadata,)
 
 
