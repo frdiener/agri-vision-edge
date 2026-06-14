@@ -29,6 +29,7 @@ Legacy/comparison schemes ("default_8bit", "annotate_all") use the TFMOT
 default scheme and suffer the per-channel leakage described above.
 """
 
+import numpy as np
 import tensorflow as tf
 import tensorflow_model_optimization as tfmot
 from object_detection.core.freezable_batch_norm import FreezableBatchNorm
@@ -354,11 +355,7 @@ def _relu6_fed_conv_names(backbone):
     produces a signed output and wants a signed quantizer instead.
     """
 
-    def is_relu6(layer):
-        return (
-            isinstance(layer, tf.keras.layers.ReLU)
-            and getattr(layer, "max_value", None) == 6
-        )
+    is_relu6 = _is_relu6
 
     passthrough = (
         tf.keras.layers.BatchNormalization,
@@ -398,10 +395,29 @@ def _relu6_fed_conv_names(backbone):
 
 
 def _is_relu6(layer):
-    return (
+    """
+    True for a ReLU6 activation, whether it is a ``keras.layers.ReLU(max_value=6)``
+    (the MobileNetV2 backbone) or a ``Lambda(tf.nn.relu6)`` (the SSD feature-map
+    generator / head). The Lambda carries no metadata identifying it as ReLU6, so
+    we probe it: a layer is ReLU6 iff it clips its input to [0, 6].
+    """
+    if (
         isinstance(layer, tf.keras.layers.ReLU)
         and getattr(layer, "max_value", None) == 6
-    )
+    ):
+        return True
+
+    if isinstance(layer, tf.keras.layers.Lambda):
+        try:
+            probe = tf.constant(
+                [-6.0, -1.0, 0.0, 3.0, 6.0, 9.0], dtype=tf.float32
+            )
+            out = np.asarray(layer(probe))
+            return np.allclose(out, np.clip(probe.numpy(), 0.0, 6.0))
+        except Exception:
+            return False
+
+    return False
 
 
 def _quantize_backbone_full(
