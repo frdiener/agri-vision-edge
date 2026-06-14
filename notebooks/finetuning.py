@@ -16,6 +16,7 @@ def _():
     # Heavy imports. setup_tensorflow_models() must run before anything pulls
     # in `object_detection`, so do it here at the top.
     import json
+    import sys
 
     from agri_vision_edge.third_party import setup_tensorflow_models
 
@@ -33,6 +34,7 @@ def _():
         FinetuneRunConfig,
         export_run,
         json,
+        sys,
         run_finetune,
     )
 
@@ -57,17 +59,21 @@ def _(mo):
     ))
     ```
 
-    To run *this notebook* against a preset config (e.g. as a script), set
-    `OVERRIDE` in the next cell to a `FinetuneRunConfig` or a dict; that
-    bypasses the form and the Train button.
+    To run *this notebook* against a preset config (e.g. as a script), pass the
+    training config as an argument. This bypasses the form and the Train button.
     """)
     return
 
 
 @app.cell
-def _():
+def _(json, sys):
     # Set to a FinetuneRunConfig or dict to bypass the UI; None = interactive.
     OVERRIDE = None
+    try:
+        if len(sys.argv) > 1:
+            OVERRIDE = json.loads(sys.argv[1])
+    except Exception:
+        pass
     return (OVERRIDE,)
 
 
@@ -93,7 +99,7 @@ def _(mo):
 
             **Quantization-aware training** (leave scheme empty for a plain finetune)
 
-            - {qat_scheme}
+            - {qat_scheme} {quantize_head}
             - {fold_bn} {reset_optimizer}
             """
         )
@@ -133,6 +139,10 @@ def _(mo):
                 },
                 value="None (plain finetune)",
                 label="QAT scheme",
+            ),
+            quantize_head=mo.ui.checkbox(
+                value=False,
+                label="Quantize head too (feature maps + box predictor; QAT only)",
             ),
             fold_bn=mo.ui.dropdown(
                 options={"Auto (on for QAT)": None, "On": True, "Off": False},
@@ -178,6 +188,7 @@ def _(FineTuneConfig, FinetuneRunConfig, OVERRIDE, form, mo):
                 early_stopping_patience=int(v["early_stopping_patience"]),
             ),
             qat_scheme=v["qat_scheme"],
+            quantize_head=bool(v["quantize_head"]),
             fold_bn=v["fold_bn"],
             reset_optimizer=v["reset_optimizer"],
         )
@@ -199,6 +210,7 @@ def _(mo, run_config):
     | Batch | {run_config.finetune.batch_size} |
     | Image size | {run_config.finetune.image_size} |
     | QAT scheme | {run_config.qat_scheme} |
+    | Quantize head | {run_config.quantize_head} |
     | Fold BN | {run_config.fold_bn} |
     | Pipeline → | `{run_config.pipeline_config_path}` |
     | Train dir → | `{run_config.train_dir}` |
