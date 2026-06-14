@@ -162,6 +162,17 @@ class FineTuneConfig:
     warmup_steps: int = 1000
 
     #
+    # Gradient clipping
+    #
+
+    # Global-norm gradient clip applied during training. The SSD feature-map
+    # BatchNorms can spike early in fine-tuning; without a clip a transient
+    # activation blow-up overflows a BatchNorm moving_variance to NaN, which
+    # silently corrupts inference (eval / export use the moving statistics)
+    # while the batch-statistic training loss still looks healthy. 0.0 disables.
+    gradient_clipping_by_norm: float = 10.0
+
+    #
     # Custom early stopping
     #
 

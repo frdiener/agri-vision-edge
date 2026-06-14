@@ -334,6 +334,10 @@ def configure_ssd_pipeline(
         1
     )
 
+    pipeline_config.train_config.gradient_clipping_by_norm = (
+        config.gradient_clipping_by_norm
+    )
+
     #
     # Learning rate
     #

@@ -32,11 +32,14 @@ from .utils import (
 )
 
 
-def make_train_step(runtime):
+def make_train_step(runtime, detection_model):
 
+    # `detection_model` is captured by closure (not passed as a tf.function
+    # argument); this mirrors object_detection.model_lib_v2.train_loop. Passing
+    # a Keras model as a tf.function argument is a known footgun for stateful
+    # side-effects (e.g. BatchNorm moving-statistic updates).
     @tf.function
     def train_step(
-        detection_model,
         iterator,
     ):
         features, labels = next(iterator)
@@ -75,6 +78,31 @@ def create_train_dataset(
             configs["model"],
         model=detection_model,
     ).repeat()
+
+
+def assert_finite_model(detection_model, step):
+    """
+    Abort training if any model weight is non-finite.
+
+    A BatchNorm moving_variance can overflow to NaN/Inf on a transient
+    activation spike without the (batch-statistic) training loss ever showing
+    it -- but eval and the exported SavedModel use the moving statistics, so a
+    single poisoned BN silently turns the model to garbage. Fail loudly here,
+    before a corrupted checkpoint is saved or exported, rather than shipping a
+    broken `ptq/`.
+    """
+    bad = [
+        v.name
+        for v in detection_model.variables
+        if not bool(tf.reduce_all(tf.math.is_finite(v)))
+    ]
+    if bad:
+        raise FloatingPointError(
+            f"Non-finite values in {len(bad)} model variable(s) at step "
+            f"{step} (e.g. {bad[:3]}). Training diverged; aborting before a "
+            f"corrupted checkpoint is saved. Lower learning_rate_base or "
+            f"gradient_clipping_by_norm."
+        )
 
 
 def train(
@@ -132,7 +160,7 @@ def train(
     )
 
     print("Making trainstep_fn...")
-    train_step_fn = make_train_step(runtime)
+    train_step_fn = make_train_step(runtime, detection_model)
 
     for _ in range(
         int(runtime.global_step.numpy()),
@@ -142,7 +170,6 @@ def train(
         start = time.time()
 
         losses = train_step_fn(
-            detection_model,
             iterator,
         )
 
@@ -158,6 +185,10 @@ def train(
             != 0
         ):
             continue
+
+        # Catch a diverged BatchNorm (NaN/Inf moving stats) as soon as it
+        # appears, before it is evaluated, checkpointed or exported.
+        assert_finite_model(detection_model, current_step)
 
         train_metrics = (
             metrics_to_float(losses)
