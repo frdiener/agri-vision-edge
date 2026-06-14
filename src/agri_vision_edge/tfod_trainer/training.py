@@ -91,10 +91,12 @@ def assert_finite_model(detection_model, step):
     before a corrupted checkpoint is saved or exported, rather than shipping a
     broken `ptq/`.
     """
+    # Only float variables support tf.math.is_finite; skip int counters etc.
     bad = [
         v.name
         for v in detection_model.variables
-        if not bool(tf.reduce_all(tf.math.is_finite(v)))
+        if v.dtype.is_floating
+        and not bool(tf.reduce_all(tf.math.is_finite(v)))
     ]
     if bad:
         raise FloatingPointError(
