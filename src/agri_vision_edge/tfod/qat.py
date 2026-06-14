@@ -29,6 +29,8 @@ Legacy/comparison schemes ("default_8bit", "annotate_all") use the TFMOT
 default scheme and suffer the per-channel leakage described above.
 """
 
+import collections
+
 import numpy as np
 import tensorflow as tf
 import tensorflow_model_optimization as tfmot
@@ -248,6 +250,48 @@ class ReLU6OutputConfig(
         return {}
 
 
+@register_keras_serializable()
+class AddOutputConfig(
+    tfmot.quantization.keras.QuantizeConfig,
+):
+    """
+    Quantize the output of a residual ``Add`` (no weights), signed AllValues.
+
+    MobileNetV2 inverted-residual blocks end in ``project_conv -> Add(skip)``.
+    The ``Add`` output is otherwise un-fake-quantized, which leaves a coverage
+    gap: when converting QAT *without* a representative dataset the converter
+    falls back to dynamic-range (per-channel) weights for the convs downstream
+    of that gap. Pinning the Add output (AllValues, signed -- residual sums are
+    signed) closes the gap so the whole backbone converts per-tensor with no
+    representative dataset.
+    """
+
+    def get_weights_and_quantizers(self, layer):
+        return []
+
+    def set_quantize_weights(self, layer, quantize_weights):
+        pass
+
+    def get_activations_and_quantizers(self, layer):
+        return []
+
+    def set_quantize_activations(self, layer, quantize_activations):
+        pass
+
+    def get_output_quantizers(self, layer):
+        return [
+            tfmot.quantization.keras.quantizers.AllValuesQuantizer(
+                num_bits=8,
+                per_axis=False,
+                symmetric=False,
+                narrow_range=False,
+            )
+        ]
+
+    def get_config(self):
+        return {}
+
+
 def annotate_conv_layers(
     layer,
     quantize_config,
@@ -459,6 +503,7 @@ def _quantize_backbone_full(
         symmetric=symmetric,
     )
     relu6_cfg = ReLU6OutputConfig()
+    add_cfg = AddOutputConfig()
 
     def clone_function(layer):
         if isinstance(
@@ -490,6 +535,17 @@ def _quantize_backbone_full(
                 )
             )
 
+        # Residual-add output: close the fake-quant coverage gap so the
+        # backbone converts per-tensor with no representative dataset.
+        if isinstance(layer, tf.keras.layers.Add):
+            return (
+                tfmot.quantization.keras
+                .quantize_annotate_layer(
+                    layer,
+                    quantize_config=add_cfg,
+                )
+            )
+
         return layer
 
     with tfmot.quantization.keras.quantize_scope(
@@ -498,6 +554,7 @@ def _quantize_backbone_full(
             "WeightOnlyQuantConfig": WeightOnlyQuantConfig,
             "SignedConvQuantConfig": SignedConvQuantConfig,
             "ReLU6OutputConfig": ReLU6OutputConfig,
+            "AddOutputConfig": AddOutputConfig,
         }
     ):
         annotated = tf.keras.models.clone_model(
@@ -636,3 +693,241 @@ def ensure_model_is_built_for_qat(
         image,
         shapes
     )
+
+
+# =========================================================
+# Whole-model QAT: weight-preserving functional rebuild of the SSD head.
+#
+# object_detection's feature_map_generator (KerasMultiResolutionFeatureMaps)
+# and box-predictor heads are *subclassed* Keras models. Swapping folded /
+# quantize-wrapped layers into them in place breaks TFLite conversion (the
+# swapped layers are not tracked sublayers, so the SavedModel trace prunes the
+# graph to empty). Rebuilding them as FUNCTIONAL models -- reusing the converged
+# layers, so weights are preserved exactly -- and wrapping them in tracked
+# adapter Layers lets the same clone_model + quantize_apply path used for the
+# backbone quantize them. A QAT model can then cover the whole graph up to the
+# (float) TFLite_Detection_PostProcess.
+#
+# Specific to the plain SSD MobileNetV2 head (KerasMultiResolutionFeatureMaps +
+# ConvolutionalBoxPredictor). FPNLite / other heads would need their own rebuild.
+# =========================================================
+
+_QAT_CONV = (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D)
+
+
+def _clone_conv_unique(layer, name):
+    """Clone a Conv2D/DepthwiseConv2D with a unique name (weights copied)."""
+    cfg = layer.get_config()
+    cfg["name"] = name
+    new = type(layer).from_config(cfg)
+    kernel = (
+        layer.depthwise_kernel
+        if isinstance(layer, tf.keras.layers.DepthwiseConv2D)
+        else layer.kernel
+    )
+    new.build((None, None, None, int(kernel.shape[2])))
+    new.set_weights(layer.get_weights())
+    return new
+
+
+def fold_functional(model):
+    """
+    Fold every conv->BN pair in a FUNCTIONAL model by rebuilding the graph with
+    the BatchNorm dropped (BN params baked into a bias-enabled conv). Generic;
+    unlike ``fold_mobilenetv2_backbone`` it makes no MobileNetV2 topology
+    assumptions, so it works on the rebuilt feature-map generator.
+    """
+    consumers = collections.defaultdict(list)
+    for layer in model.layers:
+        for node in layer.inbound_nodes:
+            for parent in tf.nest.flatten(node.inbound_layers):
+                consumers[parent.name].append(layer)
+
+    conv_bn, drop = {}, set()
+    for layer in model.layers:
+        if isinstance(layer, _QAT_CONV):
+            cs = consumers.get(layer.name, [])
+            if len(cs) == 1 and "BatchNorm" in type(cs[0]).__name__:
+                conv_bn[layer.name] = cs[0]
+                drop.add(cs[0].name)
+
+    out, new_inputs = {}, []
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.InputLayer):
+            ni = tf.keras.Input(shape=layer.output.shape[1:], name=layer.name)
+            out[layer.name] = ni
+            new_inputs.append(ni)
+            continue
+        parents = list(tf.nest.flatten(layer.inbound_nodes[0].inbound_layers))
+        x = [out[p.name] for p in parents]
+        x = x[0] if len(x) == 1 else x
+        if layer.name in drop:                       # BN -> its conv's folded output
+            out[layer.name] = out[parents[0].name]
+        elif layer.name in conv_bn:
+            folded = _fold_conv_bn_functional(layer, conv_bn[layer.name])
+            out[layer.name] = folded(x)
+        else:
+            out[layer.name] = layer(x)               # reuse (Lambda/ReLU6/...)
+    outputs = [out[o._keras_history.layer.name] for o in model.outputs]
+    return tf.keras.Model(new_inputs, outputs)
+
+
+def _fold_conv_bn_functional(conv, bn):
+    """BN-fold helper that builds from the kernel shape (subclassed-layer convs
+    don't expose ``input_shape``)."""
+    k = conv.kernel.numpy()
+    b = conv.bias.numpy() if conv.use_bias else np.zeros(k.shape[-1], np.float32)
+    g, be = bn.gamma.numpy(), bn.beta.numpy()
+    mu, var = bn.moving_mean.numpy(), bn.moving_variance.numpy()
+    scale = g / np.sqrt(var + bn.epsilon)
+    folded = tf.keras.layers.Conv2D(
+        conv.filters, conv.kernel_size, strides=conv.strides,
+        padding=conv.padding, dilation_rate=conv.dilation_rate,
+        activation=None, use_bias=True, name=conv.name + "_folded",
+    )
+    folded.build((None, None, None, int(k.shape[2])))
+    folded.set_weights([k * scale.reshape(1, 1, 1, -1), be + (b - mu) * scale])
+    return folded
+
+
+def rebuild_feature_map_generator_functional(fmg, feature_specs):
+    """
+    Functionally reconstruct a KerasMultiResolutionFeatureMaps, reusing its
+    converged layers (weights preserved). ``feature_specs`` is an OrderedDict
+    {backbone_feature_key: TensorShape} for the inputs it consumes.
+    """
+    inp = collections.OrderedDict(
+        (k, tf.keras.Input(shape=tuple(v.as_list()[1:]), name=k.replace("/", "__")))
+        for k, v in feature_specs.items()
+    )
+    fmaps = []
+    for index, from_layer in enumerate(fmg.feature_map_layout["from_layer"]):
+        if from_layer:
+            fm = inp[from_layer]
+        else:
+            fm = fmaps[-1]
+            for layer in fmg.convolutions[index]:
+                fm = layer(fm)
+        fmaps.append(fm)
+    return tf.keras.Model(inputs=inp, outputs=fmaps)
+
+
+class FMGAdapter(tf.keras.layers.Layer):
+    """Drop-in for ``feature_extractor.feature_map_generator``: wraps the
+    quantized functional generator (tracked sublayer, so it serializes) and
+    adapts the meta-arch's dict-in / OrderedDict-out contract."""
+
+    def __init__(self, func_model, output_keys, **kw):
+        super().__init__(**kw)
+        self.func = func_model
+        self.output_keys = list(output_keys)
+
+    def call(self, image_features):
+        san = {k.replace("/", "__"): v for k, v in image_features.items()}
+        ordered = [san[name] for name in self.func.input_names]
+        outs = self.func(ordered)
+        outs = outs if isinstance(outs, (list, tuple)) else [outs]
+        return collections.OrderedDict(zip(self.output_keys, outs))
+
+
+def rebuild_box_predictor_functional(box_predictor, feature_shapes):
+    """
+    Functionally reconstruct a ConvolutionalBoxPredictor, preserving weights.
+    Box/class heads are one 1x1 conv each (no BN) followed by a reshape; the
+    convs share names across heads so each is cloned to a unique name. Outputs
+    are the box-encoding tensors followed by the class tensors.
+    """
+    from object_detection.core.box_predictor import (
+        BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND,
+    )
+
+    inputs = [
+        tf.keras.Input(shape=tuple(s.as_list()[1:]), name=f"bp_in_{i}")
+        for i, s in enumerate(feature_shapes)
+    ]
+    box_out, cls_out = [], []
+    for i, x0 in enumerate(inputs):
+        x = x0
+        for layer in box_predictor._shared_nets[i]:   # empty unless a tower is configured
+            x = layer(x)
+        bh = box_predictor._prediction_heads[BOX_ENCODINGS][i]
+        b = x
+        for layer in bh._box_encoder_layers:
+            b = (_clone_conv_unique(layer, f"BoxEncodingPredictor_{i}")
+                 if isinstance(layer, _QAT_CONV) else layer)(b)
+        box_out.append(
+            tf.keras.layers.Reshape((-1, 1, bh._box_code_size),
+                                    name=f"box_reshape_{i}")(b))
+        ch = box_predictor._prediction_heads[CLASS_PREDICTIONS_WITH_BACKGROUND][i]
+        c = x
+        for layer in ch._class_predictor_layers:
+            c = (_clone_conv_unique(layer, f"ClassPredictor_{i}")
+                 if isinstance(layer, _QAT_CONV) else layer)(c)
+        cls_out.append(
+            tf.keras.layers.Reshape((-1, ch._num_class_slots),
+                                    name=f"cls_reshape_{i}")(c))
+    return tf.keras.Model(inputs, box_out + cls_out)
+
+
+class BoxPredictorAdapter(tf.keras.layers.Layer):
+    """Drop-in for ``_box_predictor``: wraps the quantized functional predictor
+    and returns the {BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND} dict the
+    meta-arch consumes."""
+
+    def __init__(self, func_model, num_feature_maps, **kw):
+        super().__init__(**kw)
+        self.func = func_model
+        self.n = num_feature_maps
+        self.is_keras_model = True
+
+    def call(self, image_features):
+        from object_detection.core.box_predictor import (
+            BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND,
+        )
+        outs = self.func(list(image_features))
+        outs = outs if isinstance(outs, (list, tuple)) else [outs]
+        return {
+            BOX_ENCODINGS: list(outs[: self.n]),
+            CLASS_PREDICTIONS_WITH_BACKGROUND: list(outs[self.n:]),
+        }
+
+
+def quantize_detection_head(detection_model, image_size, *, scheme="full"):
+    """
+    Quantize the SSD head (feature_map_generator + box predictor) in place via
+    weight-preserving functional rebuilds, so QAT covers the whole graph up to
+    the postprocess. Call AFTER the backbone has been folded + quantized.
+
+    Specific to the plain SSD MobileNetV2 head; raises if the structure differs.
+    """
+    from object_detection.utils import ops as od_ops
+
+    fe = detection_model.feature_extractor
+    fmg = fe.feature_map_generator
+    backbone = fe.classification_backbone
+
+    keys = [fl for fl in fmg.feature_map_layout["from_layer"] if fl]
+    pp, _ = detection_model.preprocess(
+        tf.zeros([1, image_size, image_size, 3], dtype=tf.float32)
+    )
+    feats = backbone(od_ops.pad_to_multiple(pp, fe._pad_to_multiple))
+    feature_specs = collections.OrderedDict(
+        (k, feats[i].shape) for i, k in enumerate(keys)
+    )
+    fmg_outputs = fmg({k: tf.zeros(v) for k, v in feature_specs.items()})
+    out_keys = list(fmg_outputs.keys())
+    feature_shapes = [t.shape for t in fmg_outputs.values()]
+
+    qfmg = quantize_backbone(
+        fold_functional(rebuild_feature_map_generator_functional(fmg, feature_specs)),
+        scheme=scheme,
+    )
+    fe.feature_map_generator = FMGAdapter(qfmg, out_keys)
+
+    qbp = quantize_backbone(
+        rebuild_box_predictor_functional(detection_model._box_predictor, feature_shapes),
+        scheme=scheme,
+    )
+    detection_model._box_predictor = BoxPredictorAdapter(qbp, len(feature_shapes))
+
+    return detection_model

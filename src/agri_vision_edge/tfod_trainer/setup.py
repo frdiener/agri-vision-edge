@@ -386,4 +386,23 @@ def apply_graph_modifications(
             )
         )
 
+        if getattr(trainer_cfg, "quantize_head", False):
+            from agri_vision_edge.tfod.qat import (
+                quantize_detection_head,
+            )
+
+            image_size = (
+                runtime.configs["model"]
+                .ssd.image_resizer.fixed_shape_resizer.height
+            )
+            print(
+                "Quantizing the detection head "
+                f"(feature maps + box predictor, scheme={scheme})..."
+            )
+            quantize_detection_head(
+                detection_model,
+                image_size,
+                scheme=scheme,
+            )
+
     return True

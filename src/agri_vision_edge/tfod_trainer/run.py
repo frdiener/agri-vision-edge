@@ -71,6 +71,11 @@ class FinetuneRunConfig:
     fold_bn: bool | None = None
     reset_optimizer: bool | None = None
 
+    # Also quantize the SSD head (feature maps + box predictor) under QAT, so
+    # the whole graph up to the float postprocess is fake-quantized. Only
+    # applies when qat_scheme is set. EXPERIMENTAL (plain SSD MobileNetV2 only).
+    quantize_head: bool = False
+
     def __post_init__(self):
         self.model_path = Path(self.model_path)
         self.dataset_bundle_path = Path(self.dataset_bundle_path)
@@ -149,6 +154,7 @@ class FinetuneRunConfig:
             reset_optimizer=self.reset_optimizer,
             fold_bn=self.fold_bn,
             qat_scheme=self.qat_scheme,
+            quantize_head=self.quantize_head,
         )
 
 

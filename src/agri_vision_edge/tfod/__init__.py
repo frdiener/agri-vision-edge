@@ -26,6 +26,11 @@ from .mobilenetv2_bn_folding import (
     fold_mobilenetv2_backbone
 )
 
+from .qat import (
+    quantize_backbone,
+    quantize_detection_head,
+)
+
 
 __all__ = [
     #
@@ -60,5 +65,7 @@ __all__ = [
     #
     # QAT
     #
-    "fold_mobilenetv2_backbone"
+    "fold_mobilenetv2_backbone",
+    "quantize_backbone",
+    "quantize_detection_head",
 ]

@@ -63,6 +63,7 @@ def export_run(
     input_type: str = "image_tensor",
     fold_bn: bool | None = None,
     qat_backbone: str | None = None,
+    quantize_head: bool | None = None,
 ) -> ExportResult:
     """
     Export the best checkpoint of ``cfg``'s run to a checkpoint + SavedModel.
@@ -76,8 +77,11 @@ def export_run(
       * ``qat_backbone`` defaults to ``cfg.qat_scheme`` (empty for a plain
         finetune), so a plain finetune yields a clean fp32 detection checkpoint
         ready to seed a follow-up QAT run.
+      * ``quantize_head`` defaults to ``cfg.quantize_head`` -- it MUST match how
+        the run was trained, otherwise the head's quantized variables won't be
+        present to restore and ``assert_existing_objects_matched`` fails.
 
-    Pass ``fold_bn`` / ``qat_backbone`` explicitly to override.
+    Pass ``fold_bn`` / ``qat_backbone`` / ``quantize_head`` explicitly to override.
     """
     from agri_vision_edge.third_party import setup_tensorflow_models
 
@@ -102,6 +106,8 @@ def export_run(
         fold_bn = cfg.fold_bn
     if qat_backbone is None:
         qat_backbone = cfg.qat_scheme.value if cfg.qat_scheme else ""
+    if quantize_head is None:
+        quantize_head = cfg.quantize_head
 
     if input_type not in DETECTION_MODULE_MAP:
         raise ValueError(
@@ -146,6 +152,25 @@ def export_run(
             backbone = quantize_backbone(backbone, scheme=qat_backbone)
 
         detection_model.feature_extractor.classification_backbone = backbone
+
+        # Reproduce the head quantization (must run after the backbone is
+        # quantized; it reads the backbone's output shapes).
+        if qat_backbone and quantize_head:
+            from agri_vision_edge.tfod.qat import quantize_detection_head
+
+            print(
+                "Quantizing the detection head "
+                f"(feature maps + box predictor, scheme={qat_backbone})..."
+            )
+            image_size = (
+                pipeline_config.model.ssd
+                .image_resizer.fixed_shape_resizer.height
+            )
+            quantize_detection_head(
+                detection_model,
+                image_size,
+                scheme=qat_backbone,
+            )
 
     # Restore the best checkpoint. The trainer only saves on metric improvement,
     # so the latest checkpoint in train_dir is the best one.

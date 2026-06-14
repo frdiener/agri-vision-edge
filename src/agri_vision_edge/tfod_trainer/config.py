@@ -58,6 +58,13 @@ class TrainerConfig:
     # (mirrors `qat_backbone` in train_loop).
     qat_scheme: QATScheme | None = None
 
+    # When QAT is enabled, also quantize the SSD head (feature_map_generator +
+    # box predictor) via weight-preserving functional rebuilds, so the whole
+    # graph up to the float postprocess is fake-quantized. EXPERIMENTAL: only
+    # the plain SSD MobileNetV2 head is supported; training of the spliced
+    # model is not yet validated end-to-end.
+    quantize_head: bool = False
+
     def __post_init__(self):
         if isinstance(self.qat_scheme, str):
             self.qat_scheme = QATScheme(
