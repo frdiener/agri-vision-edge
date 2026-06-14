@@ -120,7 +120,16 @@ def evaluate(
           materialize_eval_dataset()
     """
 
+    # Put BatchNorm into inference mode for eval. Setting `_is_training` alone
+    # is NOT enough: object_detection's FreezableBatchNorm reads the *global
+    # Keras learning phase* at call time for non-frozen layers, and
+    # eager_train_step leaves it set to True. Without resetting it, eval runs
+    # BatchNorm in training mode and updates its moving statistics from the
+    # (unaugmented, full-frame) eval batches -- which overflows the smallest
+    # feature map's moving_variance to NaN and corrupts the model. Mirrors
+    # object_detection.model_lib_v2.eager_eval_loop.
     detection_model._is_training = False
+    tf.keras.backend.set_learning_phase(False)
 
     for evaluator in runtime.evaluators:
         evaluator.clear()
@@ -172,6 +181,9 @@ def evaluate(
             tf.reduce_mean(values)
         )
 
+    # Restore training mode for the subsequent train steps (eager_train_step
+    # would set it too, but keep train/eval state symmetric).
     detection_model._is_training = True
+    tf.keras.backend.set_learning_phase(True)
 
     return metrics

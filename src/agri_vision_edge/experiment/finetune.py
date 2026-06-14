@@ -165,12 +165,10 @@ class FineTuneConfig:
     # Gradient clipping
     #
 
-    # Global-norm gradient clip applied during training. The SSD feature-map
-    # BatchNorms can spike early in fine-tuning; without a clip a transient
-    # activation blow-up overflows a BatchNorm moving_variance to NaN, which
-    # silently corrupts inference (eval / export use the moving statistics)
-    # while the batch-statistic training loss still looks healthy. 0.0 disables.
-    gradient_clipping_by_norm: float = 10.0
+    # Optional global-norm gradient clip applied during training. 0.0 disables
+    # it (the default, matching the upstream SSD MobileNet V2 pipeline). Set a
+    # positive value (e.g. 10.0) only if a run shows genuine gradient blow-up.
+    gradient_clipping_by_norm: float = 0.0
 
     #
     # Custom early stopping
