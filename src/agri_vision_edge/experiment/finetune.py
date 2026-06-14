@@ -88,32 +88,23 @@ class AugmentationConfig:
         1.2,
     )
 
-    # Hue adjustment.
-    #
-    # None disables brightness augmentation.
-    hue_max_delta: float | None = 0.2
+    # Hue jitter, as a fraction of the full colour wheel (tf random_adjust_hue:
+    # delta in [-max, max], hue in [0, 1]). Kept SMALL on purpose: for
+    # crop/weed detection the green-vs-soil hue is the primary cue, so a large
+    # shift (0.2 ~= +-72 deg can turn green into yellow/cyan) washes out the
+    # signal and hurts mAP. A small value gives white-balance robustness without
+    # destroying the cue. None disables hue augmentation.
+    hue_max_delta: float | None = 0.02
 
     #
     # Compression robustness
     #
 
-    # Simulate JPEG compression artifacts.
-    #
-    # Useful when deployment images may come from:
-    #
-    # - IP cameras
-    # - embedded devices
-    # - compressed storage
-    #
-    # Recommended:
-    #
-    #   (50, 100)
-    #
-    # None disables JPEG augmentation.
-    jpeg_quality_range: tuple[int, int] | None = (
-        50,
-        100,
-    )
+    # Simulate JPEG compression artifacts. OFF by default: training on
+    # JPEG-degraded images while evaluating on clean ones is a train/eval
+    # mismatch that costs mAP. Opt in (e.g. (50, 100)) only when the deployment
+    # images are themselves JPEG-compressed (IP cameras, compressed storage).
+    jpeg_quality_range: tuple[int, int] | None = None
 
 
 @dataclass
