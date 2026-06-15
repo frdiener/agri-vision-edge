@@ -42,6 +42,20 @@ scale, zero_point = input_details[0]["quantization"]
 print("Input:", input_details[0]["shape"])
 print("Quantization:", scale, zero_point)
 
+# The preprocess below maps a uint8 pixel straight to int8 via `pixel - 128`,
+# which is only equivalent to the proper `quantize(pixel/127.5 - 1)` when the
+# input tensor is int8 with scale ~= 2/255 and zero_point == 0. Assert that the
+# shipped model actually has those params so a re-converted detect.tflite with a
+# different input quantization fails loudly here instead of silently skewing
+# every frame.
+assert input_details[0]["dtype"] == np.int8, (
+    f"expected int8 input, got {input_details[0]['dtype']}"
+)
+assert abs(scale - 2 / 255) < 1e-3 and zero_point == 0, (
+    f"detect.tflite input quant changed ({scale}, {zero_point}); "
+    "the `pixel - 128` preprocess is no longer valid"
+)
+
 for i, out in enumerate(output_details):
     print(i, out["name"], out["shape"])
 
