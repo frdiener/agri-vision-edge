@@ -6,7 +6,8 @@ external code vendored into agri_vision_edge.
 
 Vendored projects:
 - TensorFlow Models (object_detection, slim)
-- PhenoBench
+
+(PhenoBench is no longer vendored — use the `phenobench` PyPI package directly.)
 """
 
 from .tensorflow_models import setup_tensorflow_models

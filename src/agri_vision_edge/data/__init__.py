@@ -10,9 +10,8 @@ Provides:
 - label maps
 """
 
-from ..third_party.phenobench import (
-    PhenoBench,
-)
+from phenobench import PhenoBench
+
 from .categories import (
     build_category_map,
     build_class_names,
