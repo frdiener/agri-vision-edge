@@ -7,14 +7,10 @@ SavedModel formats.
 """
 
 from pathlib import Path
-from typing import Optional, Tuple, Union
 
 import tensorflow as tf
-
 from google.protobuf import text_format
-
-from object_detection import exporter_lib_v2
-from object_detection import export_tflite_graph_lib_tf2
+from object_detection import export_tflite_graph_lib_tf2, exporter_lib_v2
 from object_detection.protos import pipeline_pb2
 
 from .common import (
@@ -22,8 +18,7 @@ from .common import (
     run_tfod_command,
 )
 
-
-PathLike = Union[str, Path]
+PathLike = str | Path
 
 def _load_pipeline_config(
     pipeline_config_path,
@@ -69,7 +64,7 @@ def export_saved_model(
     trained_checkpoint_dir: PathLike,
     output_directory: PathLike,
     input_type: str = "image_tensor",
-    log_file: Optional[PathLike] = None,
+    log_file: PathLike | None = None,
 ):
     """
     Export a TensorFlow Object Detection model
@@ -134,7 +129,7 @@ def export_tflite_graph(
     output_directory: PathLike,
     max_detections: int = 100,
     use_regular_nms: bool = False,
-    log_file: Optional[PathLike] = None,
+    log_file: PathLike | None = None,
 ):
     """
     Export a TF-OD model using the dedicated

@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agri_vision_edge.experiment import FineTuneConfig, AugmentationConfig
+from agri_vision_edge.experiment import AugmentationConfig, FineTuneConfig
 
 from .config import QATScheme, TrainerConfig
 
@@ -123,7 +123,7 @@ class FinetuneRunConfig:
     # --- construction from a plain mapping (e.g. JSON / UI dict) --------
 
     @classmethod
-    def from_mapping(cls, data) -> "FinetuneRunConfig":
+    def from_mapping(cls, data) -> FinetuneRunConfig:
         """
         Build from a plain dict, expanding a nested ``finetune`` (and its
         ``augmentation``) sub-dict into the proper dataclasses.
@@ -207,9 +207,9 @@ def run_finetune(cfg) -> RunResult:
     setup_tensorflow_models()
 
     from .setup import (
-        load_pipeline_configs,
         build_detection_model,
         create_runtime,
+        load_pipeline_configs,
     )
     from .training import train
 

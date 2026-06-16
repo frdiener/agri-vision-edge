@@ -73,8 +73,8 @@ def capture_tensorflow_environment() -> dict[str, Any] | None:
     """
 
     try:
-        import tensorflow as tf
         import google.protobuf
+        import tensorflow as tf
 
     except Exception:
         return None

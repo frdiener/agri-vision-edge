@@ -40,9 +40,7 @@ from tensorflow_model_optimization.quantization.keras import default_8bit
 
 
 @register_keras_serializable()
-class FixedRelu6Quantizer(
-    tfmot.quantization.keras.quantizers.Quantizer
-):
+class FixedRelu6Quantizer(tfmot.quantization.keras.quantizers.Quantizer):
     def build(self, tensor_shape, name, layer):
         return {}
 
@@ -57,6 +55,7 @@ class FixedRelu6Quantizer(
 
     def get_config(self):
         return {}
+
 
 @register_keras_serializable()
 class BaseQuantConfig(
@@ -76,14 +75,11 @@ class BaseQuantConfig(
         self.symmetric = symmetric
 
     def _weight_quantizer(self):
-        return (
-            tfmot.quantization.keras.quantizers
-            .LastValueQuantizer(
-                num_bits=8,
-                per_axis=self.per_axis,
-                symmetric=self.symmetric,
-                narrow_range=True,
-            )
+        return tfmot.quantization.keras.quantizers.LastValueQuantizer(
+            num_bits=8,
+            per_axis=self.per_axis,
+            symmetric=self.symmetric,
+            narrow_range=True,
         )
 
     def _kernel(self, layer):
@@ -99,9 +95,7 @@ class BaseQuantConfig(
         ):
             return layer.kernel
 
-        raise TypeError(
-            f"Unsupported layer: {type(layer)}"
-        )
+        raise TypeError(f"Unsupported layer: {type(layer)}")
 
     def get_weights_and_quantizers(
         self,
@@ -123,13 +117,9 @@ class BaseQuantConfig(
             layer,
             tf.keras.layers.DepthwiseConv2D,
         ):
-            layer.depthwise_kernel = (
-                quantize_weights[0]
-            )
+            layer.depthwise_kernel = quantize_weights[0]
         else:
-            layer.kernel = (
-                quantize_weights[0]
-            )
+            layer.kernel = quantize_weights[0]
 
     def get_config(self):
         return {
@@ -193,14 +183,11 @@ class SignedConvQuantConfig(
     """
 
     def _output_quantizer(self):
-        return (
-            tfmot.quantization.keras.quantizers
-            .AllValuesQuantizer(
-                num_bits=8,
-                per_axis=False,
-                symmetric=False,
-                narrow_range=False,
-            )
+        return tfmot.quantization.keras.quantizers.AllValuesQuantizer(
+            num_bits=8,
+            per_axis=False,
+            symmetric=False,
+            narrow_range=False,
         )
 
     def get_activations_and_quantizers(self, layer):
@@ -307,12 +294,9 @@ def annotate_conv_layers(
             tf.keras.layers.DepthwiseConv2D,
         ),
     ):
-        return (
-            tfmot.quantization.keras
-            .quantize_annotate_layer(
-                layer,
-                quantize_config=quantize_config,
-            )
+        return tfmot.quantization.keras.quantize_annotate_layer(
+            layer,
+            quantize_config=quantize_config,
         )
 
     return layer
@@ -339,31 +323,21 @@ def _quantize_backbone_legacy(
     comparison.
     """
 
-    annotated = (
-        tfmot.quantization.keras
-        .quantize_annotate_model(
-            backbone
-        )
-    )
+    annotated = tfmot.quantization.keras.quantize_annotate_model(backbone)
 
     with tfmot.quantization.keras.quantize_scope(
         {
-            "FreezableBatchNorm":
-                FreezableBatchNorm,
+            "FreezableBatchNorm": FreezableBatchNorm,
         }
     ):
-        return (
-            tfmot.quantization.keras
-            .quantize_apply(
-                annotated,
-                scheme=default_8bit
-                .Default8BitQuantizeScheme(
-                    disable_per_axis=not per_axis,
-                ),
-            )
+        return tfmot.quantization.keras.quantize_apply(
+            annotated,
+            scheme=default_8bit.Default8BitQuantizeScheme(
+                disable_per_axis=not per_axis,
+            ),
         )
 
-    
+
 def _quantize_backbone_tfmot(
     backbone,
     *,
@@ -377,14 +351,10 @@ def _quantize_backbone_tfmot(
     prefer the custom QuantizeConfig schemes.
     """
 
-    annotated = tfmot.quantization.keras.quantize_annotate_model(
-        backbone
-    )
+    annotated = tfmot.quantization.keras.quantize_annotate_model(backbone)
     return tfmot.quantization.keras.quantize_apply(
         annotated,
-        scheme=default_8bit.Default8BitQuantizeScheme(
-            disable_per_axis=per_axis
-        )
+        scheme=default_8bit.Default8BitQuantizeScheme(disable_per_axis=per_axis),
     )
 
 
@@ -407,7 +377,7 @@ def _relu6_fed_conv_names(backbone):
         tf.keras.layers.ZeroPadding2D,
     )
 
-    consumers = {l.name: [] for l in backbone.layers}
+    consumers = {layer.name: [] for layer in backbone.layers}
     for layer in backbone.layers:
         for node in layer._outbound_nodes:
             consumers[layer.name].append(node.outbound_layer)
@@ -453,9 +423,7 @@ def _is_relu6(layer):
 
     if isinstance(layer, tf.keras.layers.Lambda):
         try:
-            probe = tf.constant(
-                [-6.0, -1.0, 0.0, 3.0, 6.0, 9.0], dtype=tf.float32
-            )
+            probe = tf.constant([-6.0, -1.0, 0.0, 3.0, 6.0, 9.0], dtype=tf.float32)
             out = np.asarray(layer(probe))
             return np.allclose(out, np.clip(probe.numpy(), 0.0, 6.0))
         except Exception:
@@ -513,37 +481,24 @@ def _quantize_backbone_full(
                 tf.keras.layers.DepthwiseConv2D,
             ),
         ):
-            config = (
-                weights_only
-                if layer.name in relu6_fed
-                else signed_cfg
-            )
-            return (
-                tfmot.quantization.keras
-                .quantize_annotate_layer(
-                    layer,
-                    quantize_config=config,
-                )
+            config = weights_only if layer.name in relu6_fed else signed_cfg
+            return tfmot.quantization.keras.quantize_annotate_layer(
+                layer,
+                quantize_config=config,
             )
 
         if _is_relu6(layer):
-            return (
-                tfmot.quantization.keras
-                .quantize_annotate_layer(
-                    layer,
-                    quantize_config=relu6_cfg,
-                )
+            return tfmot.quantization.keras.quantize_annotate_layer(
+                layer,
+                quantize_config=relu6_cfg,
             )
 
         # Residual-add output: close the fake-quant coverage gap so the
         # backbone converts per-tensor with no representative dataset.
         if isinstance(layer, tf.keras.layers.Add):
-            return (
-                tfmot.quantization.keras
-                .quantize_annotate_layer(
-                    layer,
-                    quantize_config=add_cfg,
-                )
+            return tfmot.quantization.keras.quantize_annotate_layer(
+                layer,
+                quantize_config=add_cfg,
             )
 
         return layer
@@ -562,9 +517,7 @@ def _quantize_backbone_full(
             clone_function=clone_function,
         )
 
-        return tfmot.quantization.keras.quantize_apply(
-            annotated
-        )
+        return tfmot.quantization.keras.quantize_apply(annotated)
 
 
 def quantize_backbone(
@@ -659,40 +612,21 @@ def quantize_backbone(
             ),
         )
 
-        return tfmot.quantization.keras.quantize_apply(
-            annotated
-        )
+        return tfmot.quantization.keras.quantize_apply(annotated)
 
 
-def ensure_model_is_built_for_qat(
-    detection_model,
-    pipeline_config
-):
+def ensure_model_is_built_for_qat(detection_model, pipeline_config):
     ssd_config = pipeline_config.model.ssd
 
-    h = (
-        ssd_config.image_resizer
-        .fixed_shape_resizer
-        .height
-    )
+    h = ssd_config.image_resizer.fixed_shape_resizer.height
 
-    w = (
-        ssd_config.image_resizer
-        .fixed_shape_resizer
-        .width
-    )
+    w = ssd_config.image_resizer.fixed_shape_resizer.width
 
-    dummy = tf.zeros(
-        [1, h, w, 3],
-        dtype=tf.float32
-    )
+    dummy = tf.zeros([1, h, w, 3], dtype=tf.float32)
 
     image, shapes = detection_model.preprocess(dummy)
 
-    detection_model.predict(
-        image,
-        shapes
-    )
+    detection_model.predict(image, shapes)
 
 
 # =========================================================
@@ -761,13 +695,13 @@ def fold_functional(model):
         parents = list(tf.nest.flatten(layer.inbound_nodes[0].inbound_layers))
         x = [out[p.name] for p in parents]
         x = x[0] if len(x) == 1 else x
-        if layer.name in drop:                       # BN -> its conv's folded output
+        if layer.name in drop:  # BN -> its conv's folded output
             out[layer.name] = out[parents[0].name]
         elif layer.name in conv_bn:
             folded = _fold_conv_bn_functional(layer, conv_bn[layer.name])
             out[layer.name] = folded(x)
         else:
-            out[layer.name] = layer(x)               # reuse (Lambda/ReLU6/...)
+            out[layer.name] = layer(x)  # reuse (Lambda/ReLU6/...)
     outputs = [out[o._keras_history.layer.name] for o in model.outputs]
     return tf.keras.Model(new_inputs, outputs)
 
@@ -781,9 +715,14 @@ def _fold_conv_bn_functional(conv, bn):
     mu, var = bn.moving_mean.numpy(), bn.moving_variance.numpy()
     scale = g / np.sqrt(var + bn.epsilon)
     folded = tf.keras.layers.Conv2D(
-        conv.filters, conv.kernel_size, strides=conv.strides,
-        padding=conv.padding, dilation_rate=conv.dilation_rate,
-        activation=None, use_bias=True, name=conv.name + "_folded",
+        conv.filters,
+        conv.kernel_size,
+        strides=conv.strides,
+        padding=conv.padding,
+        dilation_rate=conv.dilation_rate,
+        activation=None,
+        use_bias=True,
+        name=conv.name + "_folded",
     )
     folded.build((None, None, None, int(k.shape[2])))
     folded.set_weights([k * scale.reshape(1, 1, 1, -1), be + (b - mu) * scale])
@@ -827,7 +766,7 @@ class FMGAdapter(tf.keras.layers.Layer):
         ordered = [san[name] for name in self.func.input_names]
         outs = self.func(ordered)
         outs = outs if isinstance(outs, (list, tuple)) else [outs]
-        return collections.OrderedDict(zip(self.output_keys, outs))
+        return collections.OrderedDict(zip(self.output_keys, outs, strict=False))
 
 
 def rebuild_box_predictor_functional(box_predictor, feature_shapes):
@@ -838,7 +777,8 @@ def rebuild_box_predictor_functional(box_predictor, feature_shapes):
     are the box-encoding tensors followed by the class tensors.
     """
     from object_detection.core.box_predictor import (
-        BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND,
+        BOX_ENCODINGS,
+        CLASS_PREDICTIONS_WITH_BACKGROUND,
     )
 
     inputs = [
@@ -848,24 +788,36 @@ def rebuild_box_predictor_functional(box_predictor, feature_shapes):
     box_out, cls_out = [], []
     for i, x0 in enumerate(inputs):
         x = x0
-        for layer in box_predictor._shared_nets[i]:   # empty unless a tower is configured
+        for layer in box_predictor._shared_nets[
+            i
+        ]:  # empty unless a tower is configured
             x = layer(x)
         bh = box_predictor._prediction_heads[BOX_ENCODINGS][i]
         b = x
         for layer in bh._box_encoder_layers:
-            b = (_clone_conv_unique(layer, f"BoxEncodingPredictor_{i}")
-                 if isinstance(layer, _QAT_CONV) else layer)(b)
+            b = (
+                _clone_conv_unique(layer, f"BoxEncodingPredictor_{i}")
+                if isinstance(layer, _QAT_CONV)
+                else layer
+            )(b)
         box_out.append(
-            tf.keras.layers.Reshape((-1, 1, bh._box_code_size),
-                                    name=f"box_reshape_{i}")(b))
+            tf.keras.layers.Reshape(
+                (-1, 1, bh._box_code_size), name=f"box_reshape_{i}"
+            )(b)
+        )
         ch = box_predictor._prediction_heads[CLASS_PREDICTIONS_WITH_BACKGROUND][i]
         c = x
         for layer in ch._class_predictor_layers:
-            c = (_clone_conv_unique(layer, f"ClassPredictor_{i}")
-                 if isinstance(layer, _QAT_CONV) else layer)(c)
+            c = (
+                _clone_conv_unique(layer, f"ClassPredictor_{i}")
+                if isinstance(layer, _QAT_CONV)
+                else layer
+            )(c)
         cls_out.append(
-            tf.keras.layers.Reshape((-1, ch._num_class_slots),
-                                    name=f"cls_reshape_{i}")(c))
+            tf.keras.layers.Reshape((-1, ch._num_class_slots), name=f"cls_reshape_{i}")(
+                c
+            )
+        )
     return tf.keras.Model(inputs, box_out + cls_out)
 
 
@@ -882,13 +834,15 @@ class BoxPredictorAdapter(tf.keras.layers.Layer):
 
     def call(self, image_features):
         from object_detection.core.box_predictor import (
-            BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND,
+            BOX_ENCODINGS,
+            CLASS_PREDICTIONS_WITH_BACKGROUND,
         )
+
         outs = self.func(list(image_features))
         outs = outs if isinstance(outs, (list, tuple)) else [outs]
         return {
             BOX_ENCODINGS: list(outs[: self.n]),
-            CLASS_PREDICTIONS_WITH_BACKGROUND: list(outs[self.n:]),
+            CLASS_PREDICTIONS_WITH_BACKGROUND: list(outs[self.n :]),
         }
 
 
@@ -925,7 +879,9 @@ def quantize_detection_head(detection_model, image_size, *, scheme="full"):
     fe.feature_map_generator = FMGAdapter(qfmg, out_keys)
 
     qbp = quantize_backbone(
-        rebuild_box_predictor_functional(detection_model._box_predictor, feature_shapes),
+        rebuild_box_predictor_functional(
+            detection_model._box_predictor, feature_shapes
+        ),
         scheme=scheme,
     )
     detection_model._box_predictor = BoxPredictorAdapter(qbp, len(feature_shapes))

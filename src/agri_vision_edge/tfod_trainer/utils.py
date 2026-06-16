@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import pprint
-import time
 
 
 def current_learning_rate(lr):

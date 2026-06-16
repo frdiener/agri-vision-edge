@@ -5,29 +5,26 @@ Provides helpers for evaluating multiple TensorFlow Object
 Detection checkpoints and summarizing validation metrics.
 """
 
-from pathlib import Path
-from typing import Optional, Union, List
-
 import re
-import tempfile
 import shutil
+import tempfile
+from pathlib import Path
 
-import tensorflow.compat.v1 as tf
 import pandas as pd
+import tensorflow.compat.v1 as tf
 from google.protobuf import text_format
-from object_detection.protos import pipeline_pb2
 from object_detection.model_lib_v2 import eval_one_checkpoint
+from object_detection.protos import pipeline_pb2
 
-from .tensorboard import load_event_scalars
 from ..tfod.eval import launch_eval
+from .tensorboard import load_event_scalars
 
-
-PathLike = Union[str, Path]
+PathLike = str | Path
 
 
 def find_checkpoints(
     checkpoint_dir: PathLike,
-) -> List[Path]:
+) -> list[Path]:
     """
     Discover TensorFlow checkpoints.
 

@@ -3,12 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import uuid
-
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_STRUCTURE = {
     "metadata": {},
@@ -257,7 +255,7 @@ class ExperimentManifest:
 
     def merge(
         self,
-        other: "ExperimentManifest",
+        other: ExperimentManifest,
     ) -> None:
         """
         Merge another manifest into this one.
@@ -326,7 +324,7 @@ class ExperimentManifest:
     def load(
         cls,
         path: str | Path,
-    ) -> "ExperimentManifest":
+    ) -> ExperimentManifest:
 
         path = Path(path)
 

@@ -7,14 +7,12 @@ from __future__ import annotations
 import collections
 
 import tensorflow as tf
-
-from object_detection import inputs
-from object_detection import model_lib
+from object_detection import inputs, model_lib
 from object_detection.core import standard_fields as fields
-
 from object_detection.model_lib_v2 import (
-    _compute_losses_and_predictions_dicts
-        as compute_losses_and_predictions_dicts,
+    _compute_losses_and_predictions_dicts as compute_losses_and_predictions_dicts,
+)
+from object_detection.model_lib_v2 import (
     prepare_eval_dict,
 )
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -190,8 +189,8 @@ class FineTuneConfig:
     #   max_scale = 0.95
     #
     # Reduced for smaller agricultural objects.
-    anchor_min_scale: Optional[float] = 0.03
-    anchor_max_scale: Optional[float] = 0.35
+    anchor_min_scale: float | None = 0.03
+    anchor_max_scale: float | None = 0.35
 
     # Common upstream aspect ratios.
     anchor_aspect_ratios: tuple[float, ...] = (

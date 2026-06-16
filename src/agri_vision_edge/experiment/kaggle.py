@@ -35,7 +35,6 @@ from __future__ import annotations
 import os
 from typing import Any
 
-
 #: Kaggle environment variables considered useful for experiment
 #: provenance and reproducibility tracking.
 KAGGLE_ENV_KEYS: tuple[str, ...] = (

@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import numpy as np
 import tensorflow as tf
-
 from object_detection.core.freezable_batch_norm import (
     FreezableBatchNorm,
 )
@@ -49,16 +48,10 @@ def _get_bn_consumer(
         AssertionError if the expected topology is violated.
     """
 
-    consumers = [
-        node.layer
-        for node in layer._outbound_nodes
-    ]
+    consumers = [node.layer for node in layer._outbound_nodes]
 
-    assert (
-        len(consumers) == 1
-    ), (
-        f"{layer.name}: expected exactly one consumer, "
-        f"found {len(consumers)}"
+    assert len(consumers) == 1, (
+        f"{layer.name}: expected exactly one consumer, found {len(consumers)}"
     )
 
     bn = consumers[0]
@@ -66,10 +59,7 @@ def _get_bn_consumer(
     assert isinstance(
         bn,
         FreezableBatchNorm,
-    ), (
-        f"{layer.name}: expected FreezableBatchNorm consumer, "
-        f"found {type(bn).__name__}"
-    )
+    ), f"{layer.name}: expected FreezableBatchNorm consumer, found {type(bn).__name__}"
 
     return bn
 
@@ -97,25 +87,16 @@ def _fold_conv_bn(
     mean = bn.moving_mean.numpy()
     var = bn.moving_variance.numpy()
 
-    scale = gamma / np.sqrt(
-        var + bn.epsilon
+    scale = gamma / np.sqrt(var + bn.epsilon)
+
+    kernel_folded = kernel * scale.reshape(
+        1,
+        1,
+        1,
+        -1,
     )
 
-    kernel_folded = (
-        kernel
-        * scale.reshape(
-            1,
-            1,
-            1,
-            -1,
-        )
-    )
-
-    bias_folded = (
-        beta
-        + (bias - mean)
-        * scale
-    )
+    bias_folded = beta + (bias - mean) * scale
 
     folded = tf.keras.layers.Conv2D(
         filters=conv.filters,
@@ -128,9 +109,7 @@ def _fold_conv_bn(
         name=f"{conv.name}_folded",
     )
 
-    folded.build(
-        conv.input_shape
-    )
+    folded.build(conv.input_shape)
 
     folded.set_weights(
         [
@@ -150,10 +129,7 @@ def _fold_depthwise_bn(
     Fold BatchNorm parameters into a DepthwiseConv2D layer.
     """
 
-    kernel = (
-        depthwise.depthwise_kernel
-        .numpy()
-    )
+    kernel = depthwise.depthwise_kernel.numpy()
 
     if depthwise.use_bias:
         bias = depthwise.bias.numpy()
@@ -168,25 +144,16 @@ def _fold_depthwise_bn(
     mean = bn.moving_mean.numpy()
     var = bn.moving_variance.numpy()
 
-    scale = gamma / np.sqrt(
-        var + bn.epsilon
+    scale = gamma / np.sqrt(var + bn.epsilon)
+
+    kernel_folded = kernel * scale.reshape(
+        1,
+        1,
+        -1,
+        1,
     )
 
-    kernel_folded = (
-        kernel
-        * scale.reshape(
-            1,
-            1,
-            -1,
-            1,
-        )
-    )
-
-    bias_folded = (
-        beta
-        + (bias - mean)
-        * scale
-    )
+    bias_folded = beta + (bias - mean) * scale
 
     folded = tf.keras.layers.DepthwiseConv2D(
         kernel_size=depthwise.kernel_size,
@@ -199,9 +166,7 @@ def _fold_depthwise_bn(
         name=f"{depthwise.name}_folded",
     )
 
-    folded.build(
-        depthwise.input_shape
-    )
+    folded.build(depthwise.input_shape)
 
     folded.set_weights(
         [
@@ -233,9 +198,7 @@ def _clone_or_replace_layer(
             name=layer.name,
         )
 
-    return layer.__class__.from_config(
-        layer.get_config()
-    )
+    return layer.__class__.from_config(layer.get_config())
 
 
 def fold_mobilenetv2_backbone(
@@ -263,7 +226,6 @@ def fold_mobilenetv2_backbone(
     }
 
     for layer in backbone.layers:
-
         if isinstance(
             layer,
             tf.keras.layers.InputLayer,
@@ -276,16 +238,9 @@ def fold_mobilenetv2_backbone(
         ):
             continue
 
-        old_inputs = tf.nest.flatten(
-            layer.input
-        )
+        old_inputs = tf.nest.flatten(layer.input)
 
-        new_inputs = [
-            tensor_map[
-                tensor.ref()
-            ]
-            for tensor in old_inputs
-        ]
+        new_inputs = [tensor_map[tensor.ref()] for tensor in old_inputs]
 
         if len(new_inputs) == 1:
             new_inputs = new_inputs[0]
@@ -298,25 +253,16 @@ def fold_mobilenetv2_backbone(
             layer,
             tf.keras.layers.Conv2D,
         ):
+            bn = _get_bn_consumer(layer)
 
-            bn = _get_bn_consumer(
-                layer
-            )
+            new_output = _fold_conv_bn(
+                layer,
+                bn,
+            )(new_inputs)
 
-            new_output = (
-                _fold_conv_bn(
-                    layer,
-                    bn,
-                )(new_inputs)
-            )
+            tensor_map[layer.output.ref()] = new_output
 
-            tensor_map[
-                layer.output.ref()
-            ] = new_output
-
-            tensor_map[
-                bn.output.ref()
-            ] = new_output
+            tensor_map[bn.output.ref()] = new_output
 
             continue
 
@@ -328,25 +274,16 @@ def fold_mobilenetv2_backbone(
             layer,
             tf.keras.layers.DepthwiseConv2D,
         ):
+            bn = _get_bn_consumer(layer)
 
-            bn = _get_bn_consumer(
-                layer
-            )
+            new_output = _fold_depthwise_bn(
+                layer,
+                bn,
+            )(new_inputs)
 
-            new_output = (
-                _fold_depthwise_bn(
-                    layer,
-                    bn,
-                )(new_inputs)
-            )
+            tensor_map[layer.output.ref()] = new_output
 
-            tensor_map[
-                layer.output.ref()
-            ] = new_output
-
-            tensor_map[
-                bn.output.ref()
-            ] = new_output
+            tensor_map[bn.output.ref()] = new_output
 
             continue
 
@@ -354,38 +291,22 @@ def fold_mobilenetv2_backbone(
         # Everything else
         #
 
-        new_layer = (
-            _clone_or_replace_layer(
-                layer
-            )
-        )
+        new_layer = _clone_or_replace_layer(layer)
 
-        new_output = new_layer(
-            new_inputs
-        )
+        new_output = new_layer(new_inputs)
 
-        old_outputs = tf.nest.flatten(
-            layer.output
-        )
+        old_outputs = tf.nest.flatten(layer.output)
 
-        new_outputs = tf.nest.flatten(
-            new_output
-        )
+        new_outputs = tf.nest.flatten(new_output)
 
         for old, new in zip(
             old_outputs,
             new_outputs,
+            strict=False,
         ):
-            tensor_map[
-                old.ref()
-            ] = new
+            tensor_map[old.ref()] = new
 
-    outputs = [
-        tensor_map[
-            tensor.ref()
-        ]
-        for tensor in backbone.output
-    ]
+    outputs = [tensor_map[tensor.ref()] for tensor in backbone.output]
 
     folded_backbone = tf.keras.Model(
         inputs=new_input,
@@ -401,11 +322,6 @@ def fold_mobilenetv2_backbone(
         for layer in folded_backbone.layers
     )
 
-    assert (
-        bn_count == 0
-    ), (
-        f"Folded backbone still contains "
-        f"{bn_count} BatchNorm layers."
-    )
+    assert bn_count == 0, f"Folded backbone still contains {bn_count} BatchNorm layers."
 
     return folded_backbone

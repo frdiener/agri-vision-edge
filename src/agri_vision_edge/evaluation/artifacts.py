@@ -35,9 +35,7 @@ def save_benchmark_artifacts(
         "predictions.json",
     )
 
-    from agri_vision_edge.evaluation.benchmark import (
-        latency_summary
-    )
+    from agri_vision_edge.evaluation.benchmark import latency_summary
 
     save_json(
         latency_summary(

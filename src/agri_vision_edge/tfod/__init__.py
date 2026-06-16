@@ -1,29 +1,22 @@
 from .common import (
     get_tf_models_research_dir,
 )
-
 from .config import (
+    configure_ssd_pipeline,
     load_pipeline_config,
     save_pipeline_config,
-    configure_ssd_pipeline,
 )
-
-from .train import (
-    launch_training,
-)
-
 from .eval import (
     launch_eval,
 )
-
 from .export import (
+    export_all,
     export_saved_model,
     export_tflite_graph,
-    export_all,
 )
-
-from .mobilenetv2_bn_folding import (
-    fold_mobilenetv2_backbone
+from .mobilenetv2_bn_folding import fold_mobilenetv2_backbone
+from .train import (
+    launch_training,
 )
 
 # NOTE: the QAT helpers (quantize_backbone / quantize_detection_head) live in

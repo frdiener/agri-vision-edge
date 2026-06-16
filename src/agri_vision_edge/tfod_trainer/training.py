@@ -6,25 +6,23 @@ from __future__ import annotations
 
 import time
 
-from agri_vision_edge.tfod_trainer.setup import (
-    Runtime,
-    restore_weights,
-    apply_graph_modifications,
-)
 import tensorflow as tf
-
 from object_detection import inputs
-
 from object_detection.model_lib_v2 import (
-    eager_train_step,
     eager_eval_loop,
+    eager_train_step,
 )
 
-from .state import TrainerState
-from .evaluation import (
-    evaluate,
-    create_eval_dataset,
+from agri_vision_edge.tfod_trainer.setup import (
+    apply_graph_modifications,
+    restore_weights,
 )
+
+from .evaluation import (
+    create_eval_dataset,
+    evaluate,
+)
+from .state import TrainerState
 from .utils import (
     current_learning_rate,
     metrics_to_float,

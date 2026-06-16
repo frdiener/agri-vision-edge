@@ -8,15 +8,15 @@ Provides plots for:
 """
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
 
 def load_history_scalars(
-    history: Union[str, Path, list[dict]],
+    history: str | Path | list[dict],
 ) -> pd.DataFrame:
     """
     Load scalar metrics from a tfod_trainer training history.
@@ -145,7 +145,7 @@ def plot_metric_curves(
     ylabel: str,
     smoothing: float = 0.0,
     figsize=DEFAULT_FIGSIZE,
-    save_path: Optional[Union[str, Path]] = None,
+    save_path: str | Path | None = None,
     dpi: int = DEFAULT_DPI,
 ):
     """
@@ -234,7 +234,7 @@ def plot_metric_curves(
 def plot_loss_curves(
     df: pd.DataFrame,
     smoothing: float = 0.6,
-    save_path: Optional[Union[str, Path]] = None,
+    save_path: str | Path | None = None,
     dpi: int = DEFAULT_DPI,
 ):
     """
@@ -274,7 +274,7 @@ def plot_loss_curves(
 def plot_learning_rate(
     df: pd.DataFrame,
     smoothing: float = 0.0,
-    save_path: Optional[Union[str, Path]] = None,
+    save_path: str | Path | None = None,
     dpi: int = DEFAULT_DPI,
 ):
     """
@@ -308,7 +308,7 @@ def plot_learning_rate(
 def plot_steps_per_second(
     df: pd.DataFrame,
     smoothing: float = 0.5,
-    save_path: Optional[Union[str, Path]] = None,
+    save_path: str | Path | None = None,
     dpi: int = DEFAULT_DPI,
 ):
     """
@@ -342,7 +342,7 @@ def plot_steps_per_second(
 def plot_map_curves(
     df: pd.DataFrame,
     smoothing: float = 0.0,
-    save_path: Optional[Union[str, Path]] = None,
+    save_path: str | Path | None = None,
     dpi: int = DEFAULT_DPI,
 ):
     """
@@ -368,7 +368,7 @@ def plot_map_curves(
 def plot_recall_curves(
     df: pd.DataFrame,
     smoothing: float = 0.0,
-    save_path: Optional[Union[str, Path]] = None,
+    save_path: str | Path | None = None,
     dpi: int = DEFAULT_DPI,
 ):
     """
@@ -394,7 +394,7 @@ def plot_recall_curves(
 def plot_checkpoint_metrics(
     metrics_df: pd.DataFrame,
     figsize=(10, 10),
-    save_path: Optional[Union[str, Path]] = None,
+    save_path: str | Path | None = None,
     dpi: int = DEFAULT_DPI,
 ):
     """

@@ -8,20 +8,16 @@ programmatically for custom datasets and training setups.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
 
 import tensorflow as tf
 from google.protobuf import text_format
-
 from object_detection.protos import pipeline_pb2
 
 from ..experiment.finetune import (
-    AugmentationConfig,
     FineTuneConfig,
 )
 
-
-PathLike = Union[str, Path]
+PathLike = str | Path
 
 
 def _clear_augmentations(

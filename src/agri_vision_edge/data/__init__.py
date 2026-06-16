@@ -13,40 +13,33 @@ Provides:
 from ..third_party.phenobench import (
     PhenoBench,
 )
-
-from .datasets import (
-    DatasetDefinition,
-    PHENOBENCH_MULTICLASS,
-    PHENOBENCH_WEED_ONLY,
-)
-
 from .categories import (
     build_category_map,
     build_class_names,
 )
-
-from .preprocessing import (
-    resize_image_and_boxes,
-    normalize_boxes,
-    split_indices,
-)
-
 from .coco import (
     export_coco_annotations,
 )
-
-from .tfrecord import (
-    build_record,
+from .datasets import (
+    PHENOBENCH_MULTICLASS,
+    PHENOBENCH_WEED_ONLY,
+    DatasetDefinition,
 )
-
-from .rep_dataset import (
-    representative_dataset,
-    normalized_representative_dataset,
-    build_rep_indices,
-)
-
 from .label_map import (
     write_label_map,
+)
+from .preprocessing import (
+    normalize_boxes,
+    resize_image_and_boxes,
+    split_indices,
+)
+from .rep_dataset import (
+    build_rep_indices,
+    normalized_representative_dataset,
+    representative_dataset,
+)
+from .tfrecord import (
+    build_record,
 )
 
 __all__ = [

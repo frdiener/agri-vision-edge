@@ -11,11 +11,9 @@ import numpy as np
 from .coco import (
     phenobench_bbox_to_xyxy,
 )
-
 from .preprocessing import (
     resize_image_and_boxes,
 )
-
 
 DEFAULT_REPRESENTATIVE_SAMPLES = 200
 

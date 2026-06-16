@@ -13,20 +13,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import tensorflow as tf
-
 from google.protobuf import text_format
-
-from object_detection.protos import pipeline_pb2
-from object_detection.builders import model_builder
-from object_detection.builders import optimizer_builder
-from object_detection.utils import label_map_util
-from object_detection.utils import config_util
-from object_detection.utils import variables_helper
 from object_detection import eval_util
+from object_detection.builders import model_builder, optimizer_builder
 from object_detection.model_lib_v2 import (
-    load_fine_tune_checkpoint,
     _ensure_model_is_built,
+    load_fine_tune_checkpoint,
 )
+from object_detection.protos import pipeline_pb2
+from object_detection.utils import config_util, label_map_util, variables_helper
 
 
 @dataclass(slots=True)

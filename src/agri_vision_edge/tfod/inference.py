@@ -21,20 +21,20 @@ Typical usage:
 """
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import tensorflow as tf
-from PIL import Image
-
 from object_detection.utils import (
     label_map_util,
+)
+from object_detection.utils import (
     visualization_utils as viz_utils,
 )
+from PIL import Image
 
 # Type alias
-PathLike = Union[str, Path]
+PathLike = str | Path
 
 
 # ---------------------------------------------------------------------
@@ -55,7 +55,7 @@ def load_saved_model(model_dir: PathLike):
     return tf.saved_model.load(str(model_dir))
 
 
-def load_label_map(label_map_path: PathLike) -> Dict:
+def load_label_map(label_map_path: PathLike) -> dict:
     """
     Load TF-OD label map.
 
@@ -78,7 +78,7 @@ def load_label_map(label_map_path: PathLike) -> Dict:
 
 def preprocess_image(
     image: np.ndarray,
-    image_size: Optional[int] = 320,
+    image_size: int | None = 320,
 ) -> np.ndarray:
     """
     Preprocess image for TF-OD inference.
@@ -105,7 +105,7 @@ def preprocess_image(
 def run_inference(
     detect_fn,
     image: np.ndarray,
-) -> Dict[str, tf.Tensor]:
+) -> dict[str, tf.Tensor]:
     """
     Run TF-OD inference on an RGB image.
 
@@ -131,11 +131,11 @@ def run_inference(
 # ---------------------------------------------------------------------
 
 def apply_nms(
-    detections: Dict[str, tf.Tensor],
+    detections: dict[str, tf.Tensor],
     iou_threshold: float = 0.5,
     score_threshold: float = 0.05,
     max_detections: int = 50,
-) -> Dict[str, tf.Tensor]:
+) -> dict[str, tf.Tensor]:
     """
     Apply Non-Maximum Suppression (NMS) to TF-OD detections.
 
@@ -180,8 +180,8 @@ def apply_nms(
 
 def visualize_detections(
     image: np.ndarray,
-    detections: Dict[str, tf.Tensor],
-    category_index: Dict,
+    detections: dict[str, tf.Tensor],
+    category_index: dict,
     score_threshold: float = 0.0,
     max_boxes: int = 50,
 ) -> Image.Image:
@@ -227,13 +227,13 @@ def visualize_detections(
 def detect_image(
     detect_fn,
     image_path: PathLike,
-    category_index: Dict,
-    image_size: Optional[int] = 320,
+    category_index: dict,
+    image_size: int | None = 320,
     score_threshold: float = 0.05,
     max_boxes: int = 50,
     apply_nms_flag: bool = True,
     nms_iou_threshold: float = 0.5,
-) -> Tuple[Image.Image, Dict[str, tf.Tensor]]:
+) -> tuple[Image.Image, dict[str, tf.Tensor]]:
     """
     Run full TF-OD inference pipeline on an image.
 

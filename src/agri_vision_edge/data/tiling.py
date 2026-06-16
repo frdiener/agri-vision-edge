@@ -14,12 +14,11 @@ fragments without relying on bbox shape.
 
 from __future__ import annotations
 
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
-
 
 # --------------------------------------------------
 # Geometry

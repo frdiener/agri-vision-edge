@@ -89,11 +89,10 @@ def export_run(
 
     import tensorflow as tf
     from google.protobuf import text_format
-
-    from object_detection.protos import pipeline_pb2
     from object_detection.builders import model_builder
-    from object_detection.utils import config_util
     from object_detection.exporter_lib_v2 import DETECTION_MODULE_MAP
+    from object_detection.protos import pipeline_pb2
+    from object_detection.utils import config_util
 
     if not isinstance(cfg, FinetuneRunConfig):
         cfg = FinetuneRunConfig.from_mapping(cfg)

@@ -6,14 +6,13 @@ Compatible with TensorFlow 2 Object Detection API logs.
 """
 
 from pathlib import Path
-from typing import Union
 
 import pandas as pd
 import tensorflow as tf
 
 
 def load_event_scalars(
-    logdir: Union[str, Path],
+    logdir: str | Path,
 ) -> pd.DataFrame:
     """
     Load TensorBoard scalar metrics from event files.

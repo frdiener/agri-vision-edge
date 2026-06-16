@@ -36,33 +36,14 @@ name = "agri-vision-edge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "absl-py" },
-    { name = "contextlib2" },
-    { name = "cython" },
-    { name = "lvis" },
-    { name = "lxml" },
-    { name = "matplotlib" },
     { name = "numpy" },
     { name = "opencv-python" },
-    { name = "pandas" },
-    { name = "phenobench" },
-    { name = "pillow" },
-    { name = "protobuf" },
-    { name = "pycocotools" },
-    { name = "pydantic-ai" },
     { name = "pyyaml" },
-    { name = "scipy" },
-    { name = "six" },
-    { name = "tensorflow" },
-    { name = "tensorflow-addons" },
-    { name = "tensorflow-hub" },
-    { name = "tensorflow-io" },
-    { name = "tensorflow-model-optimization" },
-    { name = "tensorflow-text" },
-    { name = "tf-models-official" },
-    { name = "tf-slim" },
+]
+
+[package.optional-dependencies]
+device = [
     { name = "tflite-runtime" },
-    { name = "tflite-support" },
 ]
 
 [package.dev-dependencies]
@@ -77,37 +58,40 @@ dev = [
     { name = "reuse" },
     { name = "ruff" },
 ]
+prep = [
+    { name = "absl-py" },
+    { name = "contextlib2" },
+    { name = "cython" },
+    { name = "lvis" },
+    { name = "lxml" },
+    { name = "matplotlib" },
+    { name = "pandas" },
+    { name = "phenobench" },
+    { name = "pillow" },
+    { name = "protobuf" },
+    { name = "pycocotools" },
+    { name = "pydantic-ai" },
+    { name = "scipy" },
+    { name = "six" },
+    { name = "tensorflow" },
+    { name = "tensorflow-addons" },
+    { name = "tensorflow-hub" },
+    { name = "tensorflow-io" },
+    { name = "tensorflow-model-optimization" },
+    { name = "tensorflow-text" },
+    { name = "tf-models-official" },
+    { name = "tf-slim" },
+    { name = "tflite-support" },
+]
 
 [package.metadata]
 requires-dist = [
-    { name = "absl-py", specifier = "==1.4.0" },
-    { name = "contextlib2", specifier = "==21.6.0" },
-    { name = "cython", specifier = "==3.0.10" },
-    { name = "lvis", specifier = ">=0.5.3" },
-    { name = "lxml", specifier = "==5.2.2" },
-    { name = "matplotlib", specifier = "==3.8.4" },
     { name = "numpy", specifier = "==1.23.5" },
     { name = "opencv-python", specifier = "==4.9.0.80" },
-    { name = "pandas", specifier = "==2.0.3" },
-    { name = "phenobench", specifier = ">=0.1.0" },
-    { name = "pillow", specifier = "==10.3.0" },
-    { name = "protobuf", specifier = "==3.20.3" },
-    { name = "pycocotools", specifier = "==2.0.7" },
-    { name = "pydantic-ai", specifier = ">=0.8.1" },
     { name = "pyyaml", specifier = "==6.0.3" },
-    { name = "scipy", specifier = "==1.10.1" },
-    { name = "six", specifier = "==1.16.0" },
-    { name = "tensorflow", specifier = "==2.12.0" },
-    { name = "tensorflow-addons", specifier = "==0.20.0" },
-    { name = "tensorflow-hub", specifier = "==0.13.*" },
-    { name = "tensorflow-io", specifier = ">=0.37.1" },
-    { name = "tensorflow-model-optimization", specifier = "==0.7.5" },
-    { name = "tensorflow-text", specifier = "==2.12.*" },
-    { name = "tf-models-official", specifier = ">=2.12.0" },
-    { name = "tf-slim", specifier = "==1.1.0" },
-    { name = "tflite-runtime", specifier = ">=2.14.0" },
-    { name = "tflite-support", specifier = ">=0.4.4" },
+    { name = "tflite-runtime", marker = "extra == 'device'", specifier = ">=2.14.0" },
 ]
+provides-extras = ["device"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -120,6 +104,31 @@ dev = [
     { name = "pytest", specifier = ">=8.4" },
     { name = "reuse", specifier = ">=5.1.1" },
     { name = "ruff", specifier = ">=0.15.15" },
+]
+prep = [
+    { name = "absl-py", specifier = "==1.4.0" },
+    { name = "contextlib2", specifier = "==21.6.0" },
+    { name = "cython", specifier = "==3.0.10" },
+    { name = "lvis", specifier = ">=0.5.3" },
+    { name = "lxml", specifier = "==5.2.2" },
+    { name = "matplotlib", specifier = "==3.8.4" },
+    { name = "pandas", specifier = "==2.0.3" },
+    { name = "phenobench", specifier = ">=0.1.0" },
+    { name = "pillow", specifier = "==10.3.0" },
+    { name = "protobuf", specifier = "==3.20.3" },
+    { name = "pycocotools", specifier = "==2.0.7" },
+    { name = "pydantic-ai", specifier = ">=0.8.1" },
+    { name = "scipy", specifier = "==1.10.1" },
+    { name = "six", specifier = "==1.16.0" },
+    { name = "tensorflow", specifier = "==2.12.0" },
+    { name = "tensorflow-addons", specifier = "==0.20.0" },
+    { name = "tensorflow-hub", specifier = "==0.13.*" },
+    { name = "tensorflow-io", specifier = ">=0.37.1" },
+    { name = "tensorflow-model-optimization", specifier = "==0.7.5" },
+    { name = "tensorflow-text", specifier = "==2.12.*" },
+    { name = "tf-models-official", specifier = ">=2.12.0" },
+    { name = "tf-slim", specifier = "==1.1.0" },
+    { name = "tflite-support", specifier = ">=0.4.4" },
 ]
 
 [[package]]

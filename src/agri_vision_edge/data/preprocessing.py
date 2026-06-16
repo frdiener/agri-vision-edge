@@ -18,12 +18,10 @@ Responsibilities:
 from __future__ import annotations
 
 import random
-
-from typing import Sequence
+from collections.abc import Sequence
 
 import cv2
 import numpy as np
-
 
 DEFAULT_TARGET_SIZE = 320
 

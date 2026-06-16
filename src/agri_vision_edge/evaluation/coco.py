@@ -6,7 +6,6 @@ from pathlib import Path
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-
 METRIC_NAMES = [
     "AP",
     "AP50",
@@ -32,7 +31,6 @@ def evaluate_predictions(
     """
 
     with open(predictions_path) as f:
-
         predictions = json.load(f)
 
     #
@@ -40,24 +38,13 @@ def evaluate_predictions(
     #
 
     if not predictions:
+        print(f"[warning] no predictions: {predictions_path}")
 
-        print(
-            "[warning] no predictions:"
-            f" {predictions_path}"
-        )
+        return dict.fromkeys(METRIC_NAMES, 0.0)
 
-        return {
-            name: 0.0
-            for name in METRIC_NAMES
-        }
+    coco_gt = COCO(str(annotations_path))
 
-    coco_gt = COCO(
-        str(annotations_path)
-    )
-
-    coco_dt = coco_gt.loadRes(
-        str(predictions_path)
-    )
+    coco_dt = coco_gt.loadRes(str(predictions_path))
 
     evaluator = COCOeval(
         coco_gt,
@@ -74,6 +61,7 @@ def evaluate_predictions(
         for name, value in zip(
             METRIC_NAMES,
             evaluator.stats,
+            strict=False,
         )
     }
 
@@ -84,7 +72,6 @@ def save_metrics(
 ):
 
     with open(output_path, "w") as f:
-
         json.dump(
             metrics,
             f,
@@ -100,32 +87,18 @@ def evaluate_model_dir(
     Evaluate one benchmark directory.
     """
 
-    predictions_path = (
-        model_dir /
-        "predictions.json"
-    )
+    predictions_path = model_dir / "predictions.json"
 
-    error_path = (
-        model_dir /
-        "error.json"
-    )
+    error_path = model_dir / "error.json"
 
-    metrics_path = (
-        model_dir /
-        "metrics.json"
-    )
+    metrics_path = model_dir / "metrics.json"
 
     #
     # Failed benchmark
     #
 
     if error_path.exists():
-
-        print(
-            f"[skip] "
-            f"{model_dir.name}"
-            " (failed benchmark)"
-        )
+        print(f"[skip] {model_dir.name} (failed benchmark)")
 
         return False
 
@@ -134,25 +107,15 @@ def evaluate_model_dir(
     #
 
     if not predictions_path.exists():
-
-        print(
-            f"[skip] "
-            f"{model_dir.name}"
-            " (missing predictions)"
-        )
+        print(f"[skip] {model_dir.name} (missing predictions)")
 
         return False
 
-    print(
-        f"\n=== Evaluating: "
-        f"{model_dir.name} ==="
-    )
+    print(f"\n=== Evaluating: {model_dir.name} ===")
 
-    metrics = (
-        evaluate_predictions(
-            annotations_path,
-            predictions_path,
-        )
+    metrics = evaluate_predictions(
+        annotations_path,
+        predictions_path,
     )
 
     save_metrics(
@@ -162,19 +125,10 @@ def evaluate_model_dir(
 
     print()
 
-    print(
-        f"AP:   "
-        f"{metrics['AP']:.4f}"
-    )
+    print(f"AP:   {metrics['AP']:.4f}")
 
-    print(
-        f"AP50: "
-        f"{metrics['AP50']:.4f}"
-    )
+    print(f"AP50: {metrics['AP50']:.4f}")
 
-    print(
-        f"AP75: "
-        f"{metrics['AP75']:.4f}"
-    )
+    print(f"AP75: {metrics['AP75']:.4f}")
 
     return True

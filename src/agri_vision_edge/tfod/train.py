@@ -6,15 +6,13 @@ using vendored TensorFlow Models code.
 """
 
 from pathlib import Path
-from typing import Optional, Union
 
 from .common import (
     get_tf_models_research_dir,
     run_tfod_command,
 )
 
-
-PathLike = Union[str, Path]
+PathLike = str | Path
 
 
 def launch_training(
@@ -22,7 +20,7 @@ def launch_training(
     model_dir: PathLike,
     checkpoint_every_n: int = 1000,
     checkpoint_max_to_keep: int = 100,
-    log_file: Optional[PathLike] = None,
+    log_file: PathLike | None = None,
     background: bool = False,
 ):
     """

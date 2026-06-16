@@ -8,16 +8,14 @@ Provides:
 - generic subprocess execution helpers
 """
 
-from pathlib import Path
-from typing import Optional, Sequence, Union
-
 import os
 import subprocess
+from collections.abc import Sequence
+from pathlib import Path
 
 import agri_vision_edge
 
-
-PathLike = Union[str, Path]
+PathLike = str | Path
 
 
 def get_tf_models_research_dir() -> Path:
@@ -68,7 +66,7 @@ def build_tfod_env():
 
 def run_tfod_command(
     args: Sequence[str],
-    log_file: Optional[PathLike] = None,
+    log_file: PathLike | None = None,
     background: bool = False,
 ):
     """

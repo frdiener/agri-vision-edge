@@ -7,7 +7,7 @@ instead of manually extracting boxes from masks.
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 import numpy as np
 import tensorflow as tf
@@ -15,20 +15,16 @@ import tensorflow as tf
 from .categories import (
     build_class_names,
 )
-
-from .datasets import (
-    DatasetDefinition,
-)
-
 from .coco import (
     phenobench_bbox_to_xyxy,
 )
-
-from .preprocessing import (
-    resize_image_and_boxes,
-    normalize_boxes,
+from .datasets import (
+    DatasetDefinition,
 )
-
+from .preprocessing import (
+    normalize_boxes,
+    resize_image_and_boxes,
+)
 
 DEFAULT_TARGET_SIZE = 320
 

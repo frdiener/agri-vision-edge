@@ -11,15 +11,13 @@ Provides helpers for:
 """
 
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Union
 
 from .common import (
     get_tf_models_research_dir,
     run_tfod_command,
 )
 
-
-PathLike = Union[str, Path]
+PathLike = str | Path
 #
 # Single evaluation
 #
@@ -31,7 +29,7 @@ def launch_eval(
     model_dir: PathLike,
     eval_timeout: int = 1,
     wait_interval: int = 1,
-    log_file: Optional[PathLike] = None,
+    log_file: PathLike | None = None,
 ):
     """
     Launch TF-OD evaluation.
