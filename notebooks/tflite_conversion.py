@@ -59,6 +59,8 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
       {classes}
     - {quantization}
       {precision} {per_channel}
+    - {eval_split}
+      {regular_nms}
     """)
         .batch(
             dataset=mo.ui.dropdown(
@@ -103,6 +105,17 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
             per_channel=mo.ui.switch(
                 value=False,
                 label="Per Channel Quantization",
+            ),
+            eval_split=mo.ui.radio(
+                options={
+                    "Eval (val split)": "val",
+                    "Test": "test",
+                },
+                value="Eval (val split)",
+            ),
+            regular_nms=mo.ui.switch(
+                value=False,
+                label="Regular (per-class) NMS",
             ),
         )
         .form(bordered=False, submit_button_label="Convert & Evaluate")
@@ -346,8 +359,13 @@ def _(
             )
 
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
+    # max_detections=100 matches the pipeline's max_total_detections so the
+    # TFLite mAP tracks the checkpoint metric (COCO also scores up to 100/image).
     detection_module = SSDModule(
-        PIPELINE_CONFIG, detection_model, max_detections=60, use_regular_nms=False
+        PIPELINE_CONFIG,
+        detection_model,
+        max_detections=100,
+        use_regular_nms=config["regular_nms"],
     )
 
     # restore model wheights
@@ -616,6 +634,7 @@ def _(
     Path,
     TFLiteRuntime,
     benchmark_runtime,
+    config,
     dataset_dir,
     dataset_raw_dir,
     load_coco_images,
@@ -624,7 +643,8 @@ def _(
 ):
     assert written and MODEL_FILE_PATH.exists()
 
-    annotations_path = dataset_dir / "test_annotations.json"
+    # eval_split: "val" (the split used for the checkpoint metric) or "test".
+    annotations_path = dataset_dir / f"{config['eval_split']}_annotations.json"
     image_records = load_coco_images(
         dataset_raw_dir / "val/images/",
         annotations_path,
