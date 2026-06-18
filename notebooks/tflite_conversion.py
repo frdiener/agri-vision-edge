@@ -244,12 +244,24 @@ def dataset___conversion_helpers(
     )
 
     QUANT = config["quantization"]
-    MODEL_FILE_PATH = TFLITE_MODELS_DIR / (
-        f"{config['model_root'].name}_"
+
+    _model_stem = (
+        "ssd-mn2"
+        + (
+            "-fpnlite_"
+            if "fpn" in PIPELINE_CONFIG.model.ssd.feature_extractor.type
+            else "_"
+        )
         + f"{'sc' if config['num_classes'] == 1 else 'mc'}_"
         + f"{config['dataset']}{'-tiled' if 'tiled' in config['original_dataset'] else ''}_"
-        + f"{config['resolution']}_"
-        + f"{config['precision']}_"
+        + f"{config['resolution']}"
+    )
+
+    assert _model_stem == f"{config['model_root'].name}"
+
+    MODEL_FILE_PATH = TFLITE_MODELS_DIR / (
+        _model_stem
+        + f"_{config['precision']}_"
         + f"{config['quantization']}"
         + f"{'_per-channel' if config['per_channel'] else ''}"
         + f"{'_regnms' if config['regular_nms'] else '_fastnms'}"
