@@ -59,8 +59,9 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
       {classes}
     - {quantization}
       {precision} {per_channel}
-    - {eval_split}
       {regular_nms}
+    - {eval_split}
+
     """)
         .batch(
             dataset=mo.ui.dropdown(
@@ -112,6 +113,7 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
                     "Test": "test",
                 },
                 value="Eval (val split)",
+                label="Eval on:",
             ),
             regular_nms=mo.ui.switch(
                 value=False,
@@ -143,12 +145,13 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
             summary,
         ]
     )
-    return DATASETS_DIR, TFLITE_MODELS_DIR, config_form, fp32_map
+    return DATASETS_DIR, TFLITE_MODELS_DIR, config_form
 
 
 @app.cell(hide_code=True)
 def imports():
     import os
+    import socket
     import json
     from pathlib import Path
     import numpy as np
@@ -203,6 +206,7 @@ def imports():
         quantize_detection_head,
         representative_dataset,
         save_benchmark_artifacts,
+        socket,
         tf,
     )
 
@@ -248,6 +252,7 @@ def dataset___conversion_helpers(
         + f"{config['precision']}_"
         + f"{config['quantization']}"
         + f"{'_per-channel' if config['per_channel'] else ''}"
+        + f"{'_regnms' if config['regular_nms'] else '_fastnms'}"
         + ".tflite"
     )
 
@@ -478,64 +483,26 @@ def tflite_conversion(
 
 
 @app.cell(hide_code=True)
-def _(MODEL_FILE_PATH, config, dataset_dir, written):
-    # Write valid TFLite ObjectDetector metadata for the converted model.
-    #
-    # object_detector.MetadataWriter reads the input tensor type (int8 vs
-    # float32) and the SSD output ordering straight from the model buffer, so the
-    # same call produces correct metadata for every precision/quant combination
-    # (fp32, ptq, qat0-qat3) and every sc/mc variant. The exported graph expects
-    # normalized [-1, 1] input (normalized = (px - 127.5) / 127.5 for px in
-    # [0, 255]); metadata normalization is always expressed in float terms, and
-    # for the int8 model the converter's own quant params carry the float->int8
-    # step, so mean/std are identical for both precisions.
-    import re
-
-    from tflite_support.metadata_writers import object_detector, writer_utils
-    from tflite_support import metadata as _metadata
-
-    assert written and MODEL_FILE_PATH.exists()
-
-    # Class names in label-map id order (id 1 -> line 0). The detection head emits
-    # 0-based class indices, so labels.txt must follow that order: ["crop",
-    # "weed"] for mc, ["weed"] for sc.
-    _label_map = (dataset_dir / "label_map.pbtxt").read_text()
-    _items = re.findall(r'id:\s*(\d+)\s+name:\s*"([^"]+)"', _label_map)
-    labels = [name for _id, name in sorted(_items, key=lambda kv: int(kv[0]))]
-    assert len(labels) == config["num_classes"], (labels, config["num_classes"])
-
-    label_file_path = MODEL_FILE_PATH.with_name(f"{MODEL_FILE_PATH.stem}_labels.txt")
-    label_file_path.write_text("\n".join(labels) + "\n")
-
-    writer = object_detector.MetadataWriter.create_for_inference(
-        writer_utils.load_file(str(MODEL_FILE_PATH)),
-        input_norm_mean=[127.5],
-        input_norm_std=[127.5],
-        label_file_paths=[str(label_file_path)],
-    )
-    writer_utils.save_file(writer.populate(), str(MODEL_FILE_PATH))
-
-    metadata_json_path = MODEL_FILE_PATH.with_name(
-        f"{MODEL_FILE_PATH.stem}.metadata.json"
-    )
-    metadata_json_path.write_text(
-        _metadata.MetadataDisplayer.with_model_file(
-            str(MODEL_FILE_PATH)
-        ).get_metadata_json()
-    )
-
-    print(f"metadata written: {MODEL_FILE_PATH.name}  (labels={labels})")
-    print(f"metadata json:    {metadata_json_path.name}")
-    return
-
-
-@app.cell(hide_code=True)
 def _(MODEL_FILE_PATH, tflite_model):
     MODEL_FILE_PATH.write_bytes(tflite_model)
     if MODEL_FILE_PATH.exists():
         print(f"tflite model written to {MODEL_FILE_PATH}")
         written = True
     return (written,)
+
+
+@app.cell(hide_code=True)
+def _(MODEL_FILE_PATH, config, dataset_dir, written):
+    from agri_vision_edge.conversion.metadata import write_object_detector_metadata
+
+    assert written, "The TFLite model must be exported before writing metadata."
+
+    write_object_detector_metadata(
+        model_path=MODEL_FILE_PATH,
+        label_map_path=dataset_dir / "label_map.pbtxt",
+        num_classes=config["num_classes"],
+    )
+    return
 
 
 @app.cell(hide_code=True)
@@ -639,6 +606,7 @@ def _(
     dataset_raw_dir,
     load_coco_images,
     save_benchmark_artifacts,
+    socket,
     written,
 ):
     assert written and MODEL_FILE_PATH.exists()
@@ -650,7 +618,9 @@ def _(
         annotations_path,
     )
 
-    output_dir = Path("./benchmark_results/") / MODEL_FILE_PATH.stem
+    output_dir = Path("./benchmark_results/") / f"{socket.gethostname()}" / (
+        MODEL_FILE_PATH.stem + f"_{config['eval_split']}"
+    )
 
     print(f"\n=== Benchmarking: {MODEL_FILE_PATH.name} ===")
 
@@ -680,9 +650,14 @@ def _(
     return annotations_path, output_dir, result
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(result):
-    max(pred["score"] for pred in result.predictions)
+    _max_score = max(pred["score"] for pred in result.predictions)
+    if _max_score == 0.5:
+        raise RuntimeError(
+            "Max score is 0.5, indicating that the model likely failed to calibrate correctly."
+        )
+    f"{_max_score=}"
     return
 
 
