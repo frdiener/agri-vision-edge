@@ -31,16 +31,14 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
 
     _original_dataset = (
         Path(
-            str(
-                _finetune_config.train_input_reader.tf_record_input_reader.input_path
-            )
+            str(_finetune_config.train_input_reader.tf_record_input_reader.input_path)
         ).parent.name
         if _finetune_config
         else "not found"
     )
 
     fp32_map = {}
-    for schema in ["ptq", "qat0", "qat1", "qat2"]:
+    for schema in ["ptq", "qat0", "qat1", "qat2", "qat3"]:
         try:
             fp32_map[schema] = json.loads(
                 (model_root.value / schema / "best_metric.json").read_text()
@@ -89,6 +87,7 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
                     "Finetuned with full QAT": "qat0",
                     "Finetuned with QAT (Quantized Weights only)": "qat1",
                     "Finetuned with QAT (Prefolded Batchnorms)": "qat2",
+                    "Finetuned with full QAT (Backbone + Head)": "qat3",
                 },
                 value="Finetuned",
                 label="Checkpoint",
@@ -118,10 +117,11 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
     | Tiled | {"tile" in _original_dataset} |
     | Labels | {("Single Class" if _finetune_config.model.ssd.num_classes == 1 else "Multi Class") if _finetune_config else "not found"} |
     | Resolution | {(_finetune_config.model.ssd.image_resizer.fixed_shape_resizer.width) if _finetune_config else "not found"} |
-    | FP32 PTQ mAP | {fp32_map['ptq']:.4f} |
-    | FP32 QAT0 mAP | {fp32_map['qat0']:.4f} |
-    | FP32 QAT1 mAP | {fp32_map['qat1']:.4f} |
-    | FP32 QAT2 mAP | {fp32_map['qat2']:.4f} |
+    | FP32 PTQ mAP | {fp32_map["ptq"]:.4f} |
+    | FP32 QAT0 mAP | {fp32_map["qat0"]:.4f} |
+    | FP32 QAT1 mAP | {fp32_map["qat1"]:.4f} |
+    | FP32 QAT2 mAP | {fp32_map["qat2"]:.4f} |
+    | FP32 QAT3 mAP | {fp32_map["qat3"]:.4f} |
     """)
 
     mo.hstack(
@@ -162,8 +162,8 @@ def imports():
     from agri_vision_edge.tfod.qat import (
         ensure_model_is_built_for_qat,
         quantize_backbone,
-        # quantize_backbone_full,
-    ) 
+        quantize_detection_head,
+    )
     from agri_vision_edge.data.coco import phenobench_bbox_to_xyxy
     from agri_vision_edge.data.preprocessing import resize_image_and_boxes
     from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
@@ -188,6 +188,7 @@ def imports():
         np,
         os,
         quantize_backbone,
+        quantize_detection_head,
         representative_dataset,
         save_benchmark_artifacts,
         tf,
@@ -215,15 +216,16 @@ def dataset___conversion_helpers(
     )
     config = config_form.value
 
-    MODEL_ROOT = config['model_root'] = model_root.value
+    MODEL_ROOT = config["model_root"] = model_root.value
     CHECKPOINT = MODEL_ROOT / config["quantization"] / "checkpoint"
-    PIPELINE_CONFIG = _load_pipeline_config(
-        CHECKPOINT.parent / "pipeline.config"
+    PIPELINE_CONFIG = _load_pipeline_config(CHECKPOINT.parent / "pipeline.config")
+    config["original_dataset"] = Path(
+        str(PIPELINE_CONFIG.train_input_reader.tf_record_input_reader.input_path)
+    ).parent.name
+    config["num_classes"] = PIPELINE_CONFIG.model.ssd.num_classes
+    config["resolution"] = (
+        PIPELINE_CONFIG.model.ssd.image_resizer.fixed_shape_resizer.width
     )
-    config['original_dataset'] = Path(str(PIPELINE_CONFIG.train_input_reader.tf_record_input_reader.input_path)).parent.name
-    config['num_classes'] = PIPELINE_CONFIG.model.ssd.num_classes
-    config['resolution'] = PIPELINE_CONFIG.model.ssd.image_resizer.fixed_shape_resizer.width
-
 
     QUANT = config["quantization"]
     MODEL_FILE_PATH = TFLITE_MODELS_DIR / (
@@ -237,7 +239,10 @@ def dataset___conversion_helpers(
         + ".tflite"
     )
 
-    dataset_dir = DATASETS_DIR / f"{config['dataset']}_{config['classes']}{'_tiled' if config['tiled'] else ''}"
+    dataset_dir = (
+        DATASETS_DIR
+        / f"{config['dataset']}_{config['classes']}{'_tiled' if config['tiled'] else ''}"
+    )
     dataset_raw_dir = (
         DATASETS_DIR
         / f"{config['dataset']}_raw_{'tiled' if config['tiled'] else 'full'}"
@@ -245,8 +250,6 @@ def dataset___conversion_helpers(
 
     if not dataset_dir.exists():
         raise RuntimeError("Configured dataset not found.")
-
-
 
     IMAGE_SIZE = config["resolution"]
 
@@ -305,34 +308,48 @@ def _(
     fold,
     model_builder,
     quantize_backbone,
-    quantize_backbone_full,
+    quantize_detection_head,
     tf,
 ):
     detection_model = model_builder.build(PIPELINE_CONFIG.model, is_training=False)
 
     ensure_model_is_built_for_qat(detection_model, PIPELINE_CONFIG)
 
+    # Rebuild the exact QAT graph the checkpoint was trained with so the weights
+    # restore cleanly. Mirrors tfod_trainer.setup: fold BatchNorms into the convs
+    # (fold_bn defaults on whenever QAT is enabled), then quantize_backbone with
+    # the per-dir scheme, then optionally quantize_detection_head for qat3.
+    # Scheme map is user-specified: qat0=annotate_all, qat1=weights, qat2=full;
+    # qat3 = full on backbone + head.
+    qat_backbone = None
+
+    QAT_SCHEMES = {
+        "qat0": "annotate_all",  # TFMOT default 8-bit (legacy / comparison)
+        "qat1": "weights",  # weight-only int8
+        "qat2": "full",  # full int8, backbone
+        "qat3": "full",  # full int8, backbone + head
+    }
+
     if config["quantization"] != "ptq":
-        backbone = detection_model.feature_extractor.classification_backbone
+        scheme = QAT_SCHEMES[config["quantization"]]
 
-        if config["quantization"] == "qat0":  # full quantization
-            qat_backbone = quantize_backbone_full(backbone)
-
-        elif config["quantization"] == "qat1":  # weights only quantization
-            qat_backbone = quantize_backbone(backbone)
-
-        elif config["quantization"] == "qat2":  # pre-folded quantization
-            folded_backbone = fold(backbone)
-            qat_backbone = quantize_backbone(
-                folded_backbone,
-                scheme="mixed"
-            )
-
+        folded_backbone = fold(
+            detection_model.feature_extractor.classification_backbone
+        )
+        qat_backbone = quantize_backbone(folded_backbone, scheme=scheme)
         detection_model.feature_extractor.classification_backbone = qat_backbone
 
+        if config["quantization"] == "qat3":
+            # Quantize the SSD head (feature maps + box predictor) in place;
+            # must run after the backbone is folded + quantized.
+            quantize_detection_head(
+                detection_model, config["resolution"], scheme="full"
+            )
 
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
-    detection_module = SSDModule(PIPELINE_CONFIG, detection_model, max_detections=60, use_regular_nms=False)
+    detection_module = SSDModule(
+        PIPELINE_CONFIG, detection_model, max_detections=60, use_regular_nms=False
+    )
 
     # restore model wheights
     ckpt = tf.train.Checkpoint(model=detection_model)
@@ -340,14 +357,11 @@ def _(
         tf.train.latest_checkpoint(CHECKPOINT)
     ).expect_partial().assert_existing_objects_matched()
 
-    concrete_function = (
-        detection_module.inference_fn
-        .get_concrete_function(
-            tf.TensorSpec(
-                shape=detection_module.input_shape(),
-                dtype=tf.float32,
-                name="input",
-            )
+    concrete_function = detection_module.inference_fn.get_concrete_function(
+        tf.TensorSpec(
+            shape=detection_module.input_shape(),
+            dtype=tf.float32,
+            name="input",
         )
     )
 
@@ -365,9 +379,7 @@ def _(qat_backbone):
     for layer in qat_backbone.layers:
         print(layer.name)
         try:
-            print(
-                f"===>{type(layer.quantize_config).__name__}"
-            )
+            print(f"===>{type(layer.quantize_config).__name__}")
         except Exception:
             pass
 
@@ -379,7 +391,6 @@ def _(qat_backbone):
         if layer.name == "quant_Conv1_folded":
             print(type(layer.layer))
             print(layer.layer.activation)
-
 
     for layer in qat_backbone.layers:
         if layer.name == "quant_block_1_project_folded":
@@ -404,282 +415,100 @@ def tflite_conversion(
         trackable_obj=detection_module,
     )
 
-    if config['precision'] == 'int8':
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS,
-        tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
-    ]
-
-    if config['precision'] == 'int8':
-        converter.inference_input_type = tf.int8
-    elif config['precision'] == 'fp32':
-        converter.inference_input_type = tf.float32
     converter.inference_output_type = tf.float32
 
-    # SSDModule.inference_fn calls model.predict() directly, WITHOUT the SSD
-    # preprocessing step, so the converted graph expects already-normalized
-    # [-1, 1] input. representative_dataset yields raw [0, 255] images, so we
-    # must normalize here. Feeding [0, 255] saturates the backbone during
-    # calibration and mis-calibrates the (non-QAT) class head: the class-logit
-    # tensor's max gets pinned to 0, capping every detection score at
-    # sigmoid(0) = 0.5. (Independent of the QAT scheme.)
-    def _normalized_rep_dataset():
-        for sample in representative_dataset(
-            dataset=train_dataset,
-            indices=rep_ds_indices,
-            num_samples=200,
-            size=IMAGE_SIZE,
-        ):
-            yield [(2.0 / 255.0) * sample[0] - 1.0]
+    if config["precision"] == "int8":
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
-    converter.representative_dataset = _normalized_rep_dataset
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+            tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+        ]
 
-    converter._experimental_new_quantizer = False
-    converter._experimental_disable_per_channel = not config['per_channel']
+        converter.inference_input_type = tf.int8
+
+        # SSDModule.inference_fn calls model.predict() directly, WITHOUT the SSD
+        # preprocessing step, so the converted graph expects already-normalized
+        # [-1, 1] input. representative_dataset yields raw [0, 255] images, so we
+        # must normalize here. Feeding [0, 255] saturates the backbone during
+        # calibration and mis-calibrates the (non-QAT) class head: the class-logit
+        # tensor's max gets pinned to 0, capping every detection score at
+        # sigmoid(0) = 0.5. (Independent of the QAT scheme.)
+        def _normalized_rep_dataset():
+            for sample in representative_dataset(
+                dataset=train_dataset,
+                indices=rep_ds_indices,
+                num_samples=200,
+                size=IMAGE_SIZE,
+            ):
+                yield [(2.0 / 255.0) * sample[0] - 1.0]
+
+        converter.representative_dataset = _normalized_rep_dataset
+
+        converter._experimental_new_quantizer = False
+        converter._experimental_disable_per_channel = not config["per_channel"]
+
+    elif config["precision"] == "fp32":
+        # Plain float conversion: the finetuned ptq/ weights are kept in
+        # float32 and no quantization happens. No optimizations, no
+        # representative dataset, and only float builtin ops — the graph
+        # already expects normalized [-1, 1] float input.
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        converter.inference_input_type = tf.float32
 
     tflite_model = converter.convert()
     return (tflite_model,)
 
 
 @app.cell(hide_code=True)
-def _(
-    FLAGS,
-    MODEL_FILE_PATH,
-    PIPELINE_CONFIG,
-    conf,
-    config,
-    flags,
-    os,
-    tflite_model,
-):
-    tflite_model
+def _(MODEL_FILE_PATH, config, dataset_dir, written):
+    # Write valid TFLite ObjectDetector metadata for the converted model.
+    #
+    # object_detector.MetadataWriter reads the input tensor type (int8 vs
+    # float32) and the SSD output ordering straight from the model buffer, so the
+    # same call produces correct metadata for every precision/quant combination
+    # (fp32, ptq, qat0-qat3) and every sc/mc variant. The exported graph expects
+    # normalized [-1, 1] input (normalized = (px - 127.5) / 127.5 for px in
+    # [0, 255]); metadata normalization is always expressed in float terms, and
+    # for the int8 model the converter's own quant params carry the float->int8
+    # step, so mean/std are identical for both precisions.
+    import re
 
-    import flatbuffers
-
-    from tflite_support import metadata_schema_py_generated as _metadata_fb
+    from tflite_support.metadata_writers import object_detector, writer_utils
     from tflite_support import metadata as _metadata
 
+    assert written and MODEL_FILE_PATH.exists()
 
-    def define_flags():
-        flags.DEFINE_string(
-            "model_file", None, "Path and file name to the TFLite model file."
-        )
-        flags.DEFINE_string("label_file", None, "Path to the label file.")
-        flags.DEFINE_string(
-            "export_directory",
-            None,
-            "Path to save the TFLite model files with metadata.",
-        )
-        flags.mark_flag_as_required("model_file")
-        flags.mark_flag_as_required("label_file")
-        flags.mark_flag_as_required("export_directory")
+    # Class names in label-map id order (id 1 -> line 0). The detection head emits
+    # 0-based class indices, so labels.txt must follow that order: ["crop",
+    # "weed"] for mc, ["weed"] for sc.
+    _label_map = (dataset_dir / "label_map.pbtxt").read_text()
+    _items = re.findall(r'id:\s*(\d+)\s+name:\s*"([^"]+)"', _label_map)
+    labels = [name for _id, name in sorted(_items, key=lambda kv: int(kv[0]))]
+    assert len(labels) == config["num_classes"], (labels, config["num_classes"])
 
+    label_file_path = MODEL_FILE_PATH.with_name(f"{MODEL_FILE_PATH.stem}_labels.txt")
+    label_file_path.write_text("\n".join(labels) + "\n")
 
-    class ModelSpecificInfo(object):
-        """Holds information that is specificly tied to an image classifier."""
+    writer = object_detector.MetadataWriter.create_for_inference(
+        writer_utils.load_file(str(MODEL_FILE_PATH)),
+        input_norm_mean=[127.5],
+        input_norm_std=[127.5],
+        label_file_paths=[str(label_file_path)],
+    )
+    writer_utils.save_file(writer.populate(), str(MODEL_FILE_PATH))
 
-        def __init__(
-            self,
-            name,
-            version,
-            image_width,
-            image_height,
-            image_min,
-            image_max,
-            mean,
-            std,
-            num_classes,
-            author,
-        ):
-            self.name = name
-            self.version = version
-            self.image_width = image_width
-            self.image_height = image_height
-            self.image_min = image_min
-            self.image_max = image_max
-            self.mean = mean
-            self.std = std
-            self.num_classes = num_classes
-            self.author = author
+    metadata_json_path = MODEL_FILE_PATH.with_name(
+        f"{MODEL_FILE_PATH.stem}.metadata.json"
+    )
+    metadata_json_path.write_text(
+        _metadata.MetadataDisplayer.with_model_file(
+            str(MODEL_FILE_PATH)
+        ).get_metadata_json()
+    )
 
-
-    _MODEL_INFO = {
-        "mobilenet_v1_0.75_160_quantized.tflite": ModelSpecificInfo(
-            name="MobileNetV1 image classifier",
-            version="v1",
-            image_width=160,
-            image_height=160,
-            image_min=0,
-            image_max=255,
-            mean=[127.5],
-            std=[127.5],
-            num_classes=1001,
-            author="TensorFlow",
-        ),
-        MODEL_FILE_PATH.name: ModelSpecificInfo(
-            name="SSD MobileNetV2 Object Detector",
-            version="v1",
-            image_height=config['resolution'],
-            image_width=config['resolution'],
-            image_min=-128,
-            image_max=127,
-            mean=[0],
-            std=[0],
-            num_classes=PIPELINE_CONFIG.model.ssd.num_classes,
-            author="fdi",
-        )
-    }
-
-    class MetadataPopulatorForImageClassifier(object):
-        """Populates the metadata for an image classifier."""
-
-        def __init__(self, model_file, model_info, label_file_path):
-            self.model_file = model_file
-            self.model_info = model_info
-            self.label_file_path = label_file_path
-            self.metadata_buf = None
-
-        def populate(self):
-            """Creates metadata and then populates it for an image classifier."""
-            self._create_metadata()
-            self._populate_metadata()
-
-        def _create_metadata(self):
-            """Creates the metadata for an image classifier."""
-
-            # Creates model info.
-            model_meta = _metadata_fb.ModelMetadataT()
-            model_meta.name = self.model_info.name
-            model_meta.description = (
-                "Identify the most prominent object in the "
-                "image from a set of %d categories." % self.model_info.num_classes
-            )
-            model_meta.version = self.model_info.version
-            model_meta.author = self.model_info.author
-            model_meta.license = (
-                "Apache License. Version 2.0 "
-                "http://www.apache.org/licenses/LICENSE-2.0."
-            )
-
-            # Creates input info.
-            input_meta = _metadata_fb.TensorMetadataT()
-            input_meta.name = "image"
-            input_meta.description = (
-                "Input image to be classified. The expected image is {0} x {1}, with "
-                "three channels (red, blue, and green) per pixel. Each value in the "
-                "tensor is a single byte between {2} and {3}.".format(
-                    self.model_info.image_width,
-                    self.model_info.image_height,
-                    self.model_info.image_min,
-                    self.model_info.image_max,
-                )
-            )
-            input_meta.content = _metadata_fb.ContentT()
-            input_meta.content.contentProperties = _metadata_fb.ImagePropertiesT()
-            input_meta.content.contentProperties.colorSpace = (
-                _metadata_fb.ColorSpaceType.RGB
-            )
-            input_meta.content.contentPropertiesType = (
-                _metadata_fb.ContentProperties.ImageProperties
-            )
-            input_normalization = _metadata_fb.ProcessUnitT()
-            input_normalization.optionsType = (
-                _metadata_fb.ProcessUnitOptions.NormalizationOptions
-            )
-            input_normalization.options = _metadata_fb.NormalizationOptionsT()
-            input_normalization.options.mean = self.model_info.mean
-            input_normalization.options.std = self.model_info.std
-            input_meta.processUnits = [input_normalization]
-            input_stats = _metadata_fb.StatsT()
-            input_stats.max = [self.model_info.image_max]
-            input_stats.min = [self.model_info.image_min]
-            input_meta.stats = input_stats
-
-            # Creates output info.
-            output_meta = _metadata_fb.TensorMetadataT()
-            output_meta.name = "probability"
-            output_meta.description = (
-                "Probabilities of the %d labels respectively."
-                % self.model_info.num_classes
-            )
-            output_meta.content = _metadata_fb.ContentT()
-            output_meta.content.content_properties = (
-                _metadata_fb.FeaturePropertiesT()
-            )
-            output_meta.content.contentPropertiesType = (
-                _metadata_fb.ContentProperties.FeatureProperties
-            )
-            output_stats = _metadata_fb.StatsT()
-            output_stats.max = [1.0]
-            output_stats.min = [0.0]
-            output_meta.stats = output_stats
-            label_file = _metadata_fb.AssociatedFileT()
-            label_file.name = os.path.basename(self.label_file_path)
-            label_file.description = (
-                "Labels for objects that the model can recognize."
-            )
-            label_file.type = _metadata_fb.AssociatedFileType.TENSOR_AXIS_LABELS
-            output_meta.associatedFiles = [label_file]
-
-            # Creates subgraph info.
-            subgraph = _metadata_fb.SubGraphMetadataT()
-            subgraph.inputTensorMetadata = [input_meta]
-            subgraph.outputTensorMetadata = [output_meta]
-            model_meta.subgraphMetadata = [subgraph]
-
-            b = flatbuffers.Builder(0)
-            b.Finish(
-                model_meta.Pack(b),
-                _metadata.MetadataPopulator.METADATA_FILE_IDENTIFIER,
-            )
-            self.metadata_buf = b.Output()
-
-        def _populate_metadata(self):
-            """Populates metadata and label file to the model file."""
-            populator = _metadata.MetadataPopulator.with_model_file(
-                self.model_file
-            )
-            populator.load_metadata_buffer(self.metadata_buf)
-            populator.load_associated_files([self.label_file_path])
-            populator.populate()
-
-
-    model_basename = MODEL_FILE_PATH.stem
-    if model_basename not in _MODEL_INFO:
-        print(
-            "The model info for, {0}, is not defined yet.".format(model_basename)
-        )
-        # raise ValueError(
-        #     "The model info for, {0}, is not defined yet.".format(model_basename))
-
-    else:
-        # Generate the metadata objects and put them in the model file
-        populator = MetadataPopulatorForImageClassifier(
-            MODEL_FILE_PATH, _MODEL_INFO.get(model_basename), FLAGS.label_file
-        )
-        populator.populate()
-
-        # Validate the output model file by reading the metadata and produce
-        # a json file with the metadata under the export path
-        displayer = _metadata.MetadataDisplayer.with_model_file(
-            MODEL_FILE_PATH
-        )
-        export_json_file = os.path.join(
-            MODEL_FILE_PATH.parent(),
-            os.path.splitext(model_basename)[0] + ".json",
-        )
-        json_file = displayer.get_metadata_json()
-        with open(export_json_file, "w") as export_json_file:
-            export_json_file.write(json_file)
-
-        print("Finished populating metadata and associated file to the model:")
-        print(conf["tflite_path"])
-        print("The metadata json file has been saved to:")
-        print(export_json_file)
-        print("The associated file that has been been packed to the model is:")
-        print(displayer.get_packed_associated_file_list())
+    print(f"metadata written: {MODEL_FILE_PATH.name}  (labels={labels})")
+    print(f"metadata json:    {metadata_json_path.name}")
     return
 
 
@@ -696,13 +525,9 @@ def _(MODEL_FILE_PATH, tflite_model):
 def _(tf, tflite_model):
     interpreter = tf.lite.Interpreter(model_content=tflite_model)
 
-    input_details = (
-        interpreter.get_input_details()
-    )
+    input_details = interpreter.get_input_details()
 
-    output_details = (
-        interpreter.get_output_details()
-    )
+    output_details = interpreter.get_output_details()
 
     # interpreter.resize_tensor_input(
     #     input_details[0]["index"],
@@ -743,7 +568,7 @@ def _(interpreter):
 @app.cell
 def _(interpreter, np):
     for tensor in interpreter.get_tensor_details():
-        if not 'relu6' in tensor['name'].lower():
+        if not "relu6" in tensor["name"].lower():
             continue
         qparams = tensor["quantization_parameters"]
 
@@ -808,10 +633,7 @@ def _(
 
     output_dir = Path("./benchmark_results/") / MODEL_FILE_PATH.stem
 
-    print(
-        f"\n=== Benchmarking: "
-        f"{MODEL_FILE_PATH.name} ==="
-    )
+    print(f"\n=== Benchmarking: {MODEL_FILE_PATH.name} ===")
 
     runtime = TFLiteRuntime(
         model_path=MODEL_FILE_PATH,
@@ -831,30 +653,17 @@ def _(
         delegate=None,
     )
 
-    mean_latency = (
-        sum(result.latencies_ms)
-        / len(result.latencies_ms)
-    )
+    mean_latency = sum(result.latencies_ms) / len(result.latencies_ms)
 
-    print(
-        f"mean latency: "
-        f"{mean_latency:.2f} ms"
-    )
+    print(f"mean latency: {mean_latency:.2f} ms")
 
-    print(
-        f"exported "
-        f"{len(result.predictions)} "
-        f"prediction(s)"
-    )
+    print(f"exported {len(result.predictions)} prediction(s)")
     return annotations_path, output_dir, result
 
 
 @app.cell
 def _(result):
-    max(
-        pred["score"]
-        for pred in result.predictions
-    )
+    max(pred["score"] for pred in result.predictions)
     return
 
 
@@ -868,16 +677,11 @@ def _(annotations_path, config, fp32_map, output_dir):
     predictions_path = output_dir / "predictions.json"
     metrics_path = output_dir / "metrics.json"
 
-    print(
-        f"\n=== Evaluating: "
-        f"{output_dir.name} ==="
-    )
+    print(f"\n=== Evaluating: {output_dir.name} ===")
 
-    metrics = (
-        evaluate_predictions(
-            annotations_path,
-            predictions_path,
-        )
+    metrics = evaluate_predictions(
+        annotations_path,
+        predictions_path,
     )
 
     save_metrics(
@@ -887,25 +691,13 @@ def _(annotations_path, config, fp32_map, output_dir):
 
     print()
 
-    print(
-        f"FP32 mAP:  "
-        f"{fp32_map[config['quantization']]:.4f}"
-    )
+    print(f"FP32 mAP:  {fp32_map[config['quantization']]:.4f}")
 
-    print(
-        f"mAP:  "
-        f"{metrics['AP']:.4f}"
-    )
+    print(f"mAP:  {metrics['AP']:.4f}")
 
-    print(
-        f"AP50: "
-        f"{metrics['AP50']:.4f}"
-    )
+    print(f"AP50: {metrics['AP50']:.4f}")
 
-    print(
-        f"AP75: "
-        f"{metrics['AP75']:.4f}"
-        )
+    print(f"AP75: {metrics['AP75']:.4f}")
     return
 
 
