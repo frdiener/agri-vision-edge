@@ -93,6 +93,8 @@ class TFLiteRuntime(BaseRuntime):
 
         self._input_size = int(self.input_details[0]["shape"][1])
 
+        self._norm_mean, self._norm_std = self._load_input_normalization()
+
     @property
     def input_size(self) -> int:
 
@@ -117,6 +119,68 @@ class TFLiteRuntime(BaseRuntime):
         print(f"[runtime] loaded metadata: {metadata_path.name}")
 
         return metadata
+
+    def _load_input_normalization(self):
+        """
+        Resolve the input normalization ``(mean, std)`` applied as
+        ``(pixels - mean) / std`` before inference.
+
+        Priority:
+
+        1. ``preprocessing`` block in the ``.runtime.json`` sidecar
+           (dependency-free, works on-device).
+        2. ``NormalizationOptions`` embedded in the TFLite metadata, read via
+           ``tflite_support`` when that package is importable (the prep/eval env).
+        3. Default ``mean=std=127.5`` — the SSD MobileNetV2 ``[0, 255] -> [-1, 1]``
+           mapping every model in this project uses.
+
+        Returned as float32 arrays so they broadcast over an ``HxWx3`` image.
+        """
+
+        mean, std = [127.5], [127.5]
+        source = "default"
+
+        preprocessing = self.metadata.get("preprocessing") or {}
+
+        if "mean" in preprocessing and "std" in preprocessing:
+            mean = preprocessing["mean"]
+            std = preprocessing["std"]
+            source = "sidecar"
+
+        else:
+            try:
+                from tflite_support import metadata as _metadata
+
+                displayer = _metadata.MetadataDisplayer.with_model_file(
+                    str(self.model_path)
+                )
+
+                meta = json.loads(displayer.get_metadata_json())
+
+                units = meta["subgraph_metadata"][0]["input_tensor_metadata"][0][
+                    "process_units"
+                ]
+
+                for unit in units:
+                    if unit.get("options_type") == "NormalizationOptions":
+                        options = unit["options"]
+                        mean = options["mean"]
+                        std = options["std"]
+                        source = "embedded metadata"
+                        break
+
+            except Exception as exc:
+                print(
+                    f"[runtime] no embedded normalization metadata "
+                    f"({type(exc).__name__}); using default"
+                )
+
+        print(f"[runtime] input normalization ({source}): mean={mean} std={std}")
+
+        return (
+            np.array(mean, dtype=np.float32),
+            np.array(std, dtype=np.float32),
+        )
 
     #
     # Delegates
@@ -194,9 +258,17 @@ class TFLiteRuntime(BaseRuntime):
         #
         # FP32
         #
+        # A float input has no quantization params to encode the expected domain,
+        # so the normalization must be applied explicitly. The graph expects
+        # already-normalized input (e.g. [-1, 1] = (px - 127.5) / 127.5); feeding
+        # raw [0, 255] silently wrecks detections. mean/std come from the model
+        # metadata (see _load_input_normalization).
+        #
 
         else:
             image = image.astype(np.float32)
+
+            image = (image - self._norm_mean) / self._norm_std
 
         image = np.expand_dims(
             image,
