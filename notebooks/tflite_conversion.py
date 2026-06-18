@@ -186,7 +186,6 @@ def imports():
         load_coco_images,
         model_builder,
         np,
-        os,
         quantize_backbone,
         quantize_detection_head,
         representative_dataset,
@@ -195,7 +194,7 @@ def imports():
     )
 
 
-@app.cell
+@app.cell(hide_code=True)
 def dataset___conversion_helpers(
     DATASETS_DIR,
     FilterConfig,
@@ -668,37 +667,74 @@ def _(result):
 
 
 @app.cell(hide_code=True)
-def _(annotations_path, config, fp32_map, output_dir):
+def _(annotations_path, config, json, output_dir):
+    import contextlib
+    import io
+
     from agri_vision_edge.evaluation.coco import (
+        METRIC_NAMES,
         evaluate_predictions,
         print_per_class,
         save_metrics,
     )
+
+    # Maps our short COCO metric names to the keys used in metrics_history.json.
+    _TF_HISTORY_KEY = {
+        "AP": "DetectionBoxes_Precision/mAP",
+        "AP50": "DetectionBoxes_Precision/mAP@.50IOU",
+        "AP75": "DetectionBoxes_Precision/mAP@.75IOU",
+        "APS": "DetectionBoxes_Precision/mAP (small)",
+        "APM": "DetectionBoxes_Precision/mAP (medium)",
+        "APL": "DetectionBoxes_Precision/mAP (large)",
+        "AR1": "DetectionBoxes_Recall/AR@1",
+        "AR10": "DetectionBoxes_Recall/AR@10",
+        "AR100": "DetectionBoxes_Recall/AR@100",
+        "ARS": "DetectionBoxes_Recall/AR@100 (small)",
+        "ARM": "DetectionBoxes_Recall/AR@100 (medium)",
+        "ARL": "DetectionBoxes_Recall/AR@100 (large)",
+    }
 
     predictions_path = output_dir / "predictions.json"
     metrics_path = output_dir / "metrics.json"
 
     print(f"\n=== Evaluating: {output_dir.name} ===")
 
-    metrics = evaluate_predictions(
-        annotations_path,
-        predictions_path,
-    )
+    # Swallow pycocotools' own index/summarize chatter; we print our own table.
+    with contextlib.redirect_stdout(io.StringIO()):
+        metrics = evaluate_predictions(
+            annotations_path,
+            predictions_path,
+        )
 
     save_metrics(
         metrics,
         metrics_path,
     )
 
+    # TF-side (pre-conversion) reference: the best eval row of the checkpoint
+    # being converted (best-mAP row of metrics_history.json, same checkpoint as
+    # best_metric.json). Missing -> NaN, rendered as x.xxxx.
+    tf_best = {}
+    try:
+        _history = json.loads(
+            (
+                config["model_root"] / config["quantization"] / "metrics_history.json"
+            ).read_text()
+        )
+        tf_best = max(_history, key=lambda r: r["DetectionBoxes_Precision/mAP"])
+    except Exception:
+        pass
+
+    def _fmt(v):
+        return f"{v:>8.4f}" if v == v else f"{'x.xxxx':>8}"  # nan != nan
+
     print()
 
-    print(f"FP32 mAP:  {fp32_map[config['quantization']]:.4f}")
+    print(f"{'':<6}{'tf':>8}    {'tflite':>8}")
 
-    print(f"mAP:  {metrics['AP']:.4f}")
-
-    print(f"AP50: {metrics['AP50']:.4f}")
-
-    print(f"AP75: {metrics['AP75']:.4f}")
+    for name in METRIC_NAMES:
+        tf_v = tf_best.get(_TF_HISTORY_KEY[name], float("nan"))
+        print(f"{name + ':':<6}{_fmt(tf_v)} => {_fmt(metrics[name])}")
 
     print_per_class(metrics)
     return
