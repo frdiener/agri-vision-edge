@@ -72,9 +72,22 @@ def _():
 
 
 @app.cell(hide_code=True)
+def _(mo, tiling):
+    # Drop PhenoBench's partial (border) plants? True matches the official
+    # PhenoBench bbox protocol (its evaluator filters partials) and the Kaggle
+    # tiled bundles. Default tracks tiling: on for tiled, off otherwise.
+    ignore_partial = mo.ui.checkbox(
+        value=tiling.value,
+        label="Ignore partial (border) plants",
+    )
+    return (ignore_partial,)
+
+
+@app.cell(hide_code=True)
 def _(
     bundle_type,
     dataset,
+    ignore_partial,
     label_mode,
     mo,
     resize,
@@ -86,30 +99,36 @@ def _(
     tiling,
 ):
     label_section = (
-        mo.vstack([
-            mo.md("### Label Configuration"),
-            label_mode,
-        ])
+        mo.vstack(
+            [
+                mo.md("### Label Configuration"),
+                label_mode,
+            ]
+        )
         if bundle_type.value == "Prepared Dataset"
         else mo.md("")
     )
 
     tiling_section = (
-        mo.vstack([
-            mo.md("### Tiling"),
-            tile_rows,
-            tile_cols,
-            tile_overlap,
-        ])
+        mo.vstack(
+            [
+                mo.md("### Tiling"),
+                tile_rows,
+                tile_cols,
+                tile_overlap,
+            ]
+        )
         if tiling.value
         else mo.md("")
     )
 
     resolution_section = (
-        mo.vstack([
-            mo.md("### Target Resolution"),
-            resolution,
-        ])
+        mo.vstack(
+            [
+                mo.md("### Target Resolution"),
+                resolution,
+            ]
+        )
         if resize.value
         else mo.md("")
     )
@@ -123,6 +142,7 @@ def _(
     | Bundle | {bundle_type.value} |
     | Labels | {label_mode.value if bundle_type.value == "Prepared Dataset" else "N/A"} |
     | Tiling | {"Enabled" if tiling.value else "Disabled"} |
+    | Ignore partials | {ignore_partial.value} |
     | Resize | {"Enabled" if resize.value else "Disabled"} |
     """)
 
@@ -136,6 +156,7 @@ def _(
                     label_section,
                     tiling,
                     tiling_section,
+                    ignore_partial,
                     resize,
                     resolution_section,
                 ]
@@ -156,6 +177,7 @@ def _(
 def _(
     bundle_type,
     dataset,
+    ignore_partial,
     label_mode,
     resize,
     resolution,
@@ -172,14 +194,13 @@ def _(
             "dataset": dataset.value,
             "bundle_type": bundle_type.value,
             "label_mode": (
-                label_mode.value
-                if bundle_type.value == "Prepared Dataset"
-                else None
+                label_mode.value if bundle_type.value == "Prepared Dataset" else None
             ),
             "tiling": tiling.value,
             "tile_rows": tile_rows.value if tiling.value else None,
             "tile_cols": tile_cols.value if tiling.value else None,
             "tile_overlap": tile_overlap.value if tiling.value else None,
+            "ignore_partial": ignore_partial.value,
             "resize": resize.value,
             "resolution": resolution.value if resize.value else None,
         }
@@ -218,17 +239,11 @@ def _(config):
     SEED = 42
 
     IMAGE_SIZE = (
-        config["resolution"]
-        if config["resize"]
-        else 512
-        if config["tiling"]
-        else 1024
+        config["resolution"] if config["resize"] else 512 if config["tiling"] else 1024
     )
 
     DATASET_DEFINITION = (
-        PHENOBENCH_MULTICLASS
-        if config["label_mode"] == "mc"
-        else PHENOBENCH_WEED_ONLY
+        PHENOBENCH_MULTICLASS if config["label_mode"] == "mc" else PHENOBENCH_WEED_ONLY
     )
 
     SOURCE_ROOT = Path("datasets") / (config["dataset"] + "_raw_full")
@@ -302,7 +317,6 @@ def _(
         "leaf_visibility",
     ]
 
-
     def tile_file(
         src: Path,
         dst_dir: Path,
@@ -332,9 +346,7 @@ def _(
 
             Image.fromarray(tile_array).save(out_path)
 
-
     if config["tiling"] and config["bundle_type"] == "Source Dataset":
-
         for split in [
             "train",
             "val",
@@ -400,7 +412,7 @@ def _(FilterConfig, PhenoBench, SOURCE_ROOT, TiledPhenoBench, config, mo):
             "semantics",
             "plant_instances",
         ],
-        ignore_partial=False,
+        ignore_partial=config["ignore_partial"],
     )
 
     val_dataset = PhenoBench(
@@ -410,11 +422,10 @@ def _(FilterConfig, PhenoBench, SOURCE_ROOT, TiledPhenoBench, config, mo):
             "semantics",
             "plant_instances",
         ],
-        ignore_partial=False,
+        ignore_partial=config["ignore_partial"],
     )
 
-    if config['tiling']:
-
+    if config["tiling"]:
         filter_config = FilterConfig(
             min_instance_pixels=32,
             min_bbox_width=4,
@@ -576,6 +587,7 @@ def _(
     DEST_ROOT,
     IMAGE_SIZE,
     SEED,
+    config,
     json,
     rep_indices,
     test_stats,
@@ -586,7 +598,6 @@ def _(
     val_stats,
 ):
     metadata = {
-
         "dataset_definition": {
             "name": DATASET_DEFINITION.name,
             "categories": DATASET_DEFINITION.categories,
@@ -595,6 +606,7 @@ def _(
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
         "rep_samples": len(rep_indices),
+        "ignore_partial": config["ignore_partial"],
         "split_seed": SEED,
         "train_stats": train_stats,
         "true_eval_stats": true_eval_stats,
@@ -602,7 +614,12 @@ def _(
         "test_stats": test_stats,
     }
 
-    (DEST_ROOT / "dataset_metadata.json").write_text(json.dumps(metadata, indent=2,))
+    (DEST_ROOT / "dataset_metadata.json").write_text(
+        json.dumps(
+            metadata,
+            indent=2,
+        )
+    )
     return (metadata,)
 
 
@@ -613,22 +630,17 @@ def _(DEST_ROOT):
         "val.record",
         "test.record",
         "true_eval.record",
-
         "train_annotations.json",
         "true_eval_annotations.json",
         "val_annotations.json",
         "test_annotations.json",
-
         "label_map.pbtxt",
         "rep_dataset.json",
         "val_test_split.json",
         "dataset_metadata.json",
     ]
 
-    missing = [
-        p for p in artifacts
-        if not (DEST_ROOT / p).exists()
-    ]
+    missing = [p for p in artifacts if not (DEST_ROOT / p).exists()]
 
     assert not missing, f"Missing artifacts: {missing}"
 
