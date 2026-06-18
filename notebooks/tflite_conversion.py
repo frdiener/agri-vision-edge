@@ -671,6 +671,7 @@ def _(result):
 def _(annotations_path, config, fp32_map, output_dir):
     from agri_vision_edge.evaluation.coco import (
         evaluate_predictions,
+        print_per_class,
         save_metrics,
     )
 
@@ -698,6 +699,8 @@ def _(annotations_path, config, fp32_map, output_dir):
     print(f"AP50: {metrics['AP50']:.4f}")
 
     print(f"AP75: {metrics['AP75']:.4f}")
+
+    print_per_class(metrics)
     return
 
 
