@@ -61,6 +61,7 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
       {precision} {per_channel}
       {regular_nms}
     - {eval_split}
+    - {iou_threshold}
 
     """)
         .batch(
@@ -98,6 +99,7 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
             precision=mo.ui.dropdown(
                 options={
                     "int8": "int8",
+                    "int8/int16": "int16",
                     "fp32": "fp32",
                 },
                 value="int8",
@@ -118,6 +120,14 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
             regular_nms=mo.ui.switch(
                 value=False,
                 label="Regular (per-class) NMS",
+            ),
+            iou_threshold=mo.ui.slider(
+                start=0.2,
+                stop=0.9,
+                step=0.05,
+                value=0.5,
+                show_value=True,
+                label="NMS IoU Threshold",
             ),
         )
         .form(bordered=False, submit_button_label="Convert & Evaluate")
@@ -235,6 +245,9 @@ def dataset___conversion_helpers(
     MODEL_ROOT = config["model_root"] = model_root.value
     CHECKPOINT = MODEL_ROOT / config["quantization"] / "checkpoint"
     PIPELINE_CONFIG = _load_pipeline_config(CHECKPOINT.parent / "pipeline.config")
+
+    PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.iou_threshold = config["iou_threshold"]
+
     config["original_dataset"] = Path(
         str(PIPELINE_CONFIG.train_input_reader.tf_record_input_reader.input_path)
     ).parent.name
@@ -408,7 +421,7 @@ def _(
     return concrete_function, detection_module, qat_backbone
 
 
-@app.cell(disabled=True)
+@app.cell(disabled=True, hide_code=True)
 def _(qat_backbone):
     for layer in qat_backbone.layers:
         print(layer.name)
@@ -489,6 +502,31 @@ def tflite_conversion(
         # already expects normalized [-1, 1] float input.
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
         converter.inference_input_type = tf.float32
+
+    elif config["precision"] == "int16":
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+            # tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+            tf.lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+        ]
+
+        # converter.inference_input_type = tf.int16
+
+        def _normalized_rep_dataset():
+            for sample in representative_dataset(
+                dataset=train_dataset,
+                indices=rep_ds_indices,
+                num_samples=200,
+                size=IMAGE_SIZE,
+            ):
+                yield [(2.0 / 255.0) * sample[0] - 1.0]
+
+        converter.representative_dataset = _normalized_rep_dataset
+
+        # converter._experimental_new_quantizer = False
+        converter._experimental_disable_per_channel =  False # not config["per_channel"]
 
     tflite_model = converter.convert()
     return (tflite_model,)
