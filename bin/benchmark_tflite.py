@@ -16,8 +16,16 @@ Supports:
 from __future__ import annotations
 
 import argparse
+import sys
 
 from pathlib import Path
+
+# Allow running from a source checkout without installing the package:
+# put the src/ layout root on sys.path so `agri_vision_edge` is importable.
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parent.parent / "src"),
+)
 
 from agri_vision_edge.evaluation.artifacts import (
     save_benchmark_artifacts,
@@ -55,12 +63,9 @@ def collect_models(
     path = Path(path)
 
     if path.is_file():
-
         return [path]
 
-    return sorted(
-        path.glob("*.tflite")
-    )
+    return sorted(path.glob("*.tflite"))
 
 
 def benchmark_model(
@@ -74,10 +79,7 @@ def benchmark_model(
     Benchmark a single model.
     """
 
-    print(
-        f"\n=== Benchmarking: "
-        f"{model_path.name} ==="
-    )
+    print(f"\n=== Benchmarking: {model_path.name} ===")
 
     runtime = TFLiteRuntime(
         model_path=model_path,
@@ -89,10 +91,7 @@ def benchmark_model(
         image_records,
     )
 
-    output_dir = (
-        output_root /
-        model_path.stem
-    )
+    output_dir = output_root / model_path.stem
 
     save_benchmark_artifacts(
         output_dir=output_dir,
@@ -102,21 +101,11 @@ def benchmark_model(
         delegate=delegate,
     )
 
-    mean_latency = (
-        sum(result.latencies_ms)
-        / len(result.latencies_ms)
-    )
+    mean_latency = sum(result.latencies_ms) / len(result.latencies_ms)
 
-    print(
-        f"mean latency: "
-        f"{mean_latency:.2f} ms"
-    )
+    print(f"mean latency: {mean_latency:.2f} ms")
 
-    print(
-        f"exported "
-        f"{len(result.predictions)} "
-        f"prediction(s)"
-    )
+    print(f"exported {len(result.predictions)} prediction(s)")
 
 
 def main():
@@ -128,82 +117,55 @@ def main():
 
     parser.add_argument(
         "models",
-
-        help=(
-            "Single .tflite model "
-            "or directory of models"
-        ),
+        help=("Single .tflite model or directory of models"),
     )
 
     parser.add_argument(
         "images",
-
-        help=(
-            "Directory containing images"
-        ),
+        help=("Directory containing images"),
     )
 
     parser.add_argument(
         "--annotations",
-
         required=True,
-
-        help=(
-            "COCO annotations JSON"
-        ),
+        help=("COCO annotations JSON"),
     )
 
     parser.add_argument(
         "--output-dir",
-
         default="benchmark_results",
     )
 
     parser.add_argument(
         "--delegate",
-
         default="/usr/lib/libteflon.so",
     )
 
     args = parser.parse_args()
 
-    model_paths = collect_models(
-        args.models
-    )
+    model_paths = collect_models(args.models)
 
     image_records = load_coco_images(
         args.images,
         args.annotations,
     )
 
-    output_root = Path(
-        args.output_dir
-    )
+    output_root = Path(args.output_dir)
 
     output_root.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    print(
-        f"Found "
-        f"{len(model_paths)} "
-        f"model(s)"
-    )
+    print(f"Found {len(model_paths)} model(s)")
 
-    print(
-        f"Found "
-        f"{len(image_records)} "
-        f"annotated image(s)"
-    )
+    print(f"Found {len(image_records)} annotated image(s)")
 
     success = 0
     failed = 0
 
     for model_path in model_paths:
-
         try:
-
             benchmark_model(
                 model_path=model_path,
                 image_records=image_records,
@@ -214,36 +176,21 @@ def main():
             success += 1
 
         except Exception as e:
-
             failed += 1
 
-            print(
-                f"\n[error] "
-                f"{model_path.name}"
-            )
+            print(f"\n[error] {model_path.name}")
 
-            print(
-                f"        "
-                f"{type(e).__name__}: {e}"
-            )
+            print(f"        {type(e).__name__}: {e}")
 
             save_failure_artifact(
-                output_dir=
-                    output_root /
-                    model_path.stem,
-
+                output_dir=output_root / model_path.stem,
                 exception=e,
             )
 
     print()
 
-    print(
-        f"completed: "
-        f"{success} succeeded, "
-        f"{failed} failed"
-    )
+    print(f"completed: {success} succeeded, {failed} failed")
 
 
 if __name__ == "__main__":
-
     main()
