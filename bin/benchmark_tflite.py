@@ -139,9 +139,19 @@ def main():
     parser.add_argument(
         "--delegate",
         default="/usr/lib/libteflon.so",
+        help=(
+            "Path to the TFLite delegate, or 'none' to run on CPU "
+            "(use for fp32 models — the NPU delegate is for INT8)"
+        ),
     )
 
     args = parser.parse_args()
+
+    # The Teflon/NPU delegate targets INT8; routing an fp32 graph through it
+    # silently degrades results. 'none' (or empty) keeps the model on CPU.
+    delegate = args.delegate
+    if delegate is not None and delegate.strip().lower() in ("", "none"):
+        delegate = None
 
     model_paths = collect_models(args.models)
 
@@ -170,7 +180,7 @@ def main():
                 model_path=model_path,
                 image_records=image_records,
                 output_root=output_root,
-                delegate=args.delegate,
+                delegate=delegate,
             )
 
             success += 1

@@ -5,8 +5,18 @@
 #
 # Output goes to benchmark_results/<hostname>/<model-stem>/. By default a model
 # whose output already contains latency.json is skipped; pass --override to
-# re-run it. Any extra arguments (e.g. --delegate ...) are forwarded to
-# bin/benchmark_tflite.py.
+# re-run it.
+#
+# All models use the NPU delegate (--delegate, default /usr/lib/libteflon.so).
+# Note: the Teflon delegate targets INT8 — routing an fp32 graph through it
+# reports support for float conv ops and silently degrades results, so use --cpu
+# for trustworthy fp32 (and CPU-reference int8) numbers.
+#
+# Pass --cpu to disable the delegate for every model and write the results to
+# benchmark_results/<hostname>_cpu/ instead, for a clean CPU-only run alongside
+# the delegated one.
+#
+# Any other extra arguments are forwarded to bin/benchmark_tflite.py.
 
 set -uo pipefail
 
@@ -15,18 +25,41 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 
 models_dir="${repo_root}/artifacts/tflite"
 bundle_dir="${repo_root}/datasets/test-bundle"
-output_root="${repo_root}/benchmark_results/$(hostname)"
 
 override=0
+cpu_only=0
+delegate="/usr/lib/libteflon.so"
 forward_args=()
 
-for arg in "$@"; do
-    if [[ "${arg}" == "--override" ]]; then
-        override=1
-    else
-        forward_args+=("${arg}")
-    fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --override)
+            override=1
+            ;;
+        --cpu)
+            cpu_only=1
+            ;;
+        --delegate)
+            delegate="$2"
+            shift
+            ;;
+        --delegate=*)
+            delegate="${1#*=}"
+            ;;
+        *)
+            forward_args+=("$1")
+            ;;
+    esac
+    shift
 done
+
+# CPU-only runs go to a separate <hostname>_cpu/ tree so they don't clobber the
+# delegated results.
+if [[ ${cpu_only} -eq 1 ]]; then
+    output_root="${repo_root}/benchmark_results/$(hostname)_cpu"
+else
+    output_root="${repo_root}/benchmark_results/$(hostname)"
+fi
 
 shopt -s nullglob
 models=("${models_dir}"/*.tflite)
@@ -67,18 +100,26 @@ for model in "${models[@]}"; do
         annotations="${bundle_dir}/annotations_${cls}.json"
     fi
 
+    # --cpu disables the delegate for every model; otherwise all models use it.
+    if [[ ${cpu_only} -eq 1 ]]; then
+        model_delegate="none"
+    else
+        model_delegate="${delegate}"
+    fi
+
     if [[ ${override} -eq 0 && -f "${output_root}/${stem}/latency.json" ]]; then
         echo "[skip] ${name}: already benchmarked (use --override to re-run)"
         skipped=$((skipped + 1))
         continue
     fi
 
-    echo "[run]  ${name}  (cls=${cls}, images=$(basename "${images}"))"
+    echo "[run]  ${name}  (cls=${cls}, images=$(basename "${images}"), delegate=${model_delegate})"
     python3 "${script_dir}/benchmark_tflite.py" \
         "${model}" \
         "${images}" \
         --annotations "${annotations}" \
         --output-dir "${output_root}" \
+        --delegate "${model_delegate}" \
         ${forward_args[@]+"${forward_args[@]}"}
     ran=$((ran + 1))
 done
