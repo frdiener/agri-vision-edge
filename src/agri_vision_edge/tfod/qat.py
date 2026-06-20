@@ -766,7 +766,10 @@ class FMGAdapter(tf.keras.layers.Layer):
         ordered = [san[name] for name in self.func.input_names]
         outs = self.func(ordered)
         outs = outs if isinstance(outs, (list, tuple)) else [outs]
-        return collections.OrderedDict(zip(self.output_keys, outs, strict=False))
+        # NB: no `strict=` — under @tf.function autograph rewrites `zip` into its
+        # own `zip_`, which does not accept Python 3.10's strict keyword (works
+        # eagerly, TypeErrors in graph mode = the training/eval forward path).
+        return collections.OrderedDict(zip(self.output_keys, outs))  # noqa: B905
 
 
 def rebuild_box_predictor_functional(box_predictor, feature_shapes):
