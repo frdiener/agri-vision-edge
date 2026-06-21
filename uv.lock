@@ -36,6 +36,7 @@ name = "agri-vision-edge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "kaggle" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "pyyaml" },
@@ -86,6 +87,7 @@ prep = [
 
 [package.metadata]
 requires-dist = [
+    { name = "kaggle", specifier = ">=1.7.4.5" },
     { name = "numpy", specifier = "==1.23.5" },
     { name = "opencv-python", specifier = "==4.9.0.80" },
     { name = "pyyaml", specifier = "==6.0.3" },
