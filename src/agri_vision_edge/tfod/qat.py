@@ -201,28 +201,27 @@ class SignedConvQuantConfig(
 
 
 @register_keras_serializable()
-class ReLU6OutputConfig(
-    tfmot.quantization.keras.QuantizeConfig,
+class ReLU6ConvQuantConfig(
+    BaseQuantConfig,
 ):
     """
-    Pin a ReLU6 *layer's* output to a fixed [0, 6] (no weights).
+    Per-tensor weights + a fixed [0, 6] output quantizer, applied to a conv
+    whose output feeds a ReLU6.
 
-    This is the tensor that matters: in the folded backbone the conv and
-    ReLU6 are separate layers, and after TFLite fuses conv+ReLU6 the fused
-    op's output IS the ReLU6 layer's output. Annotating the ReLU6 layer (not
-    the preceding conv) is therefore what makes the deployed dequantized
-    range exactly 6 (scale = 6/255, zero_point = -128 ->
-    (127 - (-128)) * 6/255 = 6.0), which a stock delegate accepts.
-
-    The preceding conv is quantized weight-only (see the "full" scheme), so
-    there is no second fake-quant on the pre-ReLU6 tensor to fight with.
+    The [0, 6] pin lives on the CONV's OWN output (not on a separate ReLU6
+    layer). TFLite then fuses the following ReLU6 into the conv, and because the
+    conv is a self-contained quantized op (per-tensor weights + its own output
+    range) the fused op keeps PER-TENSOR weights. Pinning a *separate* ReLU6
+    layer instead (the ReLU6OutputConfig path) leaves the conv weight-only,
+    which makes TFLite emit a fully-int8 fused conv with PER-CHANNEL weights that
+    `_experimental_disable_per_channel` does NOT override -- the per-channel
+    regression. Clamping the conv output to [0, 6] is equivalent to ReLU6
+    (negatives -> 0, > 6 -> 6), and the delegate fuses + accepts the resulting
+    conv+ReLU6 op (dequantized range exactly 6).
     """
 
-    def get_weights_and_quantizers(self, layer):
-        return []
-
-    def set_quantize_weights(self, layer, quantize_weights):
-        pass
+    def _output_quantizer(self):
+        return FixedRelu6Quantizer()
 
     def get_activations_and_quantizers(self, layer):
         return []
@@ -231,52 +230,7 @@ class ReLU6OutputConfig(
         pass
 
     def get_output_quantizers(self, layer):
-        return [FixedRelu6Quantizer()]
-
-    def get_config(self):
-        return {}
-
-
-@register_keras_serializable()
-class AddOutputConfig(
-    tfmot.quantization.keras.QuantizeConfig,
-):
-    """
-    Quantize the output of a residual ``Add`` (no weights), signed AllValues.
-
-    MobileNetV2 inverted-residual blocks end in ``project_conv -> Add(skip)``.
-    The ``Add`` output is otherwise un-fake-quantized, which leaves a coverage
-    gap: when converting QAT *without* a representative dataset the converter
-    falls back to dynamic-range (per-channel) weights for the convs downstream
-    of that gap. Pinning the Add output (AllValues, signed -- residual sums are
-    signed) closes the gap so the whole backbone converts per-tensor with no
-    representative dataset.
-    """
-
-    def get_weights_and_quantizers(self, layer):
-        return []
-
-    def set_quantize_weights(self, layer, quantize_weights):
-        pass
-
-    def get_activations_and_quantizers(self, layer):
-        return []
-
-    def set_quantize_activations(self, layer, quantize_activations):
-        pass
-
-    def get_output_quantizers(self, layer):
-        return [
-            tfmot.quantization.keras.quantizers.AllValuesQuantizer(
-                num_bits=8,
-                per_axis=False,
-                symmetric=False,
-                narrow_range=False,
-            )
-        ]
-
-    def get_config(self):
-        return {}
+        return [self._output_quantizer()]
 
 
 def annotate_conv_layers(
@@ -443,26 +397,27 @@ def _quantize_backbone_full(
     to what its output actually is, so nothing is over-restricted and the only
     fixed [0, 6] pin lands where it survives TFLite fusion:
 
-      * conv feeding a ReLU6      -> weights only (no output quantizer). The
-        following ReLU6 layer owns the output quant, so conv+ReLU6 fuse into a
-        single op with one output range and no double fake-quant.
-      * ReLU6 layer               -> ReLU6OutputConfig: output pinned to a
-        fixed [0, 6]. This IS the fused op's output tensor, so the deployed
-        dequantized range is exactly 6 -> stock-delegate safe (no mesa patch).
+      * conv feeding a ReLU6      -> ReLU6ConvQuantConfig: per-tensor weights +
+        a fixed [0, 6] output quantizer ON THE CONV. TFLite fuses the following
+        ReLU6 into this self-contained quantized conv and keeps PER-TENSOR
+        weights (dequantized range exactly 6 -> delegate-safe).
       * signed (linear) conv      -> SignedConvQuantConfig: weights + AllValues
         output. Keeps the negative dynamic range; no ±6 clamp, so the features
         feeding the SSD head are not squashed.
 
-    Replaces the earlier full / fixed / full_av / mixed schemes: AllValues for
-    the signed half (their only real benefit) and a correctly-placed [0, 6] pin
-    for the ReLU6 half (which the old schemes pinned on the wrong - pre-fusion -
-    tensor). With correct [-1, 1] calibration, plain PTQ already lands near
+    The activation quant lives on the CONV (not on a separate ReLU6/Add layer).
+    Annotating separate ReLU6/Add layers + weight-only convs (the previous
+    design) makes TFLite emit fully-int8 *fused* convs with PER-CHANNEL weights
+    that `_experimental_disable_per_channel` cannot override -- folded backbones
+    came out per-channel. Putting the output quantizer back on the conv (the old
+    fixed/mixed behaviour) restores per-tensor. The delegate still fuses + accepts
+    conv+ReLU6. With correct [-1, 1] calibration, plain PTQ already lands near
     fp32, so this exists mainly to make per-tensor int8 deployment robust.
     """
 
     relu6_fed = _relu6_fed_conv_names(backbone)
 
-    weights_only = WeightOnlyQuantConfig(
+    relu6_conv_cfg = ReLU6ConvQuantConfig(
         per_axis=per_axis,
         symmetric=symmetric,
     )
@@ -470,10 +425,12 @@ def _quantize_backbone_full(
         per_axis=per_axis,
         symmetric=symmetric,
     )
-    relu6_cfg = ReLU6OutputConfig()
-    add_cfg = AddOutputConfig()
 
     def clone_function(layer):
+        # Quantize convs only; the activation quant rides on the conv's own
+        # output (ReLU6 convs -> fixed [0, 6], signed convs -> AllValues). The
+        # ReLU6 / residual-Add layers are left float so TFLite fuses them into
+        # the preceding conv WITHOUT promoting the conv weights to per-channel.
         if isinstance(
             layer,
             (
@@ -481,24 +438,10 @@ def _quantize_backbone_full(
                 tf.keras.layers.DepthwiseConv2D,
             ),
         ):
-            config = weights_only if layer.name in relu6_fed else signed_cfg
+            config = relu6_conv_cfg if layer.name in relu6_fed else signed_cfg
             return tfmot.quantization.keras.quantize_annotate_layer(
                 layer,
                 quantize_config=config,
-            )
-
-        if _is_relu6(layer):
-            return tfmot.quantization.keras.quantize_annotate_layer(
-                layer,
-                quantize_config=relu6_cfg,
-            )
-
-        # Residual-add output: close the fake-quant coverage gap so the
-        # backbone converts per-tensor with no representative dataset.
-        if isinstance(layer, tf.keras.layers.Add):
-            return tfmot.quantization.keras.quantize_annotate_layer(
-                layer,
-                quantize_config=add_cfg,
             )
 
         return layer
@@ -506,10 +449,8 @@ def _quantize_backbone_full(
     with tfmot.quantization.keras.quantize_scope(
         {
             "FreezableBatchNorm": FreezableBatchNorm,
-            "WeightOnlyQuantConfig": WeightOnlyQuantConfig,
+            "ReLU6ConvQuantConfig": ReLU6ConvQuantConfig,
             "SignedConvQuantConfig": SignedConvQuantConfig,
-            "ReLU6OutputConfig": ReLU6OutputConfig,
-            "AddOutputConfig": AddOutputConfig,
         }
     ):
         annotated = tf.keras.models.clone_model(
