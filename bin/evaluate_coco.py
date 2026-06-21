@@ -15,8 +15,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from pathlib import Path
+
+# Allow running from a source checkout without installing the package:
+# put the src/ layout root on sys.path so `agri_vision_edge` is importable.
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parent.parent / "src"),
+)
 
 from agri_vision_edge.evaluation.coco import (
     evaluate_model_dir,
