@@ -254,6 +254,7 @@ def dataset___conversion_helpers(
         str(PIPELINE_CONFIG.train_input_reader.tf_record_input_reader.input_path)
     ).parent.name
     config["num_classes"] = PIPELINE_CONFIG.model.ssd.num_classes
+    config["max_detections"] = PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.max_total_detections
     config["resolution"] = (
         PIPELINE_CONFIG.model.ssd.image_resizer.fixed_shape_resizer.width
     )
@@ -363,21 +364,22 @@ def _(
     # restore cleanly. Mirrors tfod_trainer.setup: (optionally) fold BatchNorms
     # into the convs, then quantize_backbone with the per-dir scheme, then
     # optionally quantize_detection_head for qat3.
-    # Scheme map is user-specified: qat0=annotate_all, qat1=weights, qat2=full;
+    # Scheme map is user-specified: qat0=default_8bit, qat1=weights, qat2=full;
     # qat3 = full on backbone + head.
     qat_backbone = None
 
     QAT_SCHEMES = {
-        "qat0": "annotate_all",  # TFMOT default 8-bit (legacy / comparison)
-        "qat1": "weights",  # weight-only int8
-        "qat2": "full",  # full int8, backbone
-        "qat3": "full",  # full int8, backbone + head
+        "qat0": "full",  # full int8, backbone (unfolded)
+        "qat1": "weights",  # weight-only int8 (unfolded)
+        "qat2": "full",  # full int8, backbone (folded)
+        "qat3": "full",  # full int8, backbone + head (folded)
     }
 
     # BatchNorm folding per scheme -- MUST match the training notebooks' fold_bn.
-    # qat0/qat1 stay UNFOLDED to showcase the unfolded backbone's residual
-    # MUL/ADD nodes (and folded qat0 hits a per-channel issue that ignores
-    # disable_per_channel); qat2/qat3 fold (enables the qat1->qat2 progression).
+    # qat0/qat1 stay UNFOLDED to showcase the unfolded backbone's residual MUL/ADD
+    # nodes (the custom full/weights schemes annotate only convs and pass BN
+    # through, so they survive unfolded); qat2/qat3 fold. qat0 (full, unfolded) vs
+    # qat2 (full, folded) isolates the folding effect.
     QAT_FOLD = {"qat0": False, "qat1": False, "qat2": True, "qat3": True}
 
     if config["quantization"] != "ptq":
@@ -397,12 +399,10 @@ def _(
             )
 
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
-    # max_detections=100 matches the pipeline's max_total_detections so the
-    # TFLite mAP tracks the checkpoint metric (COCO also scores up to 100/image).
     detection_module = SSDModule(
         PIPELINE_CONFIG,
         detection_model,
-        max_detections=100,
+        max_detections=config["max_detections"],
         use_regular_nms=config["regular_nms"],
     )
 
@@ -534,7 +534,7 @@ def tflite_conversion(
         converter.representative_dataset = _normalized_rep_dataset
 
         # converter._experimental_new_quantizer = False
-        converter._experimental_disable_per_channel = False  # not config["per_channel"]
+        converter._experimental_disable_per_channel = not config["per_channel"]
 
     tflite_model = converter.convert()
     return (tflite_model,)
