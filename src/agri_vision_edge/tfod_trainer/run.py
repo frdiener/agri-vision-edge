@@ -181,6 +181,12 @@ def write_pipeline(cfg: FinetuneRunConfig) -> Path:
 
     cfg.pipeline_config_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Resuming our own full model (QAT from a finetune export) must restore the
+    # box/class prediction heads too, so use "full". A plain finetune bootstraps
+    # from a foreign detection checkpoint (e.g. COCO, different num_classes) where
+    # the heads must be dropped and reinitialised, so it stays "detection".
+    fine_tune_checkpoint_type = "full" if cfg.qat_scheme else "detection"
+
     configure_ssd_pipeline(
         config=cfg.finetune,
         config_path=cfg.base_pipeline_config,
@@ -190,6 +196,7 @@ def write_pipeline(cfg: FinetuneRunConfig) -> Path:
         label_map=cfg.label_map,
         checkpoint_path=cfg.base_checkpoint,
         num_classes=cfg.num_classes,
+        fine_tune_checkpoint_type=fine_tune_checkpoint_type,
     )
 
     return cfg.pipeline_config_path
