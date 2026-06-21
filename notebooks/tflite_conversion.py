@@ -246,7 +246,9 @@ def dataset___conversion_helpers(
     CHECKPOINT = MODEL_ROOT / config["quantization"] / "checkpoint"
     PIPELINE_CONFIG = _load_pipeline_config(CHECKPOINT.parent / "pipeline.config")
 
-    PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.iou_threshold = config["iou_threshold"]
+    PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.iou_threshold = config[
+        "iou_threshold"
+    ]
 
     config["original_dataset"] = Path(
         str(PIPELINE_CONFIG.train_input_reader.tf_record_input_reader.input_path)
@@ -358,9 +360,9 @@ def _(
     ensure_model_is_built_for_qat(detection_model, PIPELINE_CONFIG)
 
     # Rebuild the exact QAT graph the checkpoint was trained with so the weights
-    # restore cleanly. Mirrors tfod_trainer.setup: fold BatchNorms into the convs
-    # (fold_bn defaults on whenever QAT is enabled), then quantize_backbone with
-    # the per-dir scheme, then optionally quantize_detection_head for qat3.
+    # restore cleanly. Mirrors tfod_trainer.setup: (optionally) fold BatchNorms
+    # into the convs, then quantize_backbone with the per-dir scheme, then
+    # optionally quantize_detection_head for qat3.
     # Scheme map is user-specified: qat0=annotate_all, qat1=weights, qat2=full;
     # qat3 = full on backbone + head.
     qat_backbone = None
@@ -372,13 +374,19 @@ def _(
         "qat3": "full",  # full int8, backbone + head
     }
 
+    # BatchNorm folding per scheme -- MUST match the training notebooks' fold_bn.
+    # qat0/qat1 stay UNFOLDED to showcase the unfolded backbone's residual
+    # MUL/ADD nodes (and folded qat0 hits a per-channel issue that ignores
+    # disable_per_channel); qat2/qat3 fold (enables the qat1->qat2 progression).
+    QAT_FOLD = {"qat0": False, "qat1": False, "qat2": True, "qat3": True}
+
     if config["quantization"] != "ptq":
         scheme = QAT_SCHEMES[config["quantization"]]
 
-        folded_backbone = fold(
-            detection_model.feature_extractor.classification_backbone
-        )
-        qat_backbone = quantize_backbone(folded_backbone, scheme=scheme)
+        backbone = detection_model.feature_extractor.classification_backbone
+        if QAT_FOLD[config["quantization"]]:
+            backbone = fold(backbone)
+        qat_backbone = quantize_backbone(backbone, scheme=scheme)
         detection_model.feature_extractor.classification_backbone = qat_backbone
 
         if config["quantization"] == "qat3":
@@ -526,7 +534,7 @@ def tflite_conversion(
         converter.representative_dataset = _normalized_rep_dataset
 
         # converter._experimental_new_quantizer = False
-        converter._experimental_disable_per_channel =  False # not config["per_channel"]
+        converter._experimental_disable_per_channel = False  # not config["per_channel"]
 
     tflite_model = converter.convert()
     return (tflite_model,)
@@ -668,8 +676,10 @@ def _(
         annotations_path,
     )
 
-    output_dir = Path("./benchmark_results/") / f"{socket.gethostname()}" / (
-        MODEL_FILE_PATH.stem + f"_{config['eval_split']}"
+    output_dir = (
+        Path("./benchmark_results/")
+        / f"{socket.gethostname()}"
+        / (MODEL_FILE_PATH.stem + f"_{config['eval_split']}")
     )
 
     print(f"\n=== Benchmarking: {MODEL_FILE_PATH.name} ===")
