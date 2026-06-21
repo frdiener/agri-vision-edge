@@ -60,9 +60,7 @@ def load_pipeline_configs(
     Load TFOD pipeline config.
     """
 
-    pipeline_config = (
-        pipeline_pb2.TrainEvalPipelineConfig()
-    )
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
 
     text_format.Merge(
         pipeline_path.read_text(),
@@ -72,14 +70,10 @@ def load_pipeline_configs(
     return {
         "model": pipeline_config.model,
         "train_config": pipeline_config.train_config,
-        "train_input_config":
-            pipeline_config.train_input_reader,
-        "eval_input_configs":
-            pipeline_config.eval_input_reader,
-        "eval_input_config":
-            pipeline_config.eval_input_reader[0],
-        "eval_config":
-            pipeline_config.eval_config,
+        "train_input_config": pipeline_config.train_input_reader,
+        "eval_input_configs": pipeline_config.eval_input_reader,
+        "eval_input_config": pipeline_config.eval_input_reader[0],
+        "eval_config": pipeline_config.eval_config,
     }
 
 
@@ -99,18 +93,14 @@ def build_detection_model(
 def create_evaluators(
     configs: dict,
 ):
-    category_index = (
-        label_map_util.create_category_index_from_labelmap(
-            configs["eval_input_config"].label_map_path
-        )
+    category_index = label_map_util.create_category_index_from_labelmap(
+        configs["eval_input_config"].label_map_path
     )
 
     return eval_util.get_evaluators(
         configs["eval_config"],
         list(category_index.values()),
-        eval_util.evaluator_options_from_eval_config(
-            configs["eval_config"]
-        ),
+        eval_util.evaluator_options_from_eval_config(configs["eval_config"]),
     )
 
 
@@ -123,9 +113,7 @@ def create_runtime(
 
     # Resolve `fine_tune_checkpoint_type` from the deprecated
     # `from_detection_checkpoint` field when it is not set explicitly.
-    config_util.update_fine_tune_checkpoint_type(
-        configs["train_config"]
-    )
+    config_util.update_fine_tune_checkpoint_type(configs["train_config"])
 
     global_step = tf.Variable(
         0,
@@ -134,24 +122,15 @@ def create_runtime(
         name="global_step",
     )
 
-    optimizer, (learning_rate,) = (
-        optimizer_builder.build(
-            configs["train_config"].optimizer,
-            global_step=global_step,
-        )
+    optimizer, (learning_rate,) = optimizer_builder.build(
+        configs["train_config"].optimizer,
+        global_step=global_step,
     )
 
     clip_gradients_value = None
 
-    if (
-        configs["train_config"]
-        .gradient_clipping_by_norm
-        > 0
-    ):
-        clip_gradients_value = (
-            configs["train_config"]
-            .gradient_clipping_by_norm
-        )
+    if configs["train_config"].gradient_clipping_by_norm > 0:
+        clip_gradients_value = configs["train_config"].gradient_clipping_by_norm
 
     ckpt = tf.train.Checkpoint(
         step=global_step,
@@ -178,19 +157,10 @@ def create_runtime(
         ckpt=ckpt,
         manager=manager,
         evaluators=create_evaluators(configs),
-        add_regularization_loss=(
-            configs["train_config"]
-            .add_regularization_loss
-        ),
-        unpad_groundtruth_tensors=(
-            configs["train_config"]
-            .unpad_groundtruth_tensors
-        ),
+        add_regularization_loss=(configs["train_config"].add_regularization_loss),
+        unpad_groundtruth_tensors=(configs["train_config"].unpad_groundtruth_tensors),
         clip_gradients_value=clip_gradients_value,
-        use_moving_average=(
-            configs["train_config"]
-            .optimizer.use_moving_average
-        ),
+        use_moving_average=(configs["train_config"].optimizer.use_moving_average),
     )
 
 
@@ -220,10 +190,7 @@ def maybe_load_fine_tune_checkpoint(
     train_config = runtime.configs["train_config"]
 
     if not train_config.fine_tune_checkpoint:
-        print(
-            "No fine_tune_checkpoint set; "
-            "training from scratch."
-        )
+        print("No fine_tune_checkpoint set; training from scratch.")
         return
 
     print(
@@ -281,13 +248,8 @@ def restore_weights(
         runtime.optimizer.shadow_copy(detection_model)
 
     if runtime.manager.latest_checkpoint:
-        print(
-            "Resuming from checkpoint: "
-            f"{runtime.manager.latest_checkpoint}"
-        )
-        runtime.ckpt.restore(
-            runtime.manager.latest_checkpoint
-        )
+        print(f"Resuming from checkpoint: {runtime.manager.latest_checkpoint}")
+        runtime.ckpt.restore(runtime.manager.latest_checkpoint)
         return
 
     maybe_load_fine_tune_checkpoint(
@@ -330,11 +292,9 @@ def apply_graph_modifications(
     if trainer_cfg.reset_optimizer:
         print("Resetting the optimizer...")
         runtime.global_step.assign(0)
-        optimizer, (learning_rate,) = (
-            optimizer_builder.build(
-                train_config.optimizer,
-                global_step=runtime.global_step,
-            )
+        optimizer, (learning_rate,) = optimizer_builder.build(
+            train_config.optimizer,
+            global_step=runtime.global_step,
         )
         runtime.optimizer = optimizer
         runtime.learning_rate = learning_rate
@@ -358,10 +318,8 @@ def apply_graph_modifications(
         )
 
         print("Folding batchnorms into the convolutions...")
-        feature_extractor.classification_backbone = (
-            fold_mobilenetv2_backbone(
-                feature_extractor.classification_backbone
-            )
+        feature_extractor.classification_backbone = fold_mobilenetv2_backbone(
+            feature_extractor.classification_backbone
         )
 
     if trainer_cfg.qat_enabled:
@@ -370,15 +328,11 @@ def apply_graph_modifications(
         )
 
         scheme = trainer_cfg.qat_scheme.value
-        print(
-            "Adding fake quantization nodes to the "
-            f"backbone (scheme={scheme})..."
-        )
-        feature_extractor.classification_backbone = (
-            quantize_backbone(
-                feature_extractor.classification_backbone,
-                scheme=scheme,
-            )
+        print(f"Adding fake quantization nodes to the backbone (scheme={scheme})...")
+        feature_extractor.classification_backbone = quantize_backbone(
+            feature_extractor.classification_backbone,
+            scheme=scheme,
+            per_axis=trainer_cfg.qat_per_channel,
         )
 
         if getattr(trainer_cfg, "quantize_head", False):
@@ -386,10 +340,9 @@ def apply_graph_modifications(
                 quantize_detection_head,
             )
 
-            image_size = (
-                runtime.configs["model"]
-                .ssd.image_resizer.fixed_shape_resizer.height
-            )
+            image_size = runtime.configs[
+                "model"
+            ].ssd.image_resizer.fixed_shape_resizer.height
             print(
                 "Quantizing the detection head "
                 f"(feature maps + box predictor, scheme={scheme})..."
@@ -398,6 +351,7 @@ def apply_graph_modifications(
                 detection_model,
                 image_size,
                 scheme=scheme,
+                per_axis=trainer_cfg.qat_per_channel,
             )
 
     return True

@@ -790,11 +790,16 @@ class BoxPredictorAdapter(tf.keras.layers.Layer):
         }
 
 
-def quantize_detection_head(detection_model, image_size, *, scheme="full"):
+def quantize_detection_head(
+    detection_model, image_size, *, scheme="full", per_axis=False
+):
     """
     Quantize the SSD head (feature_map_generator + box predictor) in place via
     weight-preserving functional rebuilds, so QAT covers the whole graph up to
     the postprocess. Call AFTER the backbone has been folded + quantized.
+
+    ``per_axis`` matches the backbone: False = per-tensor weights, True =
+    per-channel (must agree with how the backbone was quantized).
 
     Specific to the plain SSD MobileNetV2 head; raises if the structure differs.
     """
@@ -819,6 +824,7 @@ def quantize_detection_head(detection_model, image_size, *, scheme="full"):
     qfmg = quantize_backbone(
         fold_functional(rebuild_feature_map_generator_functional(fmg, feature_specs)),
         scheme=scheme,
+        per_axis=per_axis,
     )
     fe.feature_map_generator = FMGAdapter(qfmg, out_keys)
 
@@ -827,6 +833,7 @@ def quantize_detection_head(detection_model, image_size, *, scheme="full"):
             detection_model._box_predictor, feature_shapes
         ),
         scheme=scheme,
+        per_axis=per_axis,
     )
     detection_model._box_predictor = BoxPredictorAdapter(qbp, len(feature_shapes))
 

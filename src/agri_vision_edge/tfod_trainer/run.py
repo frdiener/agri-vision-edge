@@ -76,6 +76,11 @@ class FinetuneRunConfig:
     # applies when qat_scheme is set. EXPERIMENTAL (plain SSD MobileNetV2 only).
     quantize_head: bool = False
 
+    # Per-channel (per-axis) QAT weight quantization. Default False = per-tensor
+    # (i.MX8M Plus Vivante/Teflon NPU). Set True for i.MX93 Arm Ethos-U65, which
+    # accepts per-channel weights. The conversion + export reproduce this flag.
+    qat_per_channel: bool = False
+
     def __post_init__(self):
         self.model_path = Path(self.model_path)
         self.dataset_bundle_path = Path(self.dataset_bundle_path)
@@ -155,6 +160,7 @@ class FinetuneRunConfig:
             fold_bn=self.fold_bn,
             qat_scheme=self.qat_scheme,
             quantize_head=self.quantize_head,
+            qat_per_channel=self.qat_per_channel,
         )
 
 

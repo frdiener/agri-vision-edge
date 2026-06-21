@@ -134,7 +134,7 @@ def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
     )
 
     summary = mo.md(f"""
-    Dataset:
+    TF Data:
 
     | Setting | Value |
     |:----------|----------|
@@ -243,7 +243,16 @@ def dataset___conversion_helpers(
     config = config_form.value
 
     MODEL_ROOT = config["model_root"] = model_root.value
-    CHECKPOINT = MODEL_ROOT / config["quantization"] / "checkpoint"
+    # A per-channel QAT run publishes a "<qatN>_per-channel" folder/stage (set by
+    # the QAT notebook's QAT_PER_CHANNEL switch), so a per-channel checkpoint never
+    # clobbers the per-tensor one. ptq is always per-tensor-irrelevant (no suffix).
+    QAT_DIRNAME = config["quantization"] + (
+        "_per-channel"
+        if config["per_channel"] and config["quantization"] != "ptq"
+        else ""
+    )
+    config["qat_dirname"] = QAT_DIRNAME
+    CHECKPOINT = MODEL_ROOT / QAT_DIRNAME / "checkpoint"
     PIPELINE_CONFIG = _load_pipeline_config(CHECKPOINT.parent / "pipeline.config")
 
     PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.iou_threshold = config[
@@ -254,7 +263,9 @@ def dataset___conversion_helpers(
         str(PIPELINE_CONFIG.train_input_reader.tf_record_input_reader.input_path)
     ).parent.name
     config["num_classes"] = PIPELINE_CONFIG.model.ssd.num_classes
-    config["max_detections"] = PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.max_total_detections
+    config["max_detections"] = (
+        PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.max_total_detections
+    )
     config["resolution"] = (
         PIPELINE_CONFIG.model.ssd.image_resizer.fixed_shape_resizer.width
     )
@@ -385,17 +396,26 @@ def _(
     if config["quantization"] != "ptq":
         scheme = QAT_SCHEMES[config["quantization"]]
 
+        # per_axis MUST match how the checkpoint was QAT-trained (it sets the
+        # fake-quant var shapes), so reuse the Per-Channel switch: False =
+        # per-tensor (i.MX8M Plus), True = per-channel (i.MX93 Ethos-U). The
+        # same switch also drives the converter's _experimental_disable_per_channel.
+        per_axis = config["per_channel"]
+
         backbone = detection_model.feature_extractor.classification_backbone
         if QAT_FOLD[config["quantization"]]:
             backbone = fold(backbone)
-        qat_backbone = quantize_backbone(backbone, scheme=scheme)
+        qat_backbone = quantize_backbone(backbone, scheme=scheme, per_axis=per_axis)
         detection_model.feature_extractor.classification_backbone = qat_backbone
 
         if config["quantization"] == "qat3":
             # Quantize the SSD head (feature maps + box predictor) in place;
             # must run after the backbone is folded + quantized.
             quantize_detection_head(
-                detection_model, config["resolution"], scheme="full"
+                detection_model,
+                config["resolution"],
+                scheme="full",
+                per_axis=per_axis,
             )
 
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
@@ -454,7 +474,7 @@ def _(qat_backbone):
     return
 
 
-@app.cell(hide_code=True)
+@app.cell
 def tflite_conversion(
     IMAGE_SIZE,
     concrete_function,
@@ -594,7 +614,7 @@ def _(tf, tflite_model):
     return (interpreter,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(interpreter):
     for t in interpreter.get_tensor_details():
         q = t["quantization"]
@@ -607,7 +627,7 @@ def _(interpreter):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(interpreter, np):
     for tensor in interpreter.get_tensor_details():
         if not "relu6" in tensor["name"].lower():
@@ -773,7 +793,7 @@ def _(annotations_path, config, json, output_dir):
     try:
         _history = json.loads(
             (
-                config["model_root"] / config["quantization"] / "metrics_history.json"
+                config["model_root"] / config["qat_dirname"] / "metrics_history.json"
             ).read_text()
         )
         tf_best = max(_history, key=lambda r: r["DetectionBoxes_Precision/mAP"])

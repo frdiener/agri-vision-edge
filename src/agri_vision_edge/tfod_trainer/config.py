@@ -39,9 +39,7 @@ class TrainerConfig:
 
     checkpoint_max_to_keep: int = 3
 
-    metric_name: str = (
-        "DetectionBoxes_Precision/mAP"
-    )
+    metric_name: str = "DetectionBoxes_Precision/mAP"
 
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 0.0
@@ -65,23 +63,21 @@ class TrainerConfig:
     # model is not yet validated end-to-end.
     quantize_head: bool = False
 
+    # Per-channel (per-axis) weight quantization for QAT. Default False =
+    # per-tensor (required by the i.MX8M Plus Vivante/Teflon NPU). Set True for
+    # targets that accept per-channel weights (i.MX93 Arm Ethos-U65), where it
+    # is usually a touch more accurate. Maps to `per_axis` on quantize_backbone.
+    qat_per_channel: bool = False
+
     def __post_init__(self):
         if isinstance(self.qat_scheme, str):
-            self.qat_scheme = QATScheme(
-                self.qat_scheme.lower()
-            )
+            self.qat_scheme = QATScheme(self.qat_scheme.lower())
 
-        if (
-            self.qat_scheme is not None
-            and not isinstance(
-                self.qat_scheme,
-                QATScheme,
-            )
+        if self.qat_scheme is not None and not isinstance(
+            self.qat_scheme,
+            QATScheme,
         ):
-            raise TypeError(
-                "qat_scheme must be "
-                "QATScheme, str, or None"
-            )
+            raise TypeError("qat_scheme must be QATScheme, str, or None")
 
     @property
     def qat_enabled(self) -> bool:

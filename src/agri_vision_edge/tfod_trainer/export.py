@@ -51,9 +51,9 @@ class ExportResult:
     """Paths to the artifacts produced by :func:`export_run`."""
 
     export_dir: Path
-    checkpoint: Path        # <export_dir>/checkpoint/ckpt-0
-    saved_model_dir: Path   # <export_dir>/saved_model
-    pipeline_config: Path   # <export_dir>/pipeline.config
+    checkpoint: Path  # <export_dir>/checkpoint/ckpt-0
+    saved_model_dir: Path  # <export_dir>/saved_model
+    pipeline_config: Path  # <export_dir>/pipeline.config
 
 
 def export_run(
@@ -64,6 +64,7 @@ def export_run(
     fold_bn: bool | None = None,
     qat_backbone: str | None = None,
     quantize_head: bool | None = None,
+    qat_per_channel: bool | None = None,
 ) -> ExportResult:
     """
     Export the best checkpoint of ``cfg``'s run to a checkpoint + SavedModel.
@@ -80,8 +81,11 @@ def export_run(
       * ``quantize_head`` defaults to ``cfg.quantize_head`` -- it MUST match how
         the run was trained, otherwise the head's quantized variables won't be
         present to restore and ``assert_existing_objects_matched`` fails.
+      * ``qat_per_channel`` defaults to ``cfg.qat_per_channel`` (per-tensor vs
+        per-channel weights) -- it changes the fake-quant variable shapes, so it
+        too MUST match the trained checkpoint.
 
-    Pass ``fold_bn`` / ``qat_backbone`` / ``quantize_head`` explicitly to override.
+    Pass any of these explicitly to override.
     """
     from agri_vision_edge.third_party import setup_tensorflow_models
 
@@ -97,9 +101,7 @@ def export_run(
     if not isinstance(cfg, FinetuneRunConfig):
         cfg = FinetuneRunConfig.from_mapping(cfg)
 
-    export_dir = (
-        cfg.output_dir / "export" if export_dir is None else Path(export_dir)
-    )
+    export_dir = cfg.output_dir / "export" if export_dir is None else Path(export_dir)
 
     if fold_bn is None:
         fold_bn = cfg.fold_bn
@@ -107,6 +109,8 @@ def export_run(
         qat_backbone = cfg.qat_scheme.value if cfg.qat_scheme else ""
     if quantize_head is None:
         quantize_head = cfg.quantize_head
+    if qat_per_channel is None:
+        qat_per_channel = cfg.qat_per_channel
 
     if input_type not in DETECTION_MODULE_MAP:
         raise ValueError(
@@ -148,7 +152,9 @@ def export_run(
                 "Adding fake quantization nodes to the backbone "
                 f"(scheme={qat_backbone})..."
             )
-            backbone = quantize_backbone(backbone, scheme=qat_backbone)
+            backbone = quantize_backbone(
+                backbone, scheme=qat_backbone, per_axis=qat_per_channel
+            )
 
         detection_model.feature_extractor.classification_backbone = backbone
 
@@ -162,25 +168,21 @@ def export_run(
                 f"(feature maps + box predictor, scheme={qat_backbone})..."
             )
             image_size = (
-                pipeline_config.model.ssd
-                .image_resizer.fixed_shape_resizer.height
+                pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.height
             )
             quantize_detection_head(
                 detection_model,
                 image_size,
                 scheme=qat_backbone,
+                per_axis=qat_per_channel,
             )
 
     # Restore the best checkpoint. The trainer only saves on metric improvement,
     # so the latest checkpoint in train_dir is the best one.
     ckpt = tf.train.Checkpoint(model=detection_model)
-    manager = tf.train.CheckpointManager(
-        ckpt, str(cfg.train_dir), max_to_keep=1
-    )
+    manager = tf.train.CheckpointManager(ckpt, str(cfg.train_dir), max_to_keep=1)
     if not manager.latest_checkpoint:
-        raise FileNotFoundError(
-            f"No checkpoint to export in {cfg.train_dir}"
-        )
+        raise FileNotFoundError(f"No checkpoint to export in {cfg.train_dir}")
     status = ckpt.restore(manager.latest_checkpoint).expect_partial()
 
     # Build the serving module; tracing the concrete function forces all
