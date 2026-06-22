@@ -27,6 +27,7 @@ semantic remapping come from a canonical :class:`DatasetDefinition`.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +93,7 @@ def export_yolo_split(
     split: str,
     indices=None,
     min_box_size: float = 0.0,
+    source_images_dir: str | Path | None = None,
 ) -> dict:
     """
     Export one dataset split as images + YOLO label files.
@@ -120,11 +122,21 @@ def export_yolo_split(
             Drop boxes whose normalized width or height is below this value
             (degenerate fragments). ``0.0`` keeps everything.
 
+        source_images_dir:
+            Optional directory of original image files. When a sample's image
+            exists there (i.e. full, un-tiled images), the original PNG is
+            copied verbatim instead of re-encoded via PIL -- much faster and
+            byte-exact. Samples without a matching source file (e.g. tiles) fall
+            back to encoding ``sample["image"]``.
+
     Returns:
         Summary dict with image and box counts.
     """
 
     output_dir = Path(output_dir)
+    source_images_dir = (
+        Path(source_images_dir) if source_images_dir is not None else None
+    )
 
     images_dir = output_dir / "images" / split
     labels_dir = output_dir / "labels" / split
@@ -152,8 +164,19 @@ def export_yolo_split(
         width, height = image.size
 
         stem = Path(sample["image_name"]).stem
+        dest_image = images_dir / f"{stem}.png"
 
-        image.save(images_dir / f"{stem}.png")
+        # Byte-exact copy for full images; re-encode only when there is no
+        # matching source file (tiles synthesised in-memory).
+        source_image = (
+            source_images_dir / sample["image_name"]
+            if source_images_dir is not None
+            else None
+        )
+        if source_image is not None and source_image.exists():
+            shutil.copyfile(source_image, dest_image)
+        else:
+            image.save(dest_image)
 
         lines = []
 
@@ -201,33 +224,49 @@ def write_data_yaml(
     train_split: str = "train",
     val_split: str = "val",
     test_split: str | None = None,
+    dest: str | Path | None = None,
 ) -> Path:
     """
     Write the YOLOv7 ``data.yaml`` describing splits and classes.
 
-    Paths are written relative to ``output_dir`` (the dataset root), matching
-    the ``images/<split>`` layout produced by :func:`export_yolo_split`.
+    ``train`` / ``val`` are written as **absolute** image-directory paths
+    beneath ``output_dir``. This matters: WongKinYiu/yolov7 ignores the
+    ultralytics ``path:`` key and resolves ``train`` / ``val`` relative to its
+    own working directory, so relative paths would be looked up under the
+    ``yolov7/`` clone and fail. (YOLOv7 finds labels by swapping ``images`` for
+    ``labels`` in the image path, so the sibling layout still works.)
+
+    Args:
+        output_dir:
+            Dataset root holding ``images/<split>`` and ``labels/<split>``.
+
+        dest:
+            Where to write the ``data.yaml`` file. Defaults to
+            ``output_dir/data.yaml``; pass a writable location when
+            ``output_dir`` is a read-only mount (e.g. a Kaggle input dataset).
     """
 
     output_dir = Path(output_dir)
 
+    dest = Path(dest) if dest is not None else output_dir / "data.yaml"
+
     names = yolo_class_names(dataset_definition)
 
+    images_root = output_dir / "images"
+
     lines = [
-        f"path: {output_dir}",
-        f"train: images/{train_split}",
-        f"val: images/{val_split}",
+        f"train: {images_root / train_split}",
+        f"val: {images_root / val_split}",
     ]
 
     if test_split is not None:
-        lines.append(f"test: images/{test_split}")
+        lines.append(f"test: {images_root / test_split}")
 
     lines.append(f"nc: {len(names)}")
 
     names_repr = ", ".join(f"'{n}'" for n in names)
     lines.append(f"names: [{names_repr}]")
 
-    data_yaml = output_dir / "data.yaml"
-    data_yaml.write_text("\n".join(lines) + "\n")
+    dest.write_text("\n".join(lines) + "\n")
 
-    return data_yaml
+    return dest
