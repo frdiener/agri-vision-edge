@@ -22,7 +22,6 @@ import copy
 import os
 import pprint
 import time
-import json
 
 import numpy as np
 import tensorflow.compat.v1 as tf
@@ -454,17 +453,6 @@ def train_loop(
     record_summaries=True,
     performance_summary_exporter=None,
     num_steps_per_iteration=NUM_STEPS_PER_ITERATION,
-
-    # NEW
-    eval_metric_key='DetectionBoxes_Precision/mAP',
-    early_stopping_patience=10,
-    early_stopping_min_delta=0,
-    save_metrics_history=True,
-
-    reset_optimizer=False,
-    qat_backbone='',
-    fold_bn=False,
-
     **kwargs):
   """Trains a model using eager + functions.
 
@@ -514,12 +502,6 @@ def train_loop(
       'create_pipeline_proto_from_configs']
   steps_per_sec_list = []
 
-  best_metric = -np.inf
-  patience_counter = 0
-  metrics_history = []
-
-  history_path = os.path.join(model_dir, 'metrics_history.json')
-  
   configs = get_configs_from_pipeline_file(
       pipeline_config_path, config_override=config_override)
   kwargs.update({
@@ -611,9 +593,6 @@ def train_loop(
   summary_writer = tf.compat.v2.summary.create_file_writer(
       summary_writer_filepath)
 
-  eval_summary_writer = tf.compat.v2.summary.create_file_writer(
-      os.path.join(model_dir, 'eval_on_train'))
-
   with summary_writer.as_default():
     with strategy.scope():
       with tf.compat.v2.summary.record_if(
@@ -643,60 +622,6 @@ def train_loop(
         # in a worker.
         latest_checkpoint = tf.train.latest_checkpoint(model_dir)
         ckpt.restore(latest_checkpoint)
-
-        print("Evaluating restored checkpoint...")
-
-        eval_input = strategy.experimental_distribute_dataset(
-            inputs.eval_input(
-                eval_config=configs['eval_config'],
-                eval_input_config=configs['eval_input_configs'][0],
-                model_config=model_config,
-                model=detection_model
-            )
-        )
-
-        metrics = eager_eval_loop(
-            detection_model,
-            configs,
-            eval_input,
-            use_tpu=False,
-            global_step=global_step
-        )
-
-        if reset_optimizer:
-          print("Resetting the optimizer...")
-          global_step.assign(0)
-          optimizer, (learning_rate,) = optimizer_builder.build(
-              train_config.optimizer,
-              global_step=global_step
-          )
-
-        if fold_bn:
-          print("Folding batchnorms into the convolutions...")
-          from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
-          detection_model.feature_extractor.classification_backbone = fold(
-            detection_model.feature_extractor.classification_backbone
-          )
-          
-        if qat_backbone:
-          from agri_vision_edge.tfod.qat import quantize_backbone
-          print("Adding fake quantization nodes to the backbone...")
-
-          detection_model.feature_extractor.classification_backbone = quantize_backbone(
-            detection_model.feature_extractor.classification_backbone,
-              scheme=qat_backbone
-            )
-          
-          print("Evaluating initial quantized configuration...")
-          metrics = eager_eval_loop(
-              detection_model,
-              configs,
-              eval_input,
-              use_tpu=False,
-              global_step=global_step
-          )
-
-        print("Beginning training...")
 
         def train_step_fn(features, labels):
           """Single train step."""
@@ -777,141 +702,16 @@ def train_loop(
           if global_step.value() - logged_step >= LOG_EVERY:
             logged_dict_np = {name: value.numpy() for name, value in
                               logged_dict.items()}
-            print(
+            tf.logging.info(
                 'Step {} per-step time {:.3f}s'.format(
                     global_step.value(), time_taken / num_steps_per_iteration))
-            print(pprint.pformat(logged_dict_np, width=40))
+            tf.logging.info(pprint.pformat(logged_dict_np, width=40))
             logged_step = global_step.value()
 
-            if ((int(global_step.value()) - checkpointed_step) >=
-                checkpoint_every_n):
-
-              checkpointed_step = int(global_step.value())
-
-              print(f"\nRunning evaluation at step {int(global_step.value())}")
-
-              eval_input = strategy.experimental_distribute_dataset(
-                  inputs.eval_input(
-                      eval_config=configs['eval_config'],
-                      eval_input_config=configs['eval_input_configs'][0],
-                      model_config=model_config,
-                      model=detection_model
-                  )
-              )
-
-              with eval_summary_writer.as_default():
-
-                if train_config.optimizer.use_moving_average:
-                  optimizer.swap_weights()
-
-                metrics = eager_eval_loop(
-                    detection_model,
-                    configs,
-                    eval_input,
-                    use_tpu=use_tpu,
-                    global_step=global_step
-                )
-
-                if train_config.optimizer.use_moving_average:
-                  optimizer.swap_weights()
-
-                detection_model._is_training = True
-                tf.keras.backend.set_learning_phase(True)
-
-                metric_value = float(metrics[eval_metric_key])
-
-                # log metric history
-                metrics_history.append({
-                    'step': int(global_step.value()),
-                    'key_metric': metric_value,
-                    'train_metrics': {
-                        k: float(v) if hasattr(v, 'item') else v
-                        for k, v in logged_dict_np.items()
-                    },
-                    'eval_metrics': {
-                        k: float(v.numpy()) if hasattr(v, 'numpy') else float(v)
-                        for k, v in metrics.items()
-                    }
-                })
-
-                if save_metrics_history:
-                  with open(history_path, 'w') as f:
-                    json.dump(metrics_history, f, indent=2)
-
-                print("\nEvaluation metrics:")
-                print(pprint.pformat(metrics, width=120))
-
-                # tensorboard scalar
-                tf.compat.v2.summary.scalar(
-                    'best_eval_metric',
-                    best_metric,
-                    step=global_step
-                )
-
-                improved = metric_value > (
-                    best_metric + early_stopping_min_delta
-                )
-
-                if improved:
-
-                  old_best = best_metric
-                  best_metric = metric_value
-                  patience_counter = 0
-
-                  print(
-                      f"\nNew best {eval_metric_key}: "
-                      f"{old_best:.5f} -> {best_metric:.5f}"
-                  )
-
-
-                  best_path = manager.save()
-
-                  print(f"\nSaved BEST checkpoint: {best_path}")
-
-                  metrics_float = {
-                      k: float(v.numpy()) if hasattr(v, 'numpy') else float(v)
-                      for k, v in metrics.items()
-                  }
-
-                  best_metadata = {
-                      'step': int(global_step.value()),
-                      'metric_name': eval_metric_key,
-                      'metric_value': float(best_metric),
-                      'checkpoint': best_path,
-                      'timestamp': time.time(),
-                      'all_metrics': metrics_float
-                  }
-
-                  with open(
-                      os.path.join(model_dir, 'best_metric.json'),
-                      'w'
-                  ) as f:
-                    json.dump(best_metadata, f, indent=2)
-
-                else:
-
-                  patience_counter += 1
-
-                  print(
-                      f"\nNo improvement in "
-                      f"{eval_metric_key}. "
-                      f"Best value still "
-                      f"{best_metric}. "
-                      f"Patience: "
-                      f"{patience_counter}/"
-                      f"{early_stopping_patience}"
-                  )
-
-                # EARLY STOPPING
-                if patience_counter >= early_stopping_patience:
-
-                  print(
-                      "\nEarly stopping triggered.\n"
-                      f"Best {eval_metric_key}: "
-                      f"{best_metric:.5f}"
-                  )
-
-                  break
+          if ((int(global_step.value()) - checkpointed_step) >=
+              checkpoint_every_n):
+            manager.save()
+            checkpointed_step = int(global_step.value())
 
   # Remove the checkpoint directories of the non-chief workers that
   # MultiWorkerMirroredStrategy forces us to save during sync distributed
@@ -1367,65 +1167,3 @@ def eval_continuously(
     if global_step.numpy() == configs['train_config'].num_steps:
       tf.logging.info('Exiting evaluation at step %d', global_step.numpy())
       return
-
-
-def eval_one_checkpoint(
-    pipeline_config_path,
-    checkpoint_path,
-    model_dir,
-    config_override=None,
-    save_final_config=False,
-    **kwargs):
-  configs = MODEL_BUILD_UTIL_MAP['get_configs_from_pipeline_file'](
-      pipeline_config_path, config_override=config_override)
-
-  if save_final_config:
-    pipeline_proto = MODEL_BUILD_UTIL_MAP['create_pipeline_proto_from_configs'](
-        configs)
-    config_util.save_pipeline_config(pipeline_proto, model_dir)
-
-  model_config = configs['model']
-  eval_config = configs['eval_config']
-  eval_input_config = configs['eval_input_configs'][0]
-
-  strategy = tf.compat.v2.distribute.get_strategy()
-  with strategy.scope():
-    detection_model = MODEL_BUILD_UTIL_MAP['detection_model_fn_base'](
-        model_config=model_config, is_training=True)
-
-  eval_input = strategy.experimental_distribute_dataset(
-      inputs.eval_input(
-          eval_config=eval_config,
-          eval_input_config=eval_input_config,
-          model_config=model_config,
-          model=detection_model))
-
-  global_step = tf.compat.v2.Variable(0, trainable=False, dtype=tf.int64)
-
-  optimizer, _ = optimizer_builder.build(
-      configs['train_config'].optimizer, global_step=global_step)
-
-  ckpt = tf.compat.v2.train.Checkpoint(
-      step=global_step, model=detection_model, optimizer=optimizer)
-
-  if eval_config.use_moving_averages:
-    _ensure_model_is_built(detection_model, eval_input,
-                           eval_config.batch_size == 1)
-    optimizer.shadow_copy(detection_model)
-
-  ckpt.restore(checkpoint_path).expect_partial()
-
-  if eval_config.use_moving_averages:
-    optimizer.swap_weights()
-
-  writer = tf.compat.v2.summary.create_file_writer(
-      os.path.join(model_dir, 'eval', eval_input_config.name))
-
-  with writer.as_default():
-    eager_eval_loop(
-        detection_model,
-        configs,
-        eval_input,
-        use_tpu=False,
-        postprocess_on_cpu=False,
-        global_step=global_step)

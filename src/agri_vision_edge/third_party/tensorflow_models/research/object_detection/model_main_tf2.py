@@ -51,8 +51,6 @@ flags.DEFINE_string(
 
 flags.DEFINE_integer('eval_timeout', 3600, 'Number of seconds to wait for an'
                      'evaluation checkpoint before exiting.')
-flags.DEFINE_integer('wait_interval', 300, 'Seconds between checkpoint '
-                     'polling attempts.')
 
 flags.DEFINE_bool('use_tpu', False, 'Whether the job is executing on a TPU.')
 flags.DEFINE_string(
@@ -65,8 +63,6 @@ flags.DEFINE_integer(
     'MirroredStrategy.')
 flags.DEFINE_integer(
     'checkpoint_every_n', 1000, 'Integer defining how often we checkpoint.')
-flags.DEFINE_integer(
-    'checkpoint_max_to_keep', 7, 'Integer defining how may checkpoints to keep.')
 flags.DEFINE_boolean('record_summaries', True,
                      ('Whether or not to record summaries defined by the model'
                       ' or the training pipeline. This does not impact the'
@@ -90,7 +86,7 @@ def main(unused_argv):
         sample_1_of_n_eval_on_train_examples=(
             FLAGS.sample_1_of_n_eval_on_train_examples),
         checkpoint_dir=FLAGS.checkpoint_dir,
-        wait_interval=FLAGS.wait_interval, timeout=FLAGS.eval_timeout)
+        wait_interval=300, timeout=FLAGS.eval_timeout)
   else:
     if FLAGS.use_tpu:
       # TPU is automatically inferred if tpu_name is None and
@@ -112,7 +108,6 @@ def main(unused_argv):
           train_steps=FLAGS.num_train_steps,
           use_tpu=FLAGS.use_tpu,
           checkpoint_every_n=FLAGS.checkpoint_every_n,
-          checkpoint_max_to_keep=FLAGS.checkpoint_max_to_keep,
           record_summaries=FLAGS.record_summaries)
 
 if __name__ == '__main__':

@@ -215,10 +215,7 @@ def export_inference_graph(input_type,
                            use_side_inputs=False,
                            side_input_shapes='',
                            side_input_types='',
-                           side_input_names='',
-                           qat_backbone='',
-                           fold_bn=False,
-                         ):
+                           side_input_names=''):
   """Exports inference graph for the model specified in the pipeline config.
 
   This function creates `output_directory` if it does not already exist,
@@ -251,30 +248,6 @@ def export_inference_graph(input_type,
       model=detection_model)
   manager = tf.train.CheckpointManager(
       ckpt, trained_checkpoint_dir, max_to_keep=1)
-
-  if qat_backbone or fold_bn:
-    from agri_vision_edge.tfod.qat import ensure_model_is_built_for_qat
-    ensure_model_is_built_for_qat(detection_model, pipeline_config)
-    assert (
-      detection_model.feature_extractor.classification_backbone is not None
-    )
-
-  if fold_bn:
-    print("Folding batchnorms into the convolutions...")
-    from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
-    detection_model.feature_extractor.classification_backbone = fold(
-      detection_model.feature_extractor.classification_backbone
-    )
-
-  if qat_backbone:
-    from agri_vision_edge.tfod.qat import quantize_backbone
-    print("Adding fake quantization nodes to the backbone...")
-
-    detection_model.feature_extractor.classification_backbone = quantize_backbone(
-      detection_model.feature_extractor.classification_backbone,
-        scheme=qat_backbone
-      )
-
   status = ckpt.restore(manager.latest_checkpoint).expect_partial()
 
   if input_type not in DETECTION_MODULE_MAP:
