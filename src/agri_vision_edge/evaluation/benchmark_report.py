@@ -289,6 +289,7 @@ def _grouped_bars(
     *,
     annotate=True,
     fmt="{:.3f}",
+    rotation=0,
 ):
     """
     Draw side-by-side bar groups.
@@ -330,7 +331,15 @@ def _grouped_bars(
                 )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(categories)
+    # Anchor rotated labels by their upper (right) end at the tick, so the
+    # text reads from the category position outward instead of being centred
+    # under it (much easier to read with long labels).
+    ax.set_xticklabels(
+        categories,
+        rotation=rotation,
+        ha="right" if rotation else "center",
+        rotation_mode="anchor" if rotation else "default",
+    )
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.margins(y=0.15)
@@ -357,7 +366,9 @@ def plot_quantization_effect(df: pd.DataFrame):
     precisions = [p for p in ("fp32", "int8") if p in df["precision"].values]
     groups = sorted(df["group"].unique())
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2), sharex=True)
+    # Stack vertically so each subplot spans the full figure width — the
+    # `platform | config` group labels are too long to share a row.
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8.4), sharex=True)
     for ax, metric, title in (
         (axes[0], "AP", "Overall AP (COCO)"),
         (axes[1], "weed_AP", "Weed AP"),
@@ -377,11 +388,11 @@ def plot_quantization_effect(df: pd.DataFrame):
             [PRECISION_COLORS[p] for p in precisions],
             ylabel=metric,
             title=title,
+            rotation=20,
         )
         ax.legend(title="precision")
-        ax.tick_params(axis="x", labelrotation=20)
 
-    fig.suptitle("FP32 -> INT8 quantization effect", y=1.02)
+    fig.suptitle("FP32 -> INT8 quantization effect", y=1.0)
     fig.tight_layout()
     return fig
 
@@ -418,12 +429,12 @@ def plot_single_vs_multiclass(df: pd.DataFrame):
         [CLASSES_COLORS[c] for c in class_order],
         ylabel="Weed AP",
         title="Weed AP: single-class vs. multi-class",
+        rotation=20,
     )
     ax.legend(
         title="regime",
         labels=["single-class", "multi-class"][: len(class_order)],
     )
-    ax.tick_params(axis="x", labelrotation=20)
     fig.tight_layout()
     return fig
 
@@ -460,9 +471,9 @@ def plot_architecture_effect(df: pd.DataFrame):
         PALETTE,
         ylabel="AP",
         title="Architecture comparison (overall AP)",
+        rotation=15,
     )
     ax.legend(title="architecture")
-    ax.tick_params(axis="x", labelrotation=15)
     fig.tight_layout()
     return fig
 
@@ -497,9 +508,9 @@ def plot_per_class_ap(df: pd.DataFrame):
         PALETTE,
         ylabel="AP",
         title="Per-class AP (multi-class runs)",
+        rotation=15,
     )
     ax.legend(title="class")
-    ax.tick_params(axis="x", labelrotation=15)
     fig.tight_layout()
     return fig
 
@@ -526,9 +537,9 @@ def plot_ap_by_area(df: pd.DataFrame):
         PALETTE,
         ylabel="AP",
         title="AP by object area",
+        rotation=25,
     )
     ax.legend(title="object size", labels=["small", "medium", "large"])
-    ax.tick_params(axis="x", labelrotation=25)
     fig.tight_layout()
     return fig
 
