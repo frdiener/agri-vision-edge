@@ -40,6 +40,11 @@ from .rep_dataset import (
 from .tfrecord import (
     build_record,
 )
+from .yolo import (
+    export_yolo_split,
+    write_data_yaml,
+    yolo_class_names,
+)
 
 __all__ = [
     "PhenoBench",
@@ -53,6 +58,9 @@ __all__ = [
     "split_indices",
     "export_coco_annotations",
     "build_record",
+    "export_yolo_split",
+    "write_data_yaml",
+    "yolo_class_names",
     "representative_dataset",
     "normalized_representative_dataset",
     "build_rep_indices",
