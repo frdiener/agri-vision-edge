@@ -6,10 +6,6 @@ from .config import (
     load_pipeline_config,
     save_pipeline_config,
 )
-from .export import (
-    export_saved_model,
-    export_tflite_graph,
-)
 from .mobilenetv2_bn_folding import fold_mobilenetv2_backbone
 
 # NOTE: the QAT helpers (quantize_backbone / quantize_detection_head) live in
@@ -30,11 +26,6 @@ __all__ = [
     "load_pipeline_config",
     "save_pipeline_config",
     "configure_ssd_pipeline",
-    #
-    # Export
-    #
-    "export_saved_model",
-    "export_tflite_graph",
     #
     # QAT
     #

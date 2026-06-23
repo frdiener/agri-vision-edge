@@ -21,9 +21,9 @@ def _(Path):
 
 
 @app.cell(hide_code=True)
-def configuration(ARTIFACTS_DIR, Path, json, mo, model_root):
+def configuration(ARTIFACTS_DIR, Path, json, load_pipeline_config, mo, model_root):
     try:
-        _finetune_config = _load_pipeline_config(
+        _finetune_config = load_pipeline_config(
             Path(model_root.value) / "ptq" / "pipeline.config"
         )
     except Exception as e:
@@ -183,7 +183,7 @@ def imports():
     from agri_vision_edge.runtime.inference.tflite import TFLiteRuntime
     from agri_vision_edge.evaluation.dataset import load_coco_images
 
-    from agri_vision_edge.tfod.export import _load_pipeline_config
+    from agri_vision_edge.tfod import load_pipeline_config
     from agri_vision_edge.experiment import ExperimentManifest
     from agri_vision_edge.tfod.qat import (
         ensure_model_is_built_for_qat,
@@ -210,6 +210,7 @@ def imports():
         fold,
         json,
         load_coco_images,
+        load_pipeline_config,
         model_builder,
         np,
         quantize_backbone,
@@ -231,6 +232,7 @@ def dataset___conversion_helpers(
     TiledPhenoBench,
     config_form,
     json,
+    load_pipeline_config,
     mo,
     model_root,
 ):
@@ -253,7 +255,7 @@ def dataset___conversion_helpers(
     )
     config["qat_dirname"] = QAT_DIRNAME
     CHECKPOINT = MODEL_ROOT / QAT_DIRNAME / "checkpoint"
-    PIPELINE_CONFIG = _load_pipeline_config(CHECKPOINT.parent / "pipeline.config")
+    PIPELINE_CONFIG = load_pipeline_config(CHECKPOINT.parent / "pipeline.config")
 
     PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.iou_threshold = config[
         "iou_threshold"
