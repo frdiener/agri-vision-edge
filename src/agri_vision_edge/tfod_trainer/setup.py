@@ -327,11 +327,9 @@ def apply_graph_modifications(
             quantize_backbone,
         )
 
-        scheme = trainer_cfg.qat_scheme.value
-        print(f"Adding fake quantization nodes to the backbone (scheme={scheme})...")
+        print("Adding fake quantization nodes to the backbone (full int8)...")
         feature_extractor.classification_backbone = quantize_backbone(
             feature_extractor.classification_backbone,
-            scheme=scheme,
             per_axis=trainer_cfg.qat_per_channel,
         )
 
@@ -343,14 +341,10 @@ def apply_graph_modifications(
             image_size = runtime.configs[
                 "model"
             ].ssd.image_resizer.fixed_shape_resizer.height
-            print(
-                "Quantizing the detection head "
-                f"(feature maps + box predictor, scheme={scheme})..."
-            )
+            print("Quantizing the detection head (feature maps + box predictor)...")
             quantize_detection_head(
                 detection_model,
                 image_size,
-                scheme=scheme,
                 per_axis=trainer_cfg.qat_per_channel,
             )
 

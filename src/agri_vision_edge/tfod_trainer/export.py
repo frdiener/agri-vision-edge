@@ -148,13 +148,8 @@ def export_run(
             backbone = fold_mobilenetv2_backbone(backbone)
 
         if qat_backbone:
-            print(
-                "Adding fake quantization nodes to the backbone "
-                f"(scheme={qat_backbone})..."
-            )
-            backbone = quantize_backbone(
-                backbone, scheme=qat_backbone, per_axis=qat_per_channel
-            )
+            print("Adding fake quantization nodes to the backbone (full int8)...")
+            backbone = quantize_backbone(backbone, per_axis=qat_per_channel)
 
         detection_model.feature_extractor.classification_backbone = backbone
 
@@ -163,17 +158,13 @@ def export_run(
         if qat_backbone and quantize_head:
             from agri_vision_edge.tfod.qat import quantize_detection_head
 
-            print(
-                "Quantizing the detection head "
-                f"(feature maps + box predictor, scheme={qat_backbone})..."
-            )
+            print("Quantizing the detection head (feature maps + box predictor)...")
             image_size = (
                 pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.height
             )
             quantize_detection_head(
                 detection_model,
                 image_size,
-                scheme=qat_backbone,
                 per_axis=qat_per_channel,
             )
 

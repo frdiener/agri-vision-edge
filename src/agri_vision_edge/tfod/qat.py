@@ -1,32 +1,22 @@
 """
 Quantization-aware training utilities for folded TFOD MobileNetV2 backbones.
 
-The deployment accelerator only supports PER-TENSOR int8 quantization, so the
-core job here is to emit per-tensor weights reliably. TFMOT's built-in
-Default8BitQuantizeScheme ("default_8bit" / "annotate_all" below) cannot be
-trusted for this: annotating the whole model inserts fake-quant no-ops at some
-points, and those make the TFLite converter ignore the per-tensor
-(disable_per_channel) request and silently emit per-channel weights. To avoid
-that, the custom schemes annotate ONLY Conv2D / DepthwiseConv2D layers and pin
-per-tensor quantization explicitly via LastValueQuantizer(per_axis=False).
+The deployment accelerators want a fully int8 graph, so the single ``full``
+scheme here annotates ONLY Conv2D / DepthwiseConv2D layers (plus, for the
+per-channel target, the ReLU6 / residual-Add layers) and pins the activation
+ranges explicitly. It has two variants chosen by ``per_axis`` (the target's
+weight granularity); both quantize activations and use per-TENSOR weight
+fake-quant -- per-channel weights, when wanted, are produced by the CONVERTER,
+never by per-channel fake-quant (which breaks the converter's int8 calibration):
 
-Custom schemes - see ``quantize_backbone`` for details:
+    * per_axis=False (i.MX8M Plus): pin [0,6] ON THE CONV (self-contained op) so
+      weights stay per-tensor.
+    * per_axis=True  (i.MX93 Ethos-U): convs feeding ReLU6 are weight-only and
+      the ReLU6 *layer* + residual Add carry the pins, so TFLite is free to emit
+      per-channel weights.
 
-    * "full"     - RECOMMENDED. Per-layer full int8: conv->ReLU6 convs are
-                   weight-only and the ReLU6 layer pins its output to a fixed
-                   [0, 6] (the tensor that survives fusion); signed convs use
-                   weights + AllValues so their range is not clamped.
-    * "weights"  - per-tensor weights only.
-
-This single "full" scheme replaces the earlier full / fixed / full_av / mixed
-experiments: it takes AllValues for the signed half (their only real benefit)
-and places the [0, 6] pin on the ReLU6 *layer* output (which the old schemes
-pinned on the wrong, pre-fusion tensor). With correct [-1, 1] calibration,
-plain PTQ already lands near fp32, so this exists to make per-tensor int8
-deployment robust rather than to recover accuracy.
-
-Legacy/comparison schemes ("default_8bit", "annotate_all") use the TFMOT
-default scheme and suffer the per-channel leakage described above.
+With correct [-1, 1] calibration plain PTQ already lands near fp32, so QAT
+exists to make int8 deployment robust rather than to recover accuracy.
 """
 
 import collections
@@ -36,7 +26,6 @@ import tensorflow as tf
 import tensorflow_model_optimization as tfmot
 from object_detection.core.freezable_batch_norm import FreezableBatchNorm
 from tensorflow.keras.utils import register_keras_serializable
-from tensorflow_model_optimization.quantization.keras import default_8bit
 
 
 @register_keras_serializable()
@@ -233,83 +222,81 @@ class ReLU6ConvQuantConfig(
         return [self._output_quantizer()]
 
 
-def annotate_conv_layers(
-    layer,
-    quantize_config,
+@register_keras_serializable()
+class ReLU6OutputConfig(
+    tfmot.quantization.keras.QuantizeConfig,
 ):
     """
-    Annotate convolution layers for QAT.
+    Pin a ReLU6 *layer's* output to a fixed [0, 6] (no weights).
+
+    This is the PER-CHANNEL counterpart to ReLU6ConvQuantConfig. In the folded
+    backbone the conv and ReLU6 are separate layers, and after TFLite fuses
+    conv+ReLU6 the fused op's output IS the ReLU6 layer's output - so pinning
+    HERE (not on the conv) makes the deployed dequantized range exactly 6
+    (scale = 6/255, zero_point = -128) which a stock delegate accepts. Crucially,
+    because the preceding conv is left WEIGHT-ONLY (no self-contained output
+    range), TFLite is free to emit PER-CHANNEL weights for it - which is exactly
+    what we want for the per-channel (i.MX93 Ethos-U) target. ReLU6ConvQuantConfig
+    does the opposite (pins on the conv) to FORCE per-tensor for i.MX8M Plus.
     """
 
-    if isinstance(
-        layer,
-        (
-            tf.keras.layers.Conv2D,
-            tf.keras.layers.DepthwiseConv2D,
-        ),
-    ):
-        return tfmot.quantization.keras.quantize_annotate_layer(
-            layer,
-            quantize_config=quantize_config,
-        )
+    def get_weights_and_quantizers(self, layer):
+        return []
 
-    return layer
+    def set_quantize_weights(self, layer, quantize_weights):
+        pass
+
+    def get_activations_and_quantizers(self, layer):
+        return []
+
+    def set_quantize_activations(self, layer, quantize_activations):
+        pass
+
+    def get_output_quantizers(self, layer):
+        return [FixedRelu6Quantizer()]
+
+    def get_config(self):
+        return {}
 
 
-def _quantize_backbone_legacy(
-    backbone,
-    *,
-    per_axis: bool,
+@register_keras_serializable()
+class AddOutputConfig(
+    tfmot.quantization.keras.QuantizeConfig,
 ):
     """
-    TFMOT Default8BitQuantizeScheme path (disable_per_axis controls
-    per-tensor vs per-channel weight quantization).
+    Quantize the output of a residual ``Add`` (no weights), signed AllValues.
 
-    KNOWN PROBLEM: this scheme annotates the whole model, which inserts
-    fake-quant no-ops at some points (e.g. around add / passthrough ops).
-    Those extra nodes make the TFLite converter ignore the per-tensor
-    (disable_per_channel) request, so weights silently come out per-channel -
-    which the deployment accelerator does not support. The custom
-    QuantizeConfig schemes ("full" / "weights") were introduced to avoid this:
-    they annotate only Conv/DepthwiseConv (and, for "full", the ReLU6 layers)
-    and pin per-tensor quantization explicitly via
-    LastValueQuantizer(per_axis=False). Prefer those; keep this only for
-    comparison.
+    MobileNetV2 inverted-residual blocks end in ``project_conv -> Add(skip)``.
+    With weight-only relu6 convs (the per-channel scheme) the ``Add`` output is
+    otherwise un-fake-quantized, leaving a coverage gap that lets the converter
+    fall back to dynamic-range weights downstream. Pinning the Add output
+    (AllValues, signed -- residual sums are signed) closes the gap.
     """
 
-    annotated = tfmot.quantization.keras.quantize_annotate_model(backbone)
+    def get_weights_and_quantizers(self, layer):
+        return []
 
-    with tfmot.quantization.keras.quantize_scope(
-        {
-            "FreezableBatchNorm": FreezableBatchNorm,
-        }
-    ):
-        return tfmot.quantization.keras.quantize_apply(
-            annotated,
-            scheme=default_8bit.Default8BitQuantizeScheme(
-                disable_per_axis=not per_axis,
-            ),
-        )
+    def set_quantize_weights(self, layer, quantize_weights):
+        pass
 
+    def get_activations_and_quantizers(self, layer):
+        return []
 
-def _quantize_backbone_tfmot(
-    backbone,
-    *,
-    per_axis: bool,
-):
-    """
-    Plain TFMOT default annotation + apply. Same KNOWN PROBLEM as
-    ``_quantize_backbone_legacy``: whole-model annotation inserts fake-quant
-    no-ops that make the converter ignore the per-tensor request and emit
-    per-channel weights (unsupported on the target). Kept for comparison;
-    prefer the custom QuantizeConfig schemes.
-    """
+    def set_quantize_activations(self, layer, quantize_activations):
+        pass
 
-    annotated = tfmot.quantization.keras.quantize_annotate_model(backbone)
-    return tfmot.quantization.keras.quantize_apply(
-        annotated,
-        scheme=default_8bit.Default8BitQuantizeScheme(disable_per_axis=per_axis),
-    )
+    def get_output_quantizers(self, layer):
+        return [
+            tfmot.quantization.keras.quantizers.AllValuesQuantizer(
+                num_bits=8,
+                per_axis=False,
+                symmetric=False,
+                narrow_range=False,
+            )
+        ]
+
+    def get_config(self):
+        return {}
 
 
 def _relu6_fed_conv_names(backbone):
@@ -393,44 +380,54 @@ def _quantize_backbone_full(
     symmetric: bool,
 ):
     """
-    The single, optimized full-int8 scheme. Each layer is quantized according
-    to what its output actually is, so nothing is over-restricted and the only
-    fixed [0, 6] pin lands where it survives TFLite fusion:
+    Full-int8 scheme. Each conv is quantized by what its output actually is, and
+    the only fixed [0, 6] pin lands where it survives TFLite fusion. There are
+    two variants, selected by ``per_axis`` (the deployment target's weight
+    granularity), because forcing per-tensor and allowing per-channel need the
+    [0, 6] pin in DIFFERENT places:
 
-      * conv feeding a ReLU6      -> ReLU6ConvQuantConfig: per-tensor weights +
-        a fixed [0, 6] output quantizer ON THE CONV. TFLite fuses the following
-        ReLU6 into this self-contained quantized conv and keeps PER-TENSOR
-        weights (dequantized range exactly 6 -> delegate-safe).
-      * signed (linear) conv      -> SignedConvQuantConfig: weights + AllValues
-        output. Keeps the negative dynamic range; no ±6 clamp, so the features
-        feeding the SSD head are not squashed.
+    PER-TENSOR target (``per_axis=False``, i.MX8M Plus / stock delegate):
+      * conv feeding a ReLU6 -> ReLU6ConvQuantConfig: weights + a fixed [0, 6]
+        output quantizer ON THE CONV, making it a self-contained quantized op so
+        TFLite keeps PER-TENSOR weights through the conv+ReLU6 fusion.
+      * signed (linear) conv -> SignedConvQuantConfig (weights + AllValues).
+      * ReLU6 / Add layers   -> left float (fused into the conv).
 
-    The activation quant lives on the CONV (not on a separate ReLU6/Add layer).
-    Annotating separate ReLU6/Add layers + weight-only convs (the previous
-    design) makes TFLite emit fully-int8 *fused* convs with PER-CHANNEL weights
-    that `_experimental_disable_per_channel` cannot override -- folded backbones
-    came out per-channel. Putting the output quantizer back on the conv (the old
-    fixed/mixed behaviour) restores per-tensor. The delegate still fuses + accepts
-    conv+ReLU6. With correct [-1, 1] calibration, plain PTQ already lands near
-    fp32, so this exists mainly to make per-tensor int8 deployment robust.
+    PER-CHANNEL target (``per_axis=True``, i.MX93 Ethos-U):
+      * conv feeding a ReLU6 -> WeightOnlyQuantConfig (NO conv-output pin), so
+        TFLite is free to emit PER-CHANNEL weights for it.
+      * ReLU6 layer          -> ReLU6OutputConfig: fixed [0, 6] on the ReLU6
+        LAYER output (the tensor that survives fusion -> deployed range exact 6).
+      * signed (linear) conv -> SignedConvQuantConfig (weights + AllValues).
+      * residual Add         -> AddOutputConfig (signed AllValues): closes the
+        fake-quant coverage gap left by the weight-only convs.
+
+    IMPORTANT: in BOTH variants the weight FAKE-QUANT is per-tensor
+    (LastValueQuantizer per_axis=False). Per-channel weights are produced by the
+    CONVERTER (weight-only convs + ``_experimental_disable_per_channel=False``),
+    NOT by per-channel fake-quant nodes -- baking
+    ``fake_quant_with_min_max_vars_per_channel`` into the graph makes the TFLite
+    int8 calibration collect ~0 activation ranges and collapses AP (fp32 stays
+    fine). This is why the per-channel path uses the weight-only / layer-pin
+    scheme rather than per-axis fake-quant.
     """
 
     relu6_fed = _relu6_fed_conv_names(backbone)
 
-    relu6_conv_cfg = ReLU6ConvQuantConfig(
-        per_axis=per_axis,
-        symmetric=symmetric,
-    )
-    signed_cfg = SignedConvQuantConfig(
-        per_axis=per_axis,
-        symmetric=symmetric,
-    )
+    # Weight fake-quant is ALWAYS per-tensor (see docstring); per-channel is a
+    # converter decision, not a fake-quant one.
+    signed_cfg = SignedConvQuantConfig(per_axis=False, symmetric=symmetric)
+
+    if per_axis:
+        relu6_conv_cfg = WeightOnlyQuantConfig(per_axis=False, symmetric=symmetric)
+        relu6_layer_cfg = ReLU6OutputConfig()
+        add_cfg = AddOutputConfig()
+    else:
+        relu6_conv_cfg = ReLU6ConvQuantConfig(per_axis=False, symmetric=symmetric)
+        relu6_layer_cfg = None
+        add_cfg = None
 
     def clone_function(layer):
-        # Quantize convs only; the activation quant rides on the conv's own
-        # output (ReLU6 convs -> fixed [0, 6], signed convs -> AllValues). The
-        # ReLU6 / residual-Add layers are left float so TFLite fuses them into
-        # the preceding conv WITHOUT promoting the conv weights to per-channel.
         if isinstance(
             layer,
             (
@@ -444,6 +441,21 @@ def _quantize_backbone_full(
                 quantize_config=config,
             )
 
+        # Per-channel scheme only: pin the ReLU6 layer output and the residual
+        # Add output (the per-tensor scheme leaves these float -- the conv owns
+        # the pin there).
+        if per_axis and _is_relu6(layer):
+            return tfmot.quantization.keras.quantize_annotate_layer(
+                layer,
+                quantize_config=relu6_layer_cfg,
+            )
+
+        if per_axis and isinstance(layer, tf.keras.layers.Add):
+            return tfmot.quantization.keras.quantize_annotate_layer(
+                layer,
+                quantize_config=add_cfg,
+            )
+
         return layer
 
     with tfmot.quantization.keras.quantize_scope(
@@ -451,6 +463,9 @@ def _quantize_backbone_full(
             "FreezableBatchNorm": FreezableBatchNorm,
             "ReLU6ConvQuantConfig": ReLU6ConvQuantConfig,
             "SignedConvQuantConfig": SignedConvQuantConfig,
+            "WeightOnlyQuantConfig": WeightOnlyQuantConfig,
+            "ReLU6OutputConfig": ReLU6OutputConfig,
+            "AddOutputConfig": AddOutputConfig,
         }
     ):
         annotated = tf.keras.models.clone_model(
@@ -464,96 +479,29 @@ def _quantize_backbone_full(
 def quantize_backbone(
     backbone,
     *,
-    scheme: str = "weights",
     per_axis: bool = False,
     symmetric: bool = True,
 ):
     """
-    Convert a backbone model to a QAT-enabled model.
+    Convert a backbone model to a QAT-enabled model (the full int8 scheme).
 
-    Supported schemes:
+    ``per_axis`` selects the deployment target's weight granularity:
+    per_axis=False pins [0,6] on the conv (forces per-tensor weights, i.MX8M
+    Plus); per_axis=True leaves relu6-fed convs weight-only and pins the ReLU6
+    layer + residual Add (lets the converter emit per-channel weights, i.MX93
+    Ethos-U). Both keep signed convs as weights + AllValues and use per-tensor
+    weight fake-quant. See _quantize_backbone_full.
 
-        full
-            The recommended full-int8 scheme. Per-layer: conv->ReLU6 convs are
-            weight-only and the ReLU6 layer pins its output to a fixed [0, 6]
-            (exactly where TFLite fusion keeps it -> stock-delegate safe);
-            signed (linear) convs use weights + AllValues (no ±6 clamp). See
-            _quantize_backbone_full.
-
-        weights
-            Weight-only quantization (activations left to graph transforms /
-            the converter). See WeightOnlyQuantConfig.
-
-        default_8bit
-            TFMOT Default8BitQuantizeScheme. LEGACY/comparison only - its
-            whole-model annotation inserts fake-quant no-ops that make the
-            converter ignore the per-tensor request and emit per-channel
-            weights (unsupported on the target). See _quantize_backbone_legacy.
-
-        annotate_all
-            TFMOT default annotation and quantization. Same per-channel
-            leakage problem as "default_8bit". See _quantize_backbone_tfmot.
-
-    NOTE: with correct [-1, 1] calibration, plain PTQ already lands near fp32
-    on this model, so QAT ("full") is robustness insurance rather than an
-    accuracy requirement.
+    NOTE: with correct [-1, 1] calibration plain PTQ already lands near fp32 on
+    this model, so QAT is robustness insurance rather than an accuracy
+    requirement.
     """
 
-    tfmot_schemes = {
-        "default_8bit": _quantize_backbone_legacy,
-        "annotate_all": _quantize_backbone_tfmot,
-    }
-
-    if scheme in tfmot_schemes:
-        return tfmot_schemes[scheme](
-            backbone,
-            per_axis=per_axis,
-        )
-
-    if scheme == "full":
-        return _quantize_backbone_full(
-            backbone,
-            per_axis=per_axis,
-            symmetric=symmetric,
-        )
-
-    custom_configs = {
-        "weights": WeightOnlyQuantConfig,
-    }
-
-    try:
-        config_cls = custom_configs[scheme]
-    except KeyError as exc:
-        valid = [
-            "full",
-            *custom_configs,
-            *tfmot_schemes,
-        ]
-        raise ValueError(
-            f"Unknown quantization scheme '{scheme}'. "
-            f"Expected one of: {', '.join(valid)}."
-        ) from exc
-
-    quantize_config = config_cls(
+    return _quantize_backbone_full(
+        backbone,
         per_axis=per_axis,
         symmetric=symmetric,
     )
-
-    with tfmot.quantization.keras.quantize_scope(
-        {
-            "FreezableBatchNorm": FreezableBatchNorm,
-            "WeightOnlyQuantConfig": WeightOnlyQuantConfig,
-        }
-    ):
-        annotated = tf.keras.models.clone_model(
-            backbone,
-            clone_function=lambda layer: annotate_conv_layers(
-                layer,
-                quantize_config,
-            ),
-        )
-
-        return tfmot.quantization.keras.quantize_apply(annotated)
 
 
 def ensure_model_is_built_for_qat(detection_model, pipeline_config):
@@ -790,9 +738,7 @@ class BoxPredictorAdapter(tf.keras.layers.Layer):
         }
 
 
-def quantize_detection_head(
-    detection_model, image_size, *, scheme="full", per_axis=False
-):
+def quantize_detection_head(detection_model, image_size, *, per_axis=False):
     """
     Quantize the SSD head (feature_map_generator + box predictor) in place via
     weight-preserving functional rebuilds, so QAT covers the whole graph up to
@@ -823,7 +769,6 @@ def quantize_detection_head(
 
     qfmg = quantize_backbone(
         fold_functional(rebuild_feature_map_generator_functional(fmg, feature_specs)),
-        scheme=scheme,
         per_axis=per_axis,
     )
     fe.feature_map_generator = FMGAdapter(qfmg, out_keys)
@@ -832,7 +777,6 @@ def quantize_detection_head(
         rebuild_box_predictor_functional(
             detection_model._box_predictor, feature_shapes
         ),
-        scheme=scheme,
         per_axis=per_axis,
     )
     detection_model._box_predictor = BoxPredictorAdapter(qbp, len(feature_shapes))

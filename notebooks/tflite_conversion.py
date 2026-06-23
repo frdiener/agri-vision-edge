@@ -21,7 +21,14 @@ def _(Path):
 
 
 @app.cell(hide_code=True)
-def configuration(ARTIFACTS_DIR, Path, json, load_pipeline_config, mo, model_root):
+def configuration(
+    ARTIFACTS_DIR,
+    Path,
+    json,
+    load_pipeline_config,
+    mo,
+    model_root,
+):
     try:
         _finetune_config = load_pipeline_config(
             Path(model_root.value) / "ptq" / "pipeline.config"
@@ -38,7 +45,7 @@ def configuration(ARTIFACTS_DIR, Path, json, load_pipeline_config, mo, model_roo
     )
 
     fp32_map = {}
-    for schema in ["ptq", "qat0", "qat1", "qat2", "qat3"]:
+    for schema in ["ptq", "qat", "qat_per-channel"]:
         try:
             fp32_map[schema] = json.loads(
                 (model_root.value / schema / "best_metric.json").read_text()
@@ -60,7 +67,6 @@ def configuration(ARTIFACTS_DIR, Path, json, load_pipeline_config, mo, model_roo
     - {quantization}
       {precision} {per_channel}
       {regular_nms}
-    - {eval_split}
     - {iou_threshold}
 
     """)
@@ -88,10 +94,7 @@ def configuration(ARTIFACTS_DIR, Path, json, load_pipeline_config, mo, model_roo
             quantization=mo.ui.dropdown(
                 options={
                     "Finetuned": "ptq",
-                    "Finetuned with full QAT": "qat0",
-                    "Finetuned with QAT (Quantized Weights only)": "qat1",
-                    "Finetuned with QAT (Prefolded Batchnorms)": "qat2",
-                    "Finetuned with full QAT (Backbone + Head)": "qat3",
+                    "Finetuned QAT": "qat",
                 },
                 value="Finetuned",
                 label="Checkpoint",
@@ -109,14 +112,6 @@ def configuration(ARTIFACTS_DIR, Path, json, load_pipeline_config, mo, model_roo
                 value=False,
                 label="Per Channel Quantization",
             ),
-            eval_split=mo.ui.radio(
-                options={
-                    "Eval (val split)": "val",
-                    "Test": "test",
-                },
-                value="Eval (val split)",
-                label="Eval on:",
-            ),
             regular_nms=mo.ui.switch(
                 value=False,
                 label="Regular (per-class) NMS",
@@ -130,7 +125,7 @@ def configuration(ARTIFACTS_DIR, Path, json, load_pipeline_config, mo, model_roo
                 label="NMS IoU Threshold",
             ),
         )
-        .form(bordered=False, submit_button_label="Convert & Evaluate")
+        .form(bordered=False, submit_button_label="Convert")
     )
 
     summary = mo.md(f"""
@@ -143,10 +138,8 @@ def configuration(ARTIFACTS_DIR, Path, json, load_pipeline_config, mo, model_roo
     | Labels | {("Single Class" if _finetune_config.model.ssd.num_classes == 1 else "Multi Class") if _finetune_config else "not found"} |
     | Resolution | {(_finetune_config.model.ssd.image_resizer.fixed_shape_resizer.width) if _finetune_config else "not found"} |
     | FP32 PTQ mAP | {fp32_map["ptq"]:.4f} |
-    | FP32 QAT0 mAP | {fp32_map["qat0"]:.4f} |
-    | FP32 QAT1 mAP | {fp32_map["qat1"]:.4f} |
-    | FP32 QAT2 mAP | {fp32_map["qat2"]:.4f} |
-    | FP32 QAT3 mAP | {fp32_map["qat3"]:.4f} |
+    | FP32 QAT mAP | {fp32_map["qat"]:.4f} |
+    | FP32 QAT_pc mAP | {fp32_map["qat_per-channel"]:.4f} |
     """)
 
     mo.hstack(
@@ -374,51 +367,30 @@ def _(
     ensure_model_is_built_for_qat(detection_model, PIPELINE_CONFIG)
 
     # Rebuild the exact QAT graph the checkpoint was trained with so the weights
-    # restore cleanly. Mirrors tfod_trainer.setup: (optionally) fold BatchNorms
-    # into the convs, then quantize_backbone with the per-dir scheme, then
-    # optionally quantize_detection_head for qat3.
-    # Scheme map is user-specified: qat0=default_8bit, qat1=weights, qat2=full;
-    # qat3 = full on backbone + head.
+    # restore cleanly. Mirrors tfod_trainer.setup: fold BatchNorms into the
+    # convs, quantize_backbone (full int8 scheme), then quantize_detection_head.
     qat_backbone = None
 
-    QAT_SCHEMES = {
-        "qat0": "full",  # full int8, backbone (unfolded)
-        "qat1": "weights",  # weight-only int8 (unfolded)
-        "qat2": "full",  # full int8, backbone (folded)
-        "qat3": "full",  # full int8, backbone + head (folded)
-    }
-
-    # BatchNorm folding per scheme -- MUST match the training notebooks' fold_bn.
-    # qat0/qat1 stay UNFOLDED to showcase the unfolded backbone's residual MUL/ADD
-    # nodes (the custom full/weights schemes annotate only convs and pass BN
-    # through, so they survive unfolded); qat2/qat3 fold. qat0 (full, unfolded) vs
-    # qat2 (full, folded) isolates the folding effect.
-    QAT_FOLD = {"qat0": False, "qat1": False, "qat2": True, "qat3": True}
-
     if config["quantization"] != "ptq":
-        scheme = QAT_SCHEMES[config["quantization"]]
-
-        # per_axis MUST match how the checkpoint was QAT-trained (it sets the
-        # fake-quant var shapes), so reuse the Per-Channel switch: False =
+        # per_axis MUST match how the checkpoint was QAT-trained (it selects the
+        # full-scheme variant), so reuse the Per-Channel switch: False =
         # per-tensor (i.MX8M Plus), True = per-channel (i.MX93 Ethos-U). The
         # same switch also drives the converter's _experimental_disable_per_channel.
         per_axis = config["per_channel"]
 
-        backbone = detection_model.feature_extractor.classification_backbone
-        if QAT_FOLD[config["quantization"]]:
-            backbone = fold(backbone)
-        qat_backbone = quantize_backbone(backbone, scheme=scheme, per_axis=per_axis)
+        backbone_folded = fold(
+            detection_model.feature_extractor.classification_backbone
+        )
+        qat_backbone = quantize_backbone(backbone_folded, per_axis=per_axis)
         detection_model.feature_extractor.classification_backbone = qat_backbone
 
-        if config["quantization"] == "qat3":
-            # Quantize the SSD head (feature maps + box predictor) in place;
-            # must run after the backbone is folded + quantized.
-            quantize_detection_head(
-                detection_model,
-                config["resolution"],
-                scheme="full",
-                per_axis=per_axis,
-            )
+        # Quantize the SSD head (feature maps + box predictor) in place; must
+        # run after the backbone is folded + quantized.
+        quantize_detection_head(
+            detection_model,
+            config["resolution"],
+            per_axis=per_axis,
+        )
 
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
     detection_module = SSDModule(
@@ -441,13 +413,6 @@ def _(
             name="input",
         )
     )
-
-    # backbone = detection_model.feature_extractor.classification_backbone
-    # folded_backbone = fold(backbone)
-    # qat_backbone = quantize_backbone(
-    #     folded_backbone,
-    #     scheme="full"
-    # )
     return concrete_function, detection_module, qat_backbone
 
 
@@ -522,7 +487,7 @@ def tflite_conversion(
 
         converter.representative_dataset = _normalized_rep_dataset
 
-        converter._experimental_new_quantizer = False
+        # converter._experimental_new_quantizer = False
         converter._experimental_disable_per_channel = not config["per_channel"]
 
     elif config["precision"] == "fp32":
@@ -676,23 +641,56 @@ def _(interpreter, np):
 
 
 @app.cell(hide_code=True)
+def _(mo):
+    # Evaluation is gated behind its own form so conversion can run on its own
+    # (convert + write tflite + metadata) without immediately benchmarking. Pick
+    # the split and click "Run Evaluation" to benchmark + score the model.
+    eval_form = (
+        mo.md("""
+    **Evaluation**
+
+    - {eval_split}
+    """)
+        .batch(
+            eval_split=mo.ui.radio(
+                options={
+                    "Eval (val split)": "val",
+                    "Test": "test",
+                },
+                value="Eval (val split)",
+                label="Eval on:",
+            ),
+        )
+        .form(bordered=False, submit_button_label="Run Evaluation")
+    )
+    eval_form
+    return (eval_form,)
+
+
+@app.cell(hide_code=True)
 def _(
     MODEL_FILE_PATH,
     Path,
     TFLiteRuntime,
     benchmark_runtime,
-    config,
     dataset_dir,
     dataset_raw_dir,
+    eval_form,
     load_coco_images,
+    mo,
     save_benchmark_artifacts,
     socket,
     written,
 ):
+    mo.stop(
+        eval_form.value is None,
+        mo.md("_Select a split above and click **Run Evaluation**._"),
+    )
     assert written and MODEL_FILE_PATH.exists()
 
     # eval_split: "val" (the split used for the checkpoint metric) or "test".
-    annotations_path = dataset_dir / f"{config['eval_split']}_annotations.json"
+    eval_split = eval_form.value["eval_split"]
+    annotations_path = dataset_dir / f"{eval_split}_annotations.json"
     image_records = load_coco_images(
         dataset_raw_dir / "val/images/",
         annotations_path,
@@ -701,7 +699,7 @@ def _(
     output_dir = (
         Path("./benchmark_results/")
         / f"{socket.gethostname()}"
-        / (MODEL_FILE_PATH.stem + f"_{config['eval_split']}")
+        / (MODEL_FILE_PATH.stem + f"_{eval_split}")
     )
 
     print(f"\n=== Benchmarking: {MODEL_FILE_PATH.name} ===")
