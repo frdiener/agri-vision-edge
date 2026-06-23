@@ -1,0 +1,322 @@
+#+TITLE: Bachelor Thesis Proposal
+#+AUTHOR: Freimut Diener
+#+DATE: <2026-05-10 So>
+#+OPTIONS: toc:nil num:t
+#+LATEX_CLASS: article
+#+LATEX_CLASS_OPTIONS: [11pt,a4paper]
+
+#+LATEX_HEADER: \usepackage{enumitem}
+#+LATEX_HEADER: \setlist{nosep}
+
+#+LATEX_HEADER: \usepackage{parskip}
+#+LATEX_HEADER: \setlength{\parskip}{0.2em}
+#+LATEX_HEADER: \setlength{\parindent}{0pt}
+
+#+LATEX_HEADER: \usepackage{titlesec}
+#+LATEX_HEADER: \titlespacing*{\section}{0pt}{1.2ex}{0.6ex}
+#+LATEX_HEADER: \titlespacing*{\subsection}{0pt}{1.0ex}{0.4ex}
+#+LATEX_HEADER: \titlespacing*{\subsubsection}{0pt}{0.8ex}{0.3ex}
+
+#+LATEX_HEADER: \linespread{0.97}
+
+* Working Title
+
+Evaluation of Quantized Lightweight Object Detection Architectures on Embedded NPUs for Agricultural Applications
+
+* Abstract
+
+Embedded machine learning systems increasingly rely on lightweight object detection models deployed on specialized Neural Processing Units (NPUs). While modern object detection architectures often report strong benchmark accuracy, their practical deployment behavior on embedded accelerators differs substantially depending on graph topology, quantization compatibility, delegated execution continuity, and runtime partitioning behavior.
+
+This thesis investigates deployment-oriented characteristics of lightweight object detection architectures on heterogeneous embedded NPU platforms using a unified TensorFlow Lite deployment stack based on Mesa/Teflon delegates. The study focuses on TensorFlow Lite-compatible lightweight detectors intended for embedded edge inference, specifically SSD MobileNetV2 and SSD MobileNetV2 FPNLite.
+
+The selected models will be evaluated on two embedded platforms: the NXP i.MX8M Plus featuring a VeriSilicon/Vivante NPU and the NXP i.MX93 featuring an Arm Ethos-U65 NPU.
+
+The primary research objective is to analyze how lightweight feature-fusion complexity and INT8 quantization behavior influence delegated execution continuity, graph partitioning behavior, runtime latency, and deployment efficiency across heterogeneous embedded NPUs.
+
+All evaluated models will be fine-tuned on an agricultural weed detection dataset and deployed as TensorFlow Lite INT8 models using post-training quantization (PTQ) and quantization-aware training (QAT) workflows.
+
+The thesis aims to provide practical insights into deployment-oriented model selection for embedded vision systems and to identify architectural and quantization characteristics that improve continuous accelerator delegation and runtime stability on resource-constrained edge AI platforms.
+
+* Motivation
+
+Modern object detection research is frequently optimized for benchmark accuracy rather than practical embedded deployment efficiency. Architectures containing complex feature fusion structures, repeated tensor reshaping operations, fragmented execution paths, or quantization-sensitive operators may achieve higher detection accuracy while simultaneously reducing accelerator utilization and increasing CPU fallback execution.
+
+In constrained embedded systems, especially low-power agricultural and robotic edge devices, continuous delegated INT8 execution is critical for achieving acceptable latency, thermal behavior, energy efficiency, and predictable runtime performance.
+
+Quantization therefore becomes not only a model compression technique, but also a deployment constraint that directly influences delegated execution continuity and runtime fragmentation behavior on embedded NPUs.
+
+The selected hardware platforms represent two different embedded NPU design philosophies:
+
+- The NXP i.MX8M Plus uses a VeriSilicon/Vivante NPU optimized for convolution-heavy delegated execution using TensorFlow Lite delegates.
+- The NXP i.MX93 uses an Arm Ethos-U65 NPU integrated into the TensorFlow Lite and Vela compiler ecosystem with advanced SRAM-aware scheduling and delegated execution support.
+
+Using a shared TensorFlow Lite deployment stack based on Mesa/Teflon delegates allows architectural and hardware differences to be studied under largely controlled software conditions.
+
+* Research Objectives
+
+The thesis is motivated by challenges in precision agriculture and embedded edge AI deployment. Weed management in agricultural environments often relies on broad herbicide application, resulting in unnecessary environmental impact and increased operational cost.
+
+Real-time weed detection on low-power embedded systems enables site-specific weed management and supports autonomous agricultural robotics applications.
+
+The work focuses on practical embedded deployment constraints rather than purely maximizing benchmark accuracy. Particular emphasis is placed on:
+
+- Continuous delegated execution
+- INT8 quantization compatibility
+- Runtime graph partitioning
+- Embedded deployment stability
+- Compatibility with open-source edge AI software stacks
+
+The thesis aims to answer the following research questions:
+
+1. How does lightweight feature-fusion complexity affect delegated INT8 execution continuity on embedded NPUs?
+2. How do PTQ and QAT influence quantized deployment behavior and delegated execution continuity?
+3. How do heterogeneous embedded NPUs differ in graph partitioning and fallback execution behavior?
+4. What deployment tradeoffs emerge between contiguous SSD-style architectures and lightweight feature-fusion variants?
+5. Which architectural and quantization characteristics improve deployment efficiency under TensorFlow Lite delegated execution?
+
+* Scope of Work
+
+The thesis focuses on deployment-oriented evaluation of lightweight object detection models under realistic embedded Linux conditions.
+
+The implementation environment is based on an open-source software stack consisting of:
+
+- Linux mainline-based userspace
+- TensorFlow Lite inference
+- Mesa/Teflon delegate integration
+- Wayland/Weston-based display infrastructure
+- Open-source deployment and benchmarking tooling
+
+The work emphasizes reproducibility and portability by avoiding proprietary vendor-specific SDK optimization wherever possible.
+
+The scope of the thesis includes:
+
+- Fine-tuning lightweight object detection models for weed detection
+- INT8 TensorFlow Lite deployment
+- PTQ and QAT evaluation
+- Real-time embedded video inference
+- Evaluation of delegated execution continuity
+- Comparative analysis of runtime and deployment characteristics
+
+The thesis does not include:
+
+- Development of entirely new object detection architectures
+- Large-scale training methodology research
+- Proprietary vendor SDK optimization
+- Cloud or server-class accelerator deployment
+
+* Selected Architectures
+
+** SSD MobileNetV2
+
+SSD MobileNetV2 represents a lightweight contiguous object detection architecture optimized for mobile and embedded deployment. The architecture contains relatively simple graph topology with minimal feature-fusion complexity and is expected to achieve high delegated execution continuity.
+
+Expected characteristics:
+
+- Simple graph topology
+- High INT8 compatibility
+- Minimal graph fragmentation
+- Low runtime latency
+- Strong deployment stability
+
+** SSD MobileNetV2 FPNLite
+
+SSD MobileNetV2 FPNLite extends the baseline architecture using lightweight feature pyramid fusion layers. This introduces additional multi-scale feature aggregation while maintaining relatively low computational complexity.
+
+Expected characteristics:
+
+- Increased feature-fusion complexity
+- Higher graph partitioning sensitivity
+- Improved multi-scale detection capability
+- Potentially reduced delegated execution continuity
+- Increased memory pressure
+- Increased quantization sensitivity
+
+* Hardware Platforms
+
+** NXP i.MX8M Plus
+
+- Integrated VeriSilicon/Vivante NPU
+- Embedded Linux environment
+- TensorFlow Lite deployment via Mesa/Teflon delegates
+- Expected sensitivity to graph fragmentation and unsupported operators
+
+** NXP i.MX93
+
+- Arm Ethos-U65 NPU
+- TensorFlow Lite integration with Vela compiler support
+- Advanced SRAM-aware scheduling and delegated execution behavior
+- Expected improved handling of partitioned execution
+
+* Theoretical Background
+
+The theoretical section of the thesis will cover:
+
+- Precision agriculture and automated weed detection
+- Fundamentals of object detection and evaluation metrics
+- Lightweight CNN architectures for embedded inference
+- TensorFlow Lite delegated execution
+- Embedded NPUs and heterogeneous acceleration
+- INT8 quantization and deployment constraints
+- Post-training quantization (PTQ)
+- Quantization-aware training (QAT)
+- TensorFlow Lite delegates and graph partitioning
+- Runtime graph partition continuity
+- Linux-based embedded video processing pipelines
+
+Particular emphasis will be placed on understanding how graph topology and quantization behavior affect delegated execution continuity on embedded accelerators.
+
+* Related Work
+
+The related work section will review:
+
+- Existing weed detection systems using deep learning
+- Embedded inference studies in agricultural robotics
+- Lightweight object detection architectures for edge AI
+- TensorFlow Lite deployment pipelines
+- Studies on delegated execution and graph partitioning
+- Quantized deployment workflows for embedded inference
+- Previous deployment studies on NXP embedded platforms
+
+The thesis specifically aims to address the limited availability of open-source deployment evaluations using TensorFlow Lite delegates and Mesa/Teflon on modern embedded NPUs.
+
+* Methodology
+
+** Dataset Preparation
+
+The thesis will use the PhenoBench dataset for training and evaluation. PhenoBench provides agricultural field imagery suitable for crop and weed detection tasks and is distributed under a CC-BY license, making it suitable for commercial and industrial evaluation scenarios.
+
+The dataset was selected because:
+
+- It provides realistic agricultural imagery for embedded weed detection research.
+- Its size remains manageable for transfer learning and fine-tuning using publicly available cloud compute resources.
+- It includes a test set with unpublished labels.
+- It supports an ongoing benchmark competition, allowing optional submission of trained models for external evaluation.
+
+Dataset preparation includes:
+
+- Dataset conversion into TensorFlow Lite-compatible training formats
+- Annotation verification and normalization
+- Training and validation split preparation
+- Augmentation pipeline definition
+
+** Model Training
+
+The selected lightweight object detection architectures will be fine-tuned using pretrained checkpoints and transfer learning workflows.
+
+Due to the absence of dedicated institutional GPU infrastructure, model training and fine-tuning will be performed using publicly available cloud-based notebook environments such as Kaggle Notebooks and Google Colab.
+
+The training workflow therefore emphasizes:
+
+- Lightweight architectures suitable for constrained training resources
+- Efficient transfer learning from pretrained checkpoints
+- Reproducible notebook-based training environments
+- Practical training durations compatible with limited cloud compute quotas
+
+Training pipeline characteristics include:
+
+- Transfer learning from pretrained lightweight detection checkpoints
+- TensorFlow Lite-compatible export workflows
+- Fixed input resolution
+- Comparable augmentation settings
+- Identical dataset splits
+
+The embedded hardware platforms required for deployment and benchmarking will be provided by the industrial project partner.
+
+** Quantization and Export
+
+Models will be exported to TensorFlow Lite INT8 format using both post-training quantization (PTQ) and quantization-aware training (QAT) workflows.
+
+The deployment pipeline includes:
+
+- Post-training quantization
+- Quantization-aware fine-tuning for selected architectures
+- Representative dataset calibration
+- Static input resolution
+- TensorFlow Lite export
+- Delegate compatibility validation
+
+The study will additionally evaluate how PTQ and QAT influence delegated execution continuity, graph fragmentation, and runtime stability on embedded NPUs.
+
+** Deployment Evaluation
+
+Both models will be deployed on both hardware platforms using the TensorFlow Lite Mesa/Teflon deployment stack.
+
+Evaluation metrics include:
+
+- Detection accuracy
+- End-to-end inference latency
+- Frames per second
+- Delegated operator percentage
+- Delegated subgraph continuity
+- Graph partition count
+- CPU fallback behavior
+- Quantization-induced accuracy degradation
+- PTQ versus QAT recovery behavior
+- Power consumption
+- Memory utilization
+- Runtime stability
+
+** Runtime Pipeline
+
+The runtime application will perform:
+
+- Real-time video capture
+- TensorFlow Lite inference
+- Bounding box extraction
+- Bounding box rendering
+- Runtime metric logging
+
+* Expected Contributions
+
+The thesis is expected to contribute:
+
+- A deployment-oriented comparison of lightweight object detection architectures
+- Analysis of feature-fusion effects on delegated execution continuity
+- Evaluation of PTQ and QAT under embedded deployment constraints
+- Cross-platform comparison between heterogeneous embedded NPUs
+- Practical deployment recommendations for embedded vision systems
+- Insights into TensorFlow Lite delegate behavior under embedded INT8 execution constraints
+- Evaluation of graph topology and quantization effects on embedded accelerator utilization
+
+* Preliminary Timeline
+
+| Phase                                   | Duration |
+|-----------------------------------------+----------|
+| Literature review and environment setup | 2 weeks  |
+| Dataset preparation and preprocessing   | 2 weeks  |
+| Model fine-tuning and validation        | 2 weeks  |
+| Quantization and TensorFlow Lite export | 2 weeks  |
+| Embedded deployment integration         | 2 weeks  |
+| Benchmarking and evaluation             | 2 weeks  |
+| Thesis writing and revision             | 2 weeks  |
+
+* Preliminary Literature
+
+1. Sandler, M. et al. MobileNetV2: Inverted Residuals and Linear Bottlenecks.
+2. Lin, T.-Y. et al. Feature Pyramid Networks for Object Detection.
+3. Jacob, B. et al. Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference.
+4. TensorFlow Lite documentation and delegate architecture documentation.
+5. Arm Ethos-U Vela documentation.
+6. NXP i.MX8M Plus technical documentation.
+7. NXP i.MX93 technical documentation.
+8. Literature on embedded neural network inference and TensorFlow Lite delegated execution.
+
+* Example Deployment Invocation
+
+The following example illustrates the intended TensorFlow Lite deployment structure.
+
+#+begin_src bash
+python detect.py \
+  --model weed_detector_int8.tflite \
+  --camera /dev/video0 \
+  --delegate teflon \
+  --input_size 320x320
+#+end_src
+
+* Expected Outcome
+
+The thesis is expected to demonstrate how lightweight feature-fusion mechanisms and quantization strategies influence embedded NPU deployment efficiency under TensorFlow Lite delegated execution.
+
+The results should identify architectural and quantization characteristics that improve continuous INT8 delegated execution while preserving acceptable object detection accuracy for embedded weed detection applications.
+
+Additionally, the thesis aims to provide practical insights into how lightweight detection architectures interact with heterogeneous embedded NPUs and open-source TensorFlow Lite delegate ecosystems.
