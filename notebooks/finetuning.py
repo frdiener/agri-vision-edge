@@ -55,7 +55,7 @@ def _(mo):
         dataset_bundle_path="datasets/phenobench_sc_tiled",
         num_classes=1,
         output_dir="runs/finetune",
-        qat_scheme="full",   # omit / None for a plain finetune
+        qat=True,   # omit for a plain finetune (-> PTQ at conversion)
     ))
     ```
 
@@ -97,10 +97,10 @@ def _(mo):
             - {learning_rate_base} {image_size}
             - {early_stopping_patience}
 
-            **Quantization-aware training** (leave scheme empty for a plain finetune)
+            **Quantization-aware training** (leave off for a plain finetune)
 
-            - {qat_scheme} {quantize_head}
-            - {fold_bn} {reset_optimizer}
+            - {qat} {qat_per_channel}
+            - {reset_optimizer}
             """
         )
         .batch(
@@ -131,23 +131,13 @@ def _(mo):
             early_stopping_patience=mo.ui.number(
                 value=50, start=1, stop=10000, label="Early-stop patience"
             ),
-            qat_scheme=mo.ui.dropdown(
-                options={
-                    "None (plain finetune)": None,
-                    "full (int8 QAT)": "full",
-                    "weights only": "weights",
-                },
-                value="None (plain finetune)",
-                label="QAT scheme",
-            ),
-            quantize_head=mo.ui.checkbox(
+            qat=mo.ui.switch(
                 value=False,
-                label="Quantize head too (feature maps + box predictor; QAT only)",
+                label="QAT (full int8: fold BN + fake-quant backbone + head)",
             ),
-            fold_bn=mo.ui.dropdown(
-                options={"Auto (on for QAT)": None, "On": True, "Off": False},
-                value="Auto (on for QAT)",
-                label="Fold BatchNorm",
+            qat_per_channel=mo.ui.switch(
+                value=False,
+                label="Per-channel weights (i.MX93 Ethos-U; off = per-tensor, i.MX8M Plus)",
             ),
             reset_optimizer=mo.ui.dropdown(
                 options={"Auto (on for QAT)": None, "On": True, "Off": False},
@@ -187,9 +177,8 @@ def _(FineTuneConfig, FinetuneRunConfig, OVERRIDE, form, mo):
                 image_size=int(v["image_size"]),
                 early_stopping_patience=int(v["early_stopping_patience"]),
             ),
-            qat_scheme=v["qat_scheme"],
-            quantize_head=bool(v["quantize_head"]),
-            fold_bn=v["fold_bn"],
+            qat=bool(v["qat"]),
+            qat_per_channel=bool(v["qat_per_channel"]),
             reset_optimizer=v["reset_optimizer"],
         )
     return (run_config,)
@@ -209,9 +198,8 @@ def _(mo, run_config):
     | Steps | {run_config.finetune.num_steps} |
     | Batch | {run_config.finetune.batch_size} |
     | Image size | {run_config.finetune.image_size} |
-    | QAT scheme | {run_config.qat_scheme} |
-    | Quantize head | {run_config.quantize_head} |
-    | Fold BN | {run_config.fold_bn} |
+    | QAT | {run_config.qat} |
+    | Per-channel | {run_config.qat_per_channel} |
     | Pipeline → | `{run_config.pipeline_config_path}` |
     | Train dir → | `{run_config.train_dir}` |
     """)
@@ -249,8 +237,8 @@ def _(json, mo, result):
 
         - Pipeline: `{result.pipeline_config}`
         - Checkpoints: `{result.train_dir}`
-        - Best metric: **{best['metric_value']:.5f}** ({best['metric_name']})
-          at step {best['step']}
+        - Best metric: **{best["metric_value"]:.5f}** ({best["metric_name"]})
+          at step {best["step"]}
         """
         if best
         else f"""
@@ -288,13 +276,15 @@ def _(mo, result):
     recall_fig, _ = plot_recall_curves(history_df)
     lr_fig, _ = plot_learning_rate(history_df)
 
-    mo.vstack([
-        mo.md("## Training curves"),
-        mo.as_html(loss_fig),
-        mo.as_html(map_fig),
-        mo.as_html(recall_fig),
-        mo.as_html(lr_fig),
-    ])
+    mo.vstack(
+        [
+            mo.md("## Training curves"),
+            mo.as_html(loss_fig),
+            mo.as_html(map_fig),
+            mo.as_html(recall_fig),
+            mo.as_html(lr_fig),
+        ]
+    )
     return
 
 
@@ -314,9 +304,7 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(mo):
-    export_button = mo.ui.run_button(
-        label="Export best checkpoint + SavedModel"
-    )
+    export_button = mo.ui.run_button(label="Export best checkpoint + SavedModel")
     export_button
     return (export_button,)
 
@@ -351,7 +339,7 @@ def _(export_result, mo, run_config):
         dataset_bundle_path="{run_config.dataset_bundle_path}",
         num_classes={run_config.num_classes},
         output_dir="runs/qat",
-        qat_scheme="full",
+        qat=True,
     ))
     ```
     """)

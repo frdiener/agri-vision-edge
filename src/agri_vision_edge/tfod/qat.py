@@ -4,14 +4,14 @@ Quantization-aware training utilities for folded TFOD MobileNetV2 backbones.
 The deployment accelerators want a fully int8 graph, so the single ``full``
 scheme here annotates ONLY Conv2D / DepthwiseConv2D layers (plus, for the
 per-channel target, the ReLU6 / residual-Add layers) and pins the activation
-ranges explicitly. It has two variants chosen by ``per_axis`` (the target's
+ranges explicitly. It has two variants chosen by ``per_channel`` (the target's
 weight granularity); both quantize activations and use per-TENSOR weight
 fake-quant -- per-channel weights, when wanted, are produced by the CONVERTER,
 never by per-channel fake-quant (which breaks the converter's int8 calibration):
 
-    * per_axis=False (i.MX8M Plus): pin [0,6] ON THE CONV (self-contained op) so
-      weights stay per-tensor.
-    * per_axis=True  (i.MX93 Ethos-U): convs feeding ReLU6 are weight-only and
+    * per_channel=False (i.MX8M Plus): pin [0,6] ON THE CONV (self-contained op)
+      so weights stay per-tensor.
+    * per_channel=True  (i.MX93 Ethos-U): convs feeding ReLU6 are weight-only and
       the ReLU6 *layer* + residual Add carry the pins, so TFLite is free to emit
       per-channel weights.
 
@@ -52,22 +52,19 @@ class BaseQuantConfig(
 ):
     """
     Shared quantization configuration for convolutional layers.
-    """
 
-    def __init__(
-        self,
-        *,
-        per_axis: bool,
-        symmetric: bool,
-    ):
-        self.per_axis = per_axis
-        self.symmetric = symmetric
+    The weight fake-quant is ALWAYS per-tensor (symmetric, narrow range): baking
+    per-channel weight fake-quant into the graph breaks the TFLite converter's
+    int8 calibration. Per-channel weights, when wanted, are emitted by the
+    CONVERTER (weight-only convs + ``_experimental_disable_per_channel=False``),
+    not here -- see ``_quantize_backbone_full``.
+    """
 
     def _weight_quantizer(self):
         return tfmot.quantization.keras.quantizers.LastValueQuantizer(
             num_bits=8,
-            per_axis=self.per_axis,
-            symmetric=self.symmetric,
+            per_axis=False,
+            symmetric=True,
             narrow_range=True,
         )
 
@@ -111,14 +108,11 @@ class BaseQuantConfig(
             layer.kernel = quantize_weights[0]
 
     def get_config(self):
-        return {
-            "per_axis": self.per_axis,
-            "symmetric": self.symmetric,
-        }
+        return {}
 
     @classmethod
     def from_config(cls, config):
-        return cls(**config)
+        return cls()
 
 
 @register_keras_serializable()
@@ -376,24 +370,23 @@ def _is_relu6(layer):
 def _quantize_backbone_full(
     backbone,
     *,
-    per_axis: bool,
-    symmetric: bool,
+    per_channel: bool,
 ):
     """
     Full-int8 scheme. Each conv is quantized by what its output actually is, and
     the only fixed [0, 6] pin lands where it survives TFLite fusion. There are
-    two variants, selected by ``per_axis`` (the deployment target's weight
+    two variants, selected by ``per_channel`` (the deployment target's weight
     granularity), because forcing per-tensor and allowing per-channel need the
     [0, 6] pin in DIFFERENT places:
 
-    PER-TENSOR target (``per_axis=False``, i.MX8M Plus / stock delegate):
+    PER-TENSOR target (``per_channel=False``, i.MX8M Plus / stock delegate):
       * conv feeding a ReLU6 -> ReLU6ConvQuantConfig: weights + a fixed [0, 6]
         output quantizer ON THE CONV, making it a self-contained quantized op so
         TFLite keeps PER-TENSOR weights through the conv+ReLU6 fusion.
       * signed (linear) conv -> SignedConvQuantConfig (weights + AllValues).
       * ReLU6 / Add layers   -> left float (fused into the conv).
 
-    PER-CHANNEL target (``per_axis=True``, i.MX93 Ethos-U):
+    PER-CHANNEL target (``per_channel=True``, i.MX93 Ethos-U):
       * conv feeding a ReLU6 -> WeightOnlyQuantConfig (NO conv-output pin), so
         TFLite is free to emit PER-CHANNEL weights for it.
       * ReLU6 layer          -> ReLU6OutputConfig: fixed [0, 6] on the ReLU6
@@ -402,28 +395,26 @@ def _quantize_backbone_full(
       * residual Add         -> AddOutputConfig (signed AllValues): closes the
         fake-quant coverage gap left by the weight-only convs.
 
-    IMPORTANT: in BOTH variants the weight FAKE-QUANT is per-tensor
-    (LastValueQuantizer per_axis=False). Per-channel weights are produced by the
-    CONVERTER (weight-only convs + ``_experimental_disable_per_channel=False``),
-    NOT by per-channel fake-quant nodes -- baking
+    IMPORTANT: the weight FAKE-QUANT is per-tensor in BOTH variants (see
+    BaseQuantConfig). Per-channel weights are produced by the CONVERTER
+    (weight-only convs + ``_experimental_disable_per_channel=False``), NOT by
+    per-channel fake-quant nodes -- baking
     ``fake_quant_with_min_max_vars_per_channel`` into the graph makes the TFLite
     int8 calibration collect ~0 activation ranges and collapses AP (fp32 stays
-    fine). This is why the per-channel path uses the weight-only / layer-pin
-    scheme rather than per-axis fake-quant.
+    fine). So ``per_channel`` only chooses the pin placement; it never changes
+    the fake-quant granularity.
     """
 
     relu6_fed = _relu6_fed_conv_names(backbone)
 
-    # Weight fake-quant is ALWAYS per-tensor (see docstring); per-channel is a
-    # converter decision, not a fake-quant one.
-    signed_cfg = SignedConvQuantConfig(per_axis=False, symmetric=symmetric)
+    signed_cfg = SignedConvQuantConfig()
 
-    if per_axis:
-        relu6_conv_cfg = WeightOnlyQuantConfig(per_axis=False, symmetric=symmetric)
+    if per_channel:
+        relu6_conv_cfg = WeightOnlyQuantConfig()
         relu6_layer_cfg = ReLU6OutputConfig()
         add_cfg = AddOutputConfig()
     else:
-        relu6_conv_cfg = ReLU6ConvQuantConfig(per_axis=False, symmetric=symmetric)
+        relu6_conv_cfg = ReLU6ConvQuantConfig()
         relu6_layer_cfg = None
         add_cfg = None
 
@@ -444,13 +435,13 @@ def _quantize_backbone_full(
         # Per-channel scheme only: pin the ReLU6 layer output and the residual
         # Add output (the per-tensor scheme leaves these float -- the conv owns
         # the pin there).
-        if per_axis and _is_relu6(layer):
+        if per_channel and _is_relu6(layer):
             return tfmot.quantization.keras.quantize_annotate_layer(
                 layer,
                 quantize_config=relu6_layer_cfg,
             )
 
-        if per_axis and isinstance(layer, tf.keras.layers.Add):
+        if per_channel and isinstance(layer, tf.keras.layers.Add):
             return tfmot.quantization.keras.quantize_annotate_layer(
                 layer,
                 quantize_config=add_cfg,
@@ -479,29 +470,24 @@ def _quantize_backbone_full(
 def quantize_backbone(
     backbone,
     *,
-    per_axis: bool = False,
-    symmetric: bool = True,
+    per_channel: bool = False,
 ):
     """
     Convert a backbone model to a QAT-enabled model (the full int8 scheme).
 
-    ``per_axis`` selects the deployment target's weight granularity:
-    per_axis=False pins [0,6] on the conv (forces per-tensor weights, i.MX8M
-    Plus); per_axis=True leaves relu6-fed convs weight-only and pins the ReLU6
-    layer + residual Add (lets the converter emit per-channel weights, i.MX93
-    Ethos-U). Both keep signed convs as weights + AllValues and use per-tensor
-    weight fake-quant. See _quantize_backbone_full.
+    ``per_channel`` selects the deployment target's weight granularity:
+    False pins [0,6] on the conv (forces per-tensor weights, i.MX8M Plus); True
+    leaves relu6-fed convs weight-only and pins the ReLU6 layer + residual Add
+    (lets the converter emit per-channel weights, i.MX93 Ethos-U). It only
+    chooses the pin placement -- the weight fake-quant is per-tensor either way.
+    See _quantize_backbone_full.
 
     NOTE: with correct [-1, 1] calibration plain PTQ already lands near fp32 on
     this model, so QAT is robustness insurance rather than an accuracy
     requirement.
     """
 
-    return _quantize_backbone_full(
-        backbone,
-        per_axis=per_axis,
-        symmetric=symmetric,
-    )
+    return _quantize_backbone_full(backbone, per_channel=per_channel)
 
 
 def ensure_model_is_built_for_qat(detection_model, pipeline_config):
@@ -635,6 +621,14 @@ def rebuild_feature_map_generator_functional(fmg, feature_specs):
         else:
             fm = fmaps[-1]
             for layer in fmg.convolutions[index]:
+                # Mirror the backbone fold (_clone_or_replace_layer): swap the
+                # ReLU6 Lambda for an explicit keras.layers.ReLU (same name, no
+                # weights). TFLite fuses conv + keras-ReLU6 into one op, but a
+                # conv + Lambda(relu6) does NOT fuse -- it leaves a
+                # dequant->relu6->quant sandwich in the head that the NPU
+                # delegate cannot consume.
+                if isinstance(layer, tf.keras.layers.Lambda) and _is_relu6(layer):
+                    layer = tf.keras.layers.ReLU(max_value=6.0, name=layer.name)
                 fm = layer(fm)
         fmaps.append(fm)
     return tf.keras.Model(inputs=inp, outputs=fmaps)
@@ -738,14 +732,49 @@ class BoxPredictorAdapter(tf.keras.layers.Layer):
         }
 
 
-def quantize_detection_head(detection_model, image_size, *, per_axis=False):
+def _quantize_weights_only(model):
+    """
+    Annotate every conv weight-only (no output fake-quant) and quantize_apply.
+
+    Used for the SSD box predictor: its 1x1 box/class convs feed reshape ->
+    CONCAT (across feature maps) -> the float TFLite_Detection_PostProcess.
+    Pinning each conv's output scale (the full scheme's AllValues) gives the six
+    feature maps SIX different scales, so the converter has to insert a requant
+    QUANTIZE on five of them before the concat -- stray ops that the NPU delegate
+    cannot consume (it trips). Leaving the output scale FREE (weight-only) lets
+    the converter align all concat inputs to one scale, exactly like PTQ, so the
+    graph stays fully fused (no stray QUANTIZE). Weights are still QAT-trained;
+    per-tensor vs per-channel weight emission is the converter's call
+    (``_experimental_disable_per_channel``).
+    """
+    cfg = WeightOnlyQuantConfig()
+
+    def clone_function(layer):
+        if isinstance(layer, (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D)):
+            return tfmot.quantization.keras.quantize_annotate_layer(
+                layer, quantize_config=cfg
+            )
+        return layer
+
+    with tfmot.quantization.keras.quantize_scope(
+        {"WeightOnlyQuantConfig": WeightOnlyQuantConfig}
+    ):
+        return tfmot.quantization.keras.quantize_apply(
+            tf.keras.models.clone_model(model, clone_function=clone_function)
+        )
+
+
+def quantize_detection_head(detection_model, image_size, *, per_channel=False):
     """
     Quantize the SSD head (feature_map_generator + box predictor) in place via
     weight-preserving functional rebuilds, so QAT covers the whole graph up to
     the postprocess. Call AFTER the backbone has been folded + quantized.
 
-    ``per_axis`` matches the backbone: False = per-tensor weights, True =
-    per-channel (must agree with how the backbone was quantized).
+    ``per_channel`` must match the backbone (it selects the same pin placement
+    for the feature-map generator's full scheme). The box predictor is always
+    quantized weight-only (see _quantize_weights_only -- pinning its output
+    scales would force stray requant QUANTIZE ops at the concat that trip the
+    NPU delegate).
 
     Specific to the plain SSD MobileNetV2 head; raises if the structure differs.
     """
@@ -769,15 +798,12 @@ def quantize_detection_head(detection_model, image_size, *, per_axis=False):
 
     qfmg = quantize_backbone(
         fold_functional(rebuild_feature_map_generator_functional(fmg, feature_specs)),
-        per_axis=per_axis,
+        per_channel=per_channel,
     )
     fe.feature_map_generator = FMGAdapter(qfmg, out_keys)
 
-    qbp = quantize_backbone(
-        rebuild_box_predictor_functional(
-            detection_model._box_predictor, feature_shapes
-        ),
-        per_axis=per_axis,
+    qbp = _quantize_weights_only(
+        rebuild_box_predictor_functional(detection_model._box_predictor, feature_shapes)
     )
     detection_model._box_predictor = BoxPredictorAdapter(qbp, len(feature_shapes))
 

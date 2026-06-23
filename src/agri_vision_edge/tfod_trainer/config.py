@@ -5,23 +5,7 @@ Configuration objects for TFOD training.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
-
-
-class QATScheme(str, Enum):
-    """
-    Backbone quantization schemes supported by
-    ``agri_vision_edge.tfod.qat.quantize_backbone``.
-    """
-
-    # Custom QuantizeConfig schemes.
-    WEIGHTS = "weights"
-    FULL = "full"
-
-    # TFMOT Default8BitQuantizeScheme variants.
-    DEFAULT_8BIT = "default_8bit"
-    ANNOTATE_ALL = "annotate_all"
 
 
 @dataclass(slots=True)
@@ -48,40 +32,18 @@ class TrainerConfig:
 
     reset_optimizer: bool = False
 
-    # Fold BatchNorm into the preceding convolutions before training
-    # (mirrors `fold_bn` in object_detection.model_lib_v2.train_loop).
-    fold_bn: bool = False
+    # Enable quantization-aware training. False = plain finetune (-> PTQ at
+    # conversion). True = the full int8 scheme: BatchNorms folded into the convs,
+    # backbone + SSD head fake-quantized up to the float postprocess (see
+    # agri_vision_edge.tfod.qat). The only QAT variant we keep.
+    qat: bool = False
 
-    # Backbone quantization scheme, or None to disable QAT
-    # (mirrors `qat_backbone` in train_loop).
-    qat_scheme: QATScheme | None = None
-
-    # When QAT is enabled, also quantize the SSD head (feature_map_generator +
-    # box predictor) via weight-preserving functional rebuilds, so the whole
-    # graph up to the float postprocess is fake-quantized. EXPERIMENTAL: only
-    # the plain SSD MobileNetV2 head is supported; training of the spliced
-    # model is not yet validated end-to-end.
-    quantize_head: bool = False
-
-    # Per-channel (per-axis) weight quantization for QAT. Default False =
-    # per-tensor (required by the i.MX8M Plus Vivante/Teflon NPU). Set True for
-    # targets that accept per-channel weights (i.MX93 Arm Ethos-U65), where it
-    # is usually a touch more accurate. Maps to `per_axis` on quantize_backbone.
+    # Per-channel weight quantization for QAT. Default False = per-tensor
+    # (required by the i.MX8M Plus Vivante/Teflon NPU). Set True for targets that
+    # accept per-channel weights (i.MX93 Arm Ethos-U65), where it is usually a
+    # touch more accurate. Maps to `per_channel` on quantize_backbone (it selects
+    # the pin placement; the converter, not the fake-quant, emits per-channel).
     qat_per_channel: bool = False
-
-    def __post_init__(self):
-        if isinstance(self.qat_scheme, str):
-            self.qat_scheme = QATScheme(self.qat_scheme.lower())
-
-        if self.qat_scheme is not None and not isinstance(
-            self.qat_scheme,
-            QATScheme,
-        ):
-            raise TypeError("qat_scheme must be QATScheme, str, or None")
-
-    @property
-    def qat_enabled(self) -> bool:
-        return self.qat_scheme is not None
 
     @property
     def history_path(self) -> Path:

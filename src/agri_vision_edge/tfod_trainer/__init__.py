@@ -1,4 +1,4 @@
-from .config import QATScheme, TrainerConfig
+from .config import TrainerConfig
 from .export import (
     ExportResult,
     export_run,
@@ -22,7 +22,6 @@ from .state import TrainerState
 from .training import train
 
 __all__ = [
-    "QATScheme",
     "TrainerConfig",
     "ExportResult",
     "export_run",

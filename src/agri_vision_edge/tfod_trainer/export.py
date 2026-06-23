@@ -1,21 +1,13 @@
 """
 Export the best checkpoint of a finetune / QAT run.
 
-This is the export analog of the rest of ``tfod_trainer``: rather than calling
-the *forked* ``object_detection.exporter_lib_v2.export_inference_graph`` (whose
-``qat_backbone`` / ``fold_bn`` arguments do not exist upstream), it reimplements
+This is the export analog of the rest of ``tfod_trainer``: it reimplements
 the inference-graph export here, keeping the custom fold / quantize logic in
-``agri_vision_edge`` and using only stock-upstream symbols from
-``object_detection``:
+``agri_vision_edge`` and using upstream symbols from ``object_detection``:
 
   * ``model_builder.build`` to construct the inference model,
-  * ``exporter_lib_v2.DETECTION_MODULE_MAP`` for the serving modules (these
-    classes are unchanged from upstream; only ``export_inference_graph`` was
-    forked), and
+  * ``exporter_lib_v2.DETECTION_MODULE_MAP`` for the serving modules and
   * ``config_util.save_pipeline_config`` to write the pipeline.
-
-So this module keeps working once the vendored ``object_detection`` tree is
-swapped for the stock upstream package.
 
 It produces the standard TF model-zoo layout::
 
@@ -61,9 +53,7 @@ def export_run(
     *,
     export_dir=None,
     input_type: str = "image_tensor",
-    fold_bn: bool | None = None,
-    qat_backbone: str | None = None,
-    quantize_head: bool | None = None,
+    qat: bool | None = None,
     qat_per_channel: bool | None = None,
 ) -> ExportResult:
     """
@@ -74,18 +64,14 @@ def export_run(
     improvement, so latest == best).
 
     By default the export mirrors how the run was trained:
-      * ``fold_bn`` defaults to ``cfg.fold_bn``.
-      * ``qat_backbone`` defaults to ``cfg.qat_scheme`` (empty for a plain
-        finetune), so a plain finetune yields a clean fp32 detection checkpoint
-        ready to seed a follow-up QAT run.
-      * ``quantize_head`` defaults to ``cfg.quantize_head`` -- it MUST match how
-        the run was trained, otherwise the head's quantized variables won't be
-        present to restore and ``assert_existing_objects_matched`` fails.
-      * ``qat_per_channel`` defaults to ``cfg.qat_per_channel`` (per-tensor vs
-        per-channel weights) -- it changes the fake-quant variable shapes, so it
-        too MUST match the trained checkpoint.
+      * ``qat`` defaults to ``cfg.qat``: False yields a clean fp32 detection
+        checkpoint (ready to seed a follow-up QAT run); True reproduces the full
+        int8 graph (fold BN + fake-quant backbone + head).
+      * ``qat_per_channel`` defaults to ``cfg.qat_per_channel`` -- it selects the
+        full-scheme pin placement, so it MUST match the trained checkpoint or the
+        variables won't line up and ``assert_existing_objects_matched`` fails.
 
-    Pass any of these explicitly to override.
+    Pass either explicitly to override.
     """
     from agri_vision_edge.third_party import setup_tensorflow_models
 
@@ -103,12 +89,8 @@ def export_run(
 
     export_dir = cfg.output_dir / "export" if export_dir is None else Path(export_dir)
 
-    if fold_bn is None:
-        fold_bn = cfg.fold_bn
-    if qat_backbone is None:
-        qat_backbone = cfg.qat_scheme.value if cfg.qat_scheme else ""
-    if quantize_head is None:
-        quantize_head = cfg.quantize_head
+    if qat is None:
+        qat = cfg.qat
     if qat_per_channel is None:
         qat_per_channel = cfg.qat_per_channel
 
@@ -133,40 +115,36 @@ def export_run(
         is_training=False,
     )
 
-    if fold_bn or qat_backbone:
+    if qat:
         from agri_vision_edge.tfod import fold_mobilenetv2_backbone
         from agri_vision_edge.tfod.qat import (
             ensure_model_is_built_for_qat,
             quantize_backbone,
+            quantize_detection_head,
         )
 
         ensure_model_is_built_for_qat(detection_model, pipeline_config)
-        backbone = detection_model.feature_extractor.classification_backbone
+        fe = detection_model.feature_extractor
 
-        if fold_bn:
-            print("Folding batchnorms into the convolutions...")
-            backbone = fold_mobilenetv2_backbone(backbone)
+        print("Folding batchnorms into the convolutions...")
+        fe.classification_backbone = fold_mobilenetv2_backbone(
+            fe.classification_backbone
+        )
 
-        if qat_backbone:
-            print("Adding fake quantization nodes to the backbone (full int8)...")
-            backbone = quantize_backbone(backbone, per_axis=qat_per_channel)
+        print("Adding fake quantization nodes to the backbone (full int8)...")
+        fe.classification_backbone = quantize_backbone(
+            fe.classification_backbone, per_channel=qat_per_channel
+        )
 
-        detection_model.feature_extractor.classification_backbone = backbone
-
-        # Reproduce the head quantization (must run after the backbone is
-        # quantized; it reads the backbone's output shapes).
-        if qat_backbone and quantize_head:
-            from agri_vision_edge.tfod.qat import quantize_detection_head
-
-            print("Quantizing the detection head (feature maps + box predictor)...")
-            image_size = (
-                pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.height
-            )
-            quantize_detection_head(
-                detection_model,
-                image_size,
-                per_axis=qat_per_channel,
-            )
+        # The head quantization must run after the backbone is quantized
+        # (it reads the backbone's output shapes).
+        print("Quantizing the detection head (feature maps + box predictor)...")
+        image_size = pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.height
+        quantize_detection_head(
+            detection_model,
+            image_size,
+            per_channel=qat_per_channel,
+        )
 
     # Restore the best checkpoint. The trainer only saves on metric improvement,
     # so the latest checkpoint in train_dir is the best one.

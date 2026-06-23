@@ -14,7 +14,7 @@ two can be driven head-less from Python::
         output_dir="runs/finetune",
     ))
 
-QAT is the same call with ``qat_scheme`` (and optionally ``fold_bn`` /
+QAT is the same call with ``qat=True`` (and optionally ``qat_per_channel`` /
 ``reset_optimizer``) set.
 """
 
@@ -25,7 +25,7 @@ from pathlib import Path
 
 from agri_vision_edge.experiment import AugmentationConfig, FineTuneConfig
 
-from .config import QATScheme, TrainerConfig
+from .config import TrainerConfig
 
 
 @dataclass
@@ -47,7 +47,7 @@ class FinetuneRunConfig:
 
     The semantic pipeline tuning lives in ``finetune`` (a ``FineTuneConfig``);
     the remaining fields fill in the ``TrainerConfig`` knobs, including the
-    QAT options (``qat_scheme`` / ``fold_bn`` / ``reset_optimizer``).
+    QAT options (``qat`` / ``qat_per_channel`` / ``reset_optimizer``).
     """
 
     model_path: Path
@@ -63,22 +63,16 @@ class FinetuneRunConfig:
     metric_name: str = "DetectionBoxes_Precision/mAP"
     save_metrics_history: bool = True
 
-    # QAT / graph modifications. qat_scheme=None => plain finetune. fold_bn and
-    # reset_optimizer are tri-state: None ("auto") resolves to True when a QAT
-    # scheme is set and False otherwise, since QAT normally wants the BatchNorms
-    # folded and the optimizer state reset. Explicit True/False is respected.
-    qat_scheme: QATScheme | None = None
-    fold_bn: bool | None = None
+    # QAT. qat=False => plain finetune (-> PTQ at conversion). qat=True => the
+    # full int8 scheme (fold BN + fake-quant backbone + head). reset_optimizer is
+    # tri-state: None ("auto") resolves to True under QAT (which normally wants
+    # the optimizer state reset) and False otherwise; explicit True/False wins.
+    qat: bool = False
     reset_optimizer: bool | None = None
 
-    # Also quantize the SSD head (feature maps + box predictor) under QAT, so
-    # the whole graph up to the float postprocess is fake-quantized. Only
-    # applies when qat_scheme is set. EXPERIMENTAL (plain SSD MobileNetV2 only).
-    quantize_head: bool = False
-
-    # Per-channel (per-axis) QAT weight quantization. Default False = per-tensor
-    # (i.MX8M Plus Vivante/Teflon NPU). Set True for i.MX93 Arm Ethos-U65, which
-    # accepts per-channel weights. The conversion + export reproduce this flag.
+    # Per-channel QAT weight quantization. Default False = per-tensor (i.MX8M
+    # Plus Vivante/Teflon NPU). Set True for i.MX93 Arm Ethos-U65, which accepts
+    # per-channel weights. The conversion + export reproduce this flag.
     qat_per_channel: bool = False
 
     def __post_init__(self):
@@ -86,14 +80,8 @@ class FinetuneRunConfig:
         self.dataset_bundle_path = Path(self.dataset_bundle_path)
         self.output_dir = Path(self.output_dir)
 
-        if isinstance(self.qat_scheme, str):
-            self.qat_scheme = QATScheme(self.qat_scheme.lower())
-
-        qat_enabled = self.qat_scheme is not None
-        if self.fold_bn is None:
-            self.fold_bn = qat_enabled
         if self.reset_optimizer is None:
-            self.reset_optimizer = qat_enabled
+            self.reset_optimizer = self.qat
 
     # --- derived paths -------------------------------------------------
 
@@ -157,9 +145,7 @@ class FinetuneRunConfig:
             early_stopping_min_delta=self.finetune.early_stopping_min_delta,
             save_metrics_history=self.save_metrics_history,
             reset_optimizer=self.reset_optimizer,
-            fold_bn=self.fold_bn,
-            qat_scheme=self.qat_scheme,
-            quantize_head=self.quantize_head,
+            qat=self.qat,
             qat_per_channel=self.qat_per_channel,
         )
 
@@ -191,7 +177,7 @@ def write_pipeline(cfg: FinetuneRunConfig) -> Path:
     # box/class prediction heads too, so use "full". A plain finetune bootstraps
     # from a foreign detection checkpoint (e.g. COCO, different num_classes) where
     # the heads must be dropped and reinitialised, so it stays "detection".
-    fine_tune_checkpoint_type = "full" if cfg.qat_scheme else "detection"
+    fine_tune_checkpoint_type = "full" if cfg.qat else "detection"
 
     configure_ssd_pipeline(
         config=cfg.finetune,

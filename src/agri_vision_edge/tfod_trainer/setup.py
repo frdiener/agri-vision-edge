@@ -269,13 +269,13 @@ def apply_graph_modifications(
     Apply optimizer reset, BatchNorm folding and backbone QAT.
 
     Functionally mirrors the corresponding block in
-    ``object_detection.model_lib_v2.train_loop``, in the same order:
+    ``object_detection.model_lib_v2.train_loop``, in order:
 
       1. ``reset_optimizer``: zero the global step and rebuild the optimizer
          from the pipeline config.
-      2. ``fold_bn``: fold BatchNorm layers into the preceding convolutions.
-      3. ``qat_scheme``: insert fake-quantization nodes into the backbone
-         using ``agri_vision_edge.tfod.qat.quantize_backbone``.
+      2. ``qat``: fold BatchNorms into the convs, then fake-quantize the
+         backbone + SSD head (the full int8 scheme,
+         ``agri_vision_edge.tfod.qat``).
 
     Must run after ``restore_weights`` (so the loaded weights are folded /
     quantized) and before the train step is traced (so the rebuilt optimizer
@@ -283,8 +283,8 @@ def apply_graph_modifications(
     ``detection_model`` in place.
 
     Returns:
-        bool: True if the backbone graph was modified (folding or QAT), so
-        the caller can run an initial evaluation of the new configuration.
+        bool: True if the backbone graph was modified (QAT), so the caller can
+        run an initial evaluation of the new configuration.
     """
 
     train_config = runtime.configs["train_config"]
@@ -299,7 +299,7 @@ def apply_graph_modifications(
         runtime.optimizer = optimizer
         runtime.learning_rate = learning_rate
 
-    if not (trainer_cfg.fold_bn or trainer_cfg.qat_enabled):
+    if not trainer_cfg.qat:
         return False
 
     # Folding and cloning require the backbone variables to exist.
@@ -309,43 +309,32 @@ def apply_graph_modifications(
         runtime.unpad_groundtruth_tensors,
     )
 
+    # Imported lazily to mirror train_loop and avoid import cycles.
+    from agri_vision_edge.tfod import fold_mobilenetv2_backbone
+    from agri_vision_edge.tfod.qat import (
+        quantize_backbone,
+        quantize_detection_head,
+    )
+
     feature_extractor = detection_model.feature_extractor
 
-    if trainer_cfg.fold_bn:
-        # Imported lazily to mirror train_loop and avoid import cycles.
-        from agri_vision_edge.tfod import (
-            fold_mobilenetv2_backbone,
-        )
+    print("Folding batchnorms into the convolutions...")
+    feature_extractor.classification_backbone = fold_mobilenetv2_backbone(
+        feature_extractor.classification_backbone
+    )
 
-        print("Folding batchnorms into the convolutions...")
-        feature_extractor.classification_backbone = fold_mobilenetv2_backbone(
-            feature_extractor.classification_backbone
-        )
+    print("Adding fake quantization nodes to the backbone (full int8)...")
+    feature_extractor.classification_backbone = quantize_backbone(
+        feature_extractor.classification_backbone,
+        per_channel=trainer_cfg.qat_per_channel,
+    )
 
-    if trainer_cfg.qat_enabled:
-        from agri_vision_edge.tfod.qat import (
-            quantize_backbone,
-        )
-
-        print("Adding fake quantization nodes to the backbone (full int8)...")
-        feature_extractor.classification_backbone = quantize_backbone(
-            feature_extractor.classification_backbone,
-            per_axis=trainer_cfg.qat_per_channel,
-        )
-
-        if getattr(trainer_cfg, "quantize_head", False):
-            from agri_vision_edge.tfod.qat import (
-                quantize_detection_head,
-            )
-
-            image_size = runtime.configs[
-                "model"
-            ].ssd.image_resizer.fixed_shape_resizer.height
-            print("Quantizing the detection head (feature maps + box predictor)...")
-            quantize_detection_head(
-                detection_model,
-                image_size,
-                per_axis=trainer_cfg.qat_per_channel,
-            )
+    print("Quantizing the detection head (feature maps + box predictor)...")
+    image_size = runtime.configs["model"].ssd.image_resizer.fixed_shape_resizer.height
+    quantize_detection_head(
+        detection_model,
+        image_size,
+        per_channel=trainer_cfg.qat_per_channel,
+    )
 
     return True

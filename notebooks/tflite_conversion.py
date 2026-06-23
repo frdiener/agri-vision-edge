@@ -372,16 +372,16 @@ def _(
     qat_backbone = None
 
     if config["quantization"] != "ptq":
-        # per_axis MUST match how the checkpoint was QAT-trained (it selects the
-        # full-scheme variant), so reuse the Per-Channel switch: False =
-        # per-tensor (i.MX8M Plus), True = per-channel (i.MX93 Ethos-U). The
-        # same switch also drives the converter's _experimental_disable_per_channel.
-        per_axis = config["per_channel"]
+        # per_channel MUST match how the checkpoint was QAT-trained (it selects
+        # the full-scheme pin placement): False = per-tensor (i.MX8M Plus), True =
+        # per-channel (i.MX93 Ethos-U). The same switch also drives the
+        # converter's _experimental_disable_per_channel.
+        per_channel = config["per_channel"]
 
         backbone_folded = fold(
             detection_model.feature_extractor.classification_backbone
         )
-        qat_backbone = quantize_backbone(backbone_folded, per_axis=per_axis)
+        qat_backbone = quantize_backbone(backbone_folded, per_channel=per_channel)
         detection_model.feature_extractor.classification_backbone = qat_backbone
 
         # Quantize the SSD head (feature maps + box predictor) in place; must
@@ -389,7 +389,7 @@ def _(
         quantize_detection_head(
             detection_model,
             config["resolution"],
-            per_axis=per_axis,
+            per_channel=per_channel,
         )
 
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
@@ -487,7 +487,7 @@ def tflite_conversion(
 
         converter.representative_dataset = _normalized_rep_dataset
 
-        # converter._experimental_new_quantizer = False
+        converter._experimental_new_quantizer = False
         converter._experimental_disable_per_channel = not config["per_channel"]
 
     elif config["precision"] == "fp32":
