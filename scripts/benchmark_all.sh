@@ -16,7 +16,7 @@
 # benchmark_results/<hostname>_cpu/ instead, for a clean CPU-only run alongside
 # the delegated one.
 #
-# Any other extra arguments are forwarded to bin/benchmark_tflite.py.
+# Any other extra arguments are forwarded to `ave benchmark`.
 
 set -uo pipefail
 
@@ -114,7 +114,7 @@ for model in "${models[@]}"; do
     fi
 
     echo "[run]  ${name}  (cls=${cls}, images=$(basename "${images}"), delegate=${model_delegate})"
-    python3 "${script_dir}/benchmark_tflite.py" \
+    "${script_dir}/ave" benchmark \
         "${model}" \
         "${images}" \
         --annotations "${annotations}" \

@@ -5,10 +5,10 @@
 # name (which is the model stem).
 #
 # Usage:
-#   bin/evaluate_all.sh [target-dir]
+#   scripts/evaluate_all.sh [target-dir]
 #
 # target-dir defaults to benchmark_results/<hostname>. Each immediate subdir is
-# expected to contain a predictions.json (as written by bin/benchmark_tflite.py);
+# expected to contain a predictions.json (as written by `ave benchmark`);
 # dirs without one (e.g. failed runs holding error.json) are skipped. metrics.json
 # is written beside each predictions.json.
 
@@ -62,7 +62,7 @@ for model_dir in "${target_dir}"/*/; do
     fi
 
     echo "[eval] ${name}  (annotations=$(basename "${annotations}"))"
-    python3 "${script_dir}/evaluate_coco.py" \
+    "${script_dir}/ave" evaluate \
         "${annotations}" \
         "${predictions}"
     evaluated=$((evaluated + 1))

@@ -24,11 +24,11 @@ differently): ``<owner>/<config '_'->'-' lowercased>-<stage>``, e.g.
 ``freimutdiener/ssd-mn2-sc-phenobench-320-qat0``.
 
 Usage:
-    bin/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320
-    bin/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320 --dest artifacts/tf/ssd-mn2_sc_phenobench_320
-    bin/sync_kaggle_runs.py <config> --no-download        # re-merge what's on disk
-    bin/sync_kaggle_runs.py <config> --stages finetune,qat0,qat2
-    bin/sync_kaggle_runs.py <config> --per-channel        # the qatN_per-channel kernels
+    scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320
+    scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320 --dest artifacts/tf/ssd-mn2_sc_phenobench_320
+    scripts/sync_kaggle_runs.py <config> --no-download        # re-merge what's on disk
+    scripts/sync_kaggle_runs.py <config> --stages finetune,qat0,qat2
+    scripts/sync_kaggle_runs.py <config> --per-channel        # the qatN_per-channel kernels
 """
 
 from __future__ import annotations
