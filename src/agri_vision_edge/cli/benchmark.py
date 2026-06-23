@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 """
 Benchmark TensorFlow Lite models.
 
@@ -16,30 +14,18 @@ Supports:
 from __future__ import annotations
 
 import argparse
-import sys
-
 from pathlib import Path
-
-# Allow running from a source checkout without installing the package:
-# put the src/ layout root on sys.path so `agri_vision_edge` is importable.
-sys.path.insert(
-    0,
-    str(Path(__file__).resolve().parent.parent / "src"),
-)
 
 from agri_vision_edge.evaluation.artifacts import (
     save_benchmark_artifacts,
     save_failure_artifact,
 )
-
 from agri_vision_edge.evaluation.benchmark import (
     benchmark_runtime,
 )
-
 from agri_vision_edge.evaluation.dataset import (
     load_coco_images,
 )
-
 from agri_vision_edge.runtime.inference.tflite import (
     TFLiteRuntime,
 )
@@ -108,12 +94,12 @@ def benchmark_model(
     print(f"exported {len(result.predictions)} prediction(s)")
 
 
-def main():
+def main(argv=None):
     """
     CLI entrypoint.
     """
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(prog="ave benchmark")
 
     parser.add_argument(
         "models",
@@ -145,7 +131,7 @@ def main():
         ),
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # The Teflon/NPU delegate targets INT8; routing an fp32 graph through it
     # silently degrades results. 'none' (or empty) keeps the model on CPU.
@@ -201,6 +187,8 @@ def main():
 
     print(f"completed: {success} succeeded, {failed} failed")
 
+    return 1 if failed else 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

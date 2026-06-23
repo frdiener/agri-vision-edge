@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# Run the `ave` CLI from a bare source checkout (rsync'd repo, no install/uv).
+# Puts the src/ layout root on PYTHONPATH and dispatches to the same entry point
+# as the installed `ave` console script.
+#
+# Installed environments should use the real `ave` command instead.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec env PYTHONPATH="$here/../src${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m agri_vision_edge.cli "$@"

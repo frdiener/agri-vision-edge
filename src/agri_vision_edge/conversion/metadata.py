@@ -1,8 +1,8 @@
 """Embed TFLite ObjectDetector metadata into the exported model."""
 
-from pathlib import Path
 import re
 import tempfile
+from pathlib import Path
 
 from tflite_support import metadata as metadata_api
 from tflite_support.metadata_writers import object_detector, writer_utils

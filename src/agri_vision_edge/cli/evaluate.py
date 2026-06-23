@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 """
 Evaluate COCO predictions.
 
@@ -15,16 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
-
 from pathlib import Path
-
-# Allow running from a source checkout without installing the package:
-# put the src/ layout root on sys.path so `agri_vision_edge` is importable.
-sys.path.insert(
-    0,
-    str(Path(__file__).resolve().parent.parent / "src"),
-)
 
 from agri_vision_edge.evaluation.coco import (
     evaluate_model_dir,
@@ -34,9 +23,9 @@ from agri_vision_edge.evaluation.coco import (
 )
 
 
-def main():
+def main(argv=None):
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(prog="ave evaluate")
 
     parser.add_argument(
         "annotations",
@@ -48,7 +37,7 @@ def main():
         help=("predictions.json or benchmark_results directory"),
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     annotations_path = Path(args.annotations)
 
@@ -114,4 +103,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

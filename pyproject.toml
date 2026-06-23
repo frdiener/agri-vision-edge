@@ -25,6 +25,12 @@ dependencies = [
     "pyyaml==6.0.3",
 ]
 
+# Single console entry point with subcommands (benchmark / evaluate / infer).
+# Only materializes when the package is installed; from a bare checkout use
+# `PYTHONPATH=src python -m agri_vision_edge.cli ...` or the `scripts/ave` shim.
+[project.scripts]
+ave = "agri_vision_edge.cli:main"
+
 [project.optional-dependencies]
 # On-device inference/evaluation: lightweight standalone interpreter only.
 # `pip install agri-vision-edge[device]` — no tensorflow, no training stack.
