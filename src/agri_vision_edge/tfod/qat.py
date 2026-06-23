@@ -20,6 +20,7 @@ exists to make int8 deployment robust rather than to recover accuracy.
 """
 
 import collections
+import itertools
 
 import numpy as np
 import tensorflow as tf
@@ -652,7 +653,8 @@ class FMGAdapter(tf.keras.layers.Layer):
         # NB: no `strict=` — under @tf.function autograph rewrites `zip` into its
         # own `zip_`, which does not accept Python 3.10's strict keyword (works
         # eagerly, TypeErrors in graph mode = the training/eval forward path).
-        return collections.OrderedDict(zip(self.output_keys, outs))  # noqa: B905
+        # noqa note: see FMGAdapter -- autograph rewrites zip and rejects strict=
+        return collections.OrderedDict(zip(self.output_keys, outs))  # noqa: B905  # noqa: B905
 
 
 def rebuild_box_predictor_functional(box_predictor, feature_shapes):
@@ -766,21 +768,30 @@ def _quantize_weights_only(model):
 
 def quantize_detection_head(detection_model, image_size, *, per_channel=False):
     """
-    Quantize the SSD head (feature_map_generator + box predictor) in place via
-    weight-preserving functional rebuilds, so QAT covers the whole graph up to
-    the postprocess. Call AFTER the backbone has been folded + quantized.
+    Quantize the SSD head in place via weight-preserving functional rebuilds, so
+    QAT covers the whole graph up to the postprocess. Call AFTER the backbone has
+    been folded + quantized.
 
     ``per_channel`` must match the backbone (it selects the same pin placement
-    for the feature-map generator's full scheme). The box predictor is always
+    for the feature generator's full scheme). The box predictor is always
     quantized weight-only (see _quantize_weights_only -- pinning its output
     scales would force stray requant QUANTIZE ops at the concat that trip the
     NPU delegate).
 
-    Specific to the plain SSD MobileNetV2 head; raises if the structure differs.
+    Dispatches on the head architecture:
+      * plain SSD MobileNetV2 (KerasMultiResolutionFeatureMaps +
+        ConvolutionalBoxPredictor) -- below.
+      * FPNLite (KerasFpnTopDownFeatureMaps + WeightSharedConvolutionalBox
+        Predictor) -- see _quantize_fpn_detection_head.
     """
+    fe = detection_model.feature_extractor
+    if hasattr(fe, "_fpn_features_generator"):
+        return _quantize_fpn_detection_head(
+            detection_model, image_size, per_channel=per_channel
+        )
+
     from object_detection.utils import ops as od_ops
 
-    fe = detection_model.feature_extractor
     fmg = fe.feature_map_generator
     backbone = fe.classification_backbone
 
@@ -804,6 +815,282 @@ def quantize_detection_head(detection_model, image_size, *, per_channel=False):
 
     qbp = _quantize_weights_only(
         rebuild_box_predictor_functional(detection_model._box_predictor, feature_shapes)
+    )
+    detection_model._box_predictor = BoxPredictorAdapter(qbp, len(feature_shapes))
+
+    return detection_model
+
+
+# =========================================================
+# FPNLite head QAT (SSD MobileNetV2 FPN).
+#
+# The FPN head is structurally different from the plain SSD head:
+#   * feature generation is a top-down FPN (KerasFpnTopDownFeatureMaps:
+#     projections + nearest-neighbour upsample + residual ADD + smoothing convs)
+#     followed by extra "coarse" stride-2 layers, instead of a flat chain of
+#     extra conv blocks;
+#   * the box predictor is a WeightSharedConvolutionalBoxPredictor (one shared
+#     tower + shared box/class heads applied to every feature map, with per-level
+#     BatchNorm), instead of one conv per feature map.
+# Both use SeparableConv2D everywhere, which our fold/quant only handle once split
+# into DepthwiseConv2D + Conv2D(1x1). The functional rebuilds below mirror the
+# plain-SSD ones (reuse converged layers, weights preserved) but replay those
+# FPN-specific forwards layer-by-layer so fold + quantize + TFLite tracing work.
+# =========================================================
+
+
+def _split_separable_conv(sep, tag):
+    """
+    Split a SeparableConv2D into (DepthwiseConv2D no-bias, Conv2D 1x1 +bias),
+    weights copied. Our fold/quant primitives are Conv2D/DepthwiseConv2D only
+    (TFLite splits separables the same way). ``tag`` makes the names unique --
+    the FPN/weight-shared graphs reuse one separable across feature maps, and the
+    per-map BatchNorm folds into a distinct Conv2D each, so they cannot share.
+    """
+    cfg = sep.get_config()
+    dw = tf.keras.layers.DepthwiseConv2D(
+        kernel_size=cfg["kernel_size"],
+        strides=cfg["strides"],
+        padding=cfg["padding"],
+        depth_multiplier=cfg["depth_multiplier"],
+        dilation_rate=cfg["dilation_rate"],
+        use_bias=False,
+        name=f"{sep.name}_{tag}_dw",
+    )
+    pw = tf.keras.layers.Conv2D(
+        filters=cfg["filters"],
+        kernel_size=1,
+        use_bias=cfg["use_bias"],
+        name=f"{sep.name}_{tag}_pw",
+    )
+    w = sep.get_weights()  # [depthwise_kernel, pointwise_kernel, (bias)]
+    in_ch = w[0].shape[2] * w[0].shape[3]
+    dw.build((None, None, None, w[0].shape[2]))
+    dw.set_weights([w[0]])
+    pw.build((None, None, None, in_ch))
+    pw.set_weights(w[1:] if cfg["use_bias"] else [w[1]])
+    return dw, pw
+
+
+def _fpn_apply(layer, x, counter):
+    """
+    Apply one reused head layer to a (set of) functional tensor(s), making the
+    graph fold/quant/trace friendly: SeparableConv2D -> split, ReLU6 (keras ReLU
+    or Lambda) -> keras ReLU6 (fuses), other Lambda (e.g. nearest-neighbour
+    upsample) -> a freshly-named copy (the originals share names across levels).
+    """
+    if isinstance(layer, tf.keras.layers.SeparableConv2D):
+        dw, pw = _split_separable_conv(layer, next(counter))
+        return pw(dw(x))
+    if _is_relu6(layer):
+        return tf.keras.layers.ReLU(max_value=6.0, name=f"relu6_{next(counter)}")(x)
+    if isinstance(layer, tf.keras.layers.Lambda):
+        return tf.keras.layers.Lambda(
+            layer.function, name=f"{layer.name}_{next(counter)}"
+        )(x)
+    return layer(x)
+
+
+def rebuild_fpn_generator_functional(fpn_gen, feature_specs):
+    """
+    Functionally reconstruct a KerasFpnTopDownFeatureMaps (top-down pathway only;
+    the extractor's coarse layers are rebuilt separately). Returns
+    ``(model, output_keys)`` where ``model`` maps the backbone feature inputs to
+    the top-down feature maps and ``output_keys`` are the matching
+    ``top_down_<block>`` names in the generator's output order.
+    """
+    counter = itertools.count()
+    inp = collections.OrderedDict(
+        (k, tf.keras.Input(shape=tuple(v[1:]), name=k.replace("/", "__")))
+        for k, v in feature_specs.items()
+    )
+    image_features = list(inp.items())
+    top_down = image_features[-1][1]
+    for layer in fpn_gen.top_layers:
+        top_down = _fpn_apply(layer, top_down, counter)
+    outs = [top_down]
+    keys = [f"top_down_{image_features[-1][0]}"]
+    num_levels = len(image_features)
+    for index, level in enumerate(reversed(list(range(num_levels - 1)))):
+        residual = image_features[level][1]
+        top_down = outs[-1]
+        for layer in fpn_gen.residual_blocks[index]:
+            residual = _fpn_apply(layer, residual, counter)
+        for layer in fpn_gen.top_down_blocks[index]:
+            top_down = _fpn_apply(layer, top_down, counter)
+        for layer in fpn_gen.reshape_blocks[index]:
+            top_down = _fpn_apply(layer, [residual, top_down], counter)
+        top_down = tf.keras.layers.Add(name=f"fpn_add_{next(counter)}")(
+            [top_down, residual]
+        )
+        for layer in fpn_gen.conv_layers[index]:
+            top_down = _fpn_apply(layer, top_down, counter)
+        outs.append(top_down)
+        keys.append(f"top_down_{image_features[level][0]}")
+    ordered = collections.OrderedDict(reversed(list(zip(keys, outs, strict=True))))
+    return (
+        tf.keras.Model(list(inp.values()), list(ordered.values())),
+        list(ordered.keys()),
+    )
+
+
+def rebuild_coarse_block_functional(block, input_shape):
+    """Functionally reconstruct one extractor coarse-feature block (a stride-2
+    separable conv block) over a single feature-map input."""
+    counter = itertools.count()
+    inp = tf.keras.Input(shape=tuple(input_shape[1:]))
+    x = inp
+    for layer in block:
+        x = _fpn_apply(layer, x, counter)
+    return tf.keras.Model(inp, x)
+
+
+class _FpnGeneratorAdapter:
+    """Drop-in for ``feature_extractor._fpn_features_generator``. Plain callable
+    (NOT a Keras Layer): the extractor calls it with a list of (key, tensor)
+    tuples, and a Layer cannot track the string keys -- that breaks TFLite output
+    shape inference. The wrapped functional model is tracked separately on the
+    extractor so its variables still convert."""
+
+    def __init__(self, func, output_keys):
+        self.func = func
+        self.output_keys = list(output_keys)
+
+    def __call__(self, image_features):
+        san = {k.replace("/", "__"): v for k, v in image_features}
+        outs = self.func([san[name] for name in self.func.input_names])
+        outs = outs if isinstance(outs, (list, tuple)) else [outs]
+        # noqa note: see FMGAdapter -- autograph rewrites zip and rejects strict=
+        return collections.OrderedDict(zip(self.output_keys, outs))  # noqa: B905
+
+
+class _CoarseBlockAdapter:
+    """Drop-in for one entry of ``feature_extractor._coarse_feature_layers`` (a
+    list of layers iterated over a single tensor). Plain callable; the wrapped
+    model is tracked separately on the extractor."""
+
+    def __init__(self, func):
+        self.func = func
+
+    def __call__(self, x):
+        return self.func(x)
+
+
+def rebuild_weight_shared_box_predictor_functional(box_predictor, feature_shapes):
+    """
+    Functionally reconstruct a WeightSharedConvolutionalBoxPredictor, preserving
+    weights. The shared tower + shared box/class heads are replayed per feature
+    map (``_split_separable_conv`` gives each map its own copy so the per-level
+    BatchNorm folds into a distinct conv). Outputs are the flat box-encoding
+    tensors followed by the class tensors -- the shape the meta-arch consumes.
+    """
+    from object_detection.core.box_predictor import (
+        BOX_ENCODINGS,
+        CLASS_PREDICTIONS_WITH_BACKGROUND,
+    )
+
+    counter = itertools.count()
+    code_size = box_predictor._box_prediction_head._box_code_size
+    num_class_slots = box_predictor._prediction_heads[
+        CLASS_PREDICTIONS_WITH_BACKGROUND
+    ]._num_class_slots
+
+    inputs = [
+        tf.keras.Input(shape=tuple(s.as_list()[1:]), name=f"bp_in_{i}")
+        for i, s in enumerate(feature_shapes)
+    ]
+    box_out, cls_out = [], []
+    for i, x0 in enumerate(inputs):
+        x = x0
+        for layer in box_predictor._additional_projection_layers[i]:
+            x = _fpn_apply(layer, x, counter)
+        for layer in box_predictor._base_tower_layers_for_heads[BOX_ENCODINGS][i]:
+            x = _fpn_apply(layer, x, counter)
+        tower = x  # shared between box and class heads (share_prediction_tower)
+
+        b = tower
+        for layer in box_predictor._box_prediction_head._box_encoder_layers:
+            b = _fpn_apply(layer, b, counter)
+        box_out.append(
+            tf.keras.layers.Reshape((-1, code_size), name=f"ws_box_reshape_{i}")(b)
+        )
+
+        c = tower
+        for layer in box_predictor._prediction_heads[
+            CLASS_PREDICTIONS_WITH_BACKGROUND
+        ]._class_predictor_layers:
+            c = _fpn_apply(layer, c, counter)
+        cls_out.append(
+            tf.keras.layers.Reshape((-1, num_class_slots), name=f"ws_cls_reshape_{i}")(
+                c
+            )
+        )
+    return tf.keras.Model(inputs, box_out + cls_out)
+
+
+def _quantize_fpn_detection_head(detection_model, image_size, *, per_channel=False):
+    """
+    FPNLite head QAT: quantize the FPN feature generator + coarse layers (full
+    scheme) and the weight-shared box predictor (weight-only), in place. Mirrors
+    ``quantize_detection_head`` for the plain SSD head; see the section banner.
+    """
+    from object_detection.utils import ops as od_ops
+
+    fe = detection_model.feature_extractor
+    pp, _ = detection_model.preprocess(
+        tf.zeros([1, image_size, image_size, 3], dtype=tf.float32)
+    )
+    backbone_feats = fe.classification_backbone(
+        od_ops.pad_to_multiple(pp, fe._pad_to_multiple)
+    )
+
+    # The backbone feature maps that feed the FPN (mirrors _extract_features).
+    start = len(fe._feature_blocks) - fe._num_levels
+    keys = [
+        fe._feature_blocks[level - 2]
+        for level in range(fe._fpn_min_level, fe._base_fpn_max_level + 1)
+    ]
+    feature_specs = collections.OrderedDict(
+        (k, backbone_feats[start + i].shape) for i, k in enumerate(keys)
+    )
+
+    # FPN top-down generator.
+    gen_model, out_keys = rebuild_fpn_generator_functional(
+        fe._fpn_features_generator, feature_specs
+    )
+    qgen = quantize_backbone(fold_functional(gen_model), per_channel=per_channel)
+
+    # Coarse stride-2 blocks, fed by the deepest top-down map then each other.
+    gen_out = fe._fpn_features_generator(
+        [(k, backbone_feats[start + i]) for i, k in enumerate(keys)]
+    )
+    last = gen_out[f"top_down_{fe._feature_blocks[fe._base_fpn_max_level - 2]}"]
+    q_coarse = []
+    for block in fe._coarse_feature_layers:
+        qcm = quantize_backbone(
+            fold_functional(rebuild_coarse_block_functional(block, last.shape)),
+            per_channel=per_channel,
+        )
+        q_coarse.append(qcm)
+        for layer in block:
+            last = layer(last)  # advance the shape for the next block
+
+    # The FPN feature_maps the box predictor consumes (for its input shapes).
+    feature_shapes = [t.shape for t in fe._extract_features(pp)]
+
+    # Track the quantized models on the extractor so their variables convert;
+    # route the original call sites through plain-callable adapters.
+    fe._q_fpn_generator = qgen
+    fe._q_coarse_blocks = q_coarse
+    fe._fpn_features_generator = _FpnGeneratorAdapter(qgen, out_keys)
+    fe._coarse_feature_layers = [[_CoarseBlockAdapter(m)] for m in q_coarse]
+
+    qbp = _quantize_weights_only(
+        fold_functional(
+            rebuild_weight_shared_box_predictor_functional(
+                detection_model._box_predictor, feature_shapes
+            )
+        )
     )
     detection_model._box_predictor = BoxPredictorAdapter(qbp, len(feature_shapes))
 
