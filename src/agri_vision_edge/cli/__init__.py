@@ -25,6 +25,10 @@ _COMMANDS: dict[str, tuple[str, str]] = {
         "agri_vision_edge.cli.benchmark",
         "Benchmark TFLite model(s) on a COCO dataset",
     ),
+    "convert": (
+        "agri_vision_edge.cli.convert",
+        "Convert TF model variant(s) to int8/fp32 TFLite + metadata",
+    ),
     "evaluate": (
         "agri_vision_edge.cli.evaluate",
         "Evaluate COCO predictions / benchmark_results",
