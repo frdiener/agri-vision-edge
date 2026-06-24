@@ -261,6 +261,9 @@ def dataset___conversion_helpers(
     config["max_detections"] = (
         PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.max_total_detections
     )
+    config["score_threshold"] = (
+        PIPELINE_CONFIG.model.ssd.post_processing.batch_non_max_suppression.score_threshold
+    )
     config["resolution"] = (
         PIPELINE_CONFIG.model.ssd.image_resizer.fixed_shape_resizer.width
     )
@@ -546,6 +549,12 @@ def _(MODEL_FILE_PATH, config, dataset_dir, written):
         model_path=MODEL_FILE_PATH,
         label_map_path=dataset_dir / "label_map.pbtxt",
         num_classes=config["num_classes"],
+        extra_metadata={
+            "iou_threshold": config["iou_threshold"],
+            "nms": "regular" if config["regular_nms"] else "fast",
+            "max_detections": config["max_detections"],
+            "score_threshold": config["score_threshold"],
+        },
     )
     return
 

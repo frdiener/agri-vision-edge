@@ -1,11 +1,18 @@
 """Embed TFLite ObjectDetector metadata into the exported model."""
 
+import json
 import re
 import tempfile
 from pathlib import Path
 
+import flatbuffers
 from tflite_support import metadata as metadata_api
+from tflite_support import metadata_schema_py_generated as _schema
 from tflite_support.metadata_writers import object_detector, writer_utils
+
+# Name under which the extra detector parameters (IoU threshold, NMS type, ...)
+# are stored as a CustomMetadata entry on the model's subgraph.
+DETECTOR_PARAMS_KEY = "DETECTOR_POSTPROCESSING"
 
 
 def read_labels(label_map_path: Path, expected_classes: int) -> list[str]:
@@ -44,10 +51,43 @@ def read_labels(label_map_path: Path, expected_classes: int) -> list[str]:
     return labels
 
 
+def _inject_custom_metadata(
+    metadata_buffer: bytearray,
+    name: str,
+    payload: dict[str, object],
+) -> bytearray:
+    """
+    Append a CustomMetadata entry (``name`` -> JSON ``payload``) to a serialized
+    ``ModelMetadata`` flatbuffer's subgraph and return the repacked buffer.
+
+    The standard ObjectDetector metadata schema has no field for post-processing
+    parameters such as the NMS IoU threshold or NMS type, so they are carried in
+    a free-form ``CustomMetadata`` blob the on-device runtime can read by name.
+    """
+    model_meta = _schema.ModelMetadataT.InitFromPackedBuf(metadata_buffer, 0)
+
+    # The ObjectDetector writer always produces exactly one subgraph.
+    subgraph = model_meta.subgraphMetadata[0]
+
+    custom = _schema.CustomMetadataT()
+    custom.name = name
+    custom.data = list(json.dumps(payload, sort_keys=True).encode("utf-8"))
+
+    subgraph.customMetadata = (subgraph.customMetadata or []) + [custom]
+
+    builder = flatbuffers.Builder(0)
+    builder.Finish(
+        model_meta.Pack(builder),
+        file_identifier=metadata_api.MetadataPopulator.METADATA_FILE_IDENTIFIER,
+    )
+    return builder.Output()
+
+
 def write_object_detector_metadata(
     model_path: Path,
     label_map_path: Path,
     num_classes: int,
+    extra_metadata: dict[str, object] | None = None,
 ) -> Path:
     """
     Embed ObjectDetector metadata and labels into a TFLite model.
@@ -59,6 +99,12 @@ def write_object_detector_metadata(
     The normalization metadata remains the same for float and quantized
     models. Quantized models additionally carry their tensor quantization
     parameters in the TFLite graph.
+
+    ``extra_metadata`` is an optional mapping of post-processing parameters that
+    the standard schema cannot express (e.g. ``iou_threshold``, ``nms`` type,
+    ``max_detections``, ``score_threshold``). It is JSON-encoded into a
+    ``CustomMetadata`` entry named :data:`DETECTOR_PARAMS_KEY` on the subgraph,
+    and so also appears in the emitted ``*.metadata.json``.
     """
     if not model_path.is_file():
         raise FileNotFoundError(f"TFLite model not found: {model_path}")
@@ -84,6 +130,18 @@ def write_object_detector_metadata(
             label_file_paths=[str(labels_path)],
         )
 
+        # Inject the post-processing parameters as a CustomMetadata blob before
+        # the metadata buffer is populated into the model. There is no public
+        # hook for custom metadata, so we rewrite the writer's serialized buffer
+        # (always set by create_for_inference) in place.
+        if extra_metadata:
+            assert writer._metadata_buffer is not None
+            writer._metadata_buffer = _inject_custom_metadata(
+                writer._metadata_buffer,
+                DETECTOR_PARAMS_KEY,
+                extra_metadata,
+            )
+
         populated_model = writer.populate()
 
     # The labels file has now been embedded in populated_model.
@@ -101,6 +159,8 @@ def write_object_detector_metadata(
 
     print(f"Metadata written: {model_path.name}")
     print(f"Embedded labels:  {labels}")
+    if extra_metadata:
+        print(f"Detector params:  {extra_metadata}")
     print(f"Metadata JSON:    {metadata_json_path.name}")
 
     return metadata_json_path
