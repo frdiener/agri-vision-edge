@@ -38,6 +38,38 @@ from .base import (
 DEFAULT_TEFLON_LIB = "/usr/lib/libteflon.so"
 
 
+def load_delegates(delegate_path):
+    """
+    Load the optional TFLite delegate.
+
+    Returns a list suitable for ``Interpreter(experimental_delegates=...)`` —
+    empty (CPU) when ``delegate_path`` is ``None``, missing, or fails to load.
+    Shared by every runtime so delegate handling stays uniform.
+    """
+
+    if delegate_path is None:
+        return []
+
+    delegate_path = Path(delegate_path)
+
+    if not delegate_path.exists():
+        print(f"[runtime] delegate not found: {delegate_path}")
+
+        return []
+
+    try:
+        delegate = load_delegate(str(delegate_path))
+
+        print(f"[runtime] loaded delegate: {delegate_path}")
+
+        return [delegate]
+
+    except Exception as e:
+        print(f"[runtime] failed to load delegate: {e}")
+
+        return []
+
+
 class TFLiteRuntime(BaseRuntime):
     """
     TensorFlow Lite inference runtime.
@@ -191,29 +223,7 @@ class TFLiteRuntime(BaseRuntime):
         delegate_path,
     ):
 
-        delegates = []
-
-        if delegate_path is None:
-            return delegates
-
-        delegate_path = Path(delegate_path)
-
-        if not delegate_path.exists():
-            print(f"[runtime] delegate not found: {delegate_path}")
-
-            return delegates
-
-        try:
-            delegate = load_delegate(str(delegate_path))
-
-            delegates.append(delegate)
-
-            print(f"[runtime] loaded delegate: {delegate_path}")
-
-        except Exception as e:
-            print(f"[runtime] failed to load delegate: {e}")
-
-        return delegates
+        return load_delegates(delegate_path)
 
     #
     # Preprocessing

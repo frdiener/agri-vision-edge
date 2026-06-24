@@ -26,8 +26,8 @@ from agri_vision_edge.evaluation.benchmark import (
 from agri_vision_edge.evaluation.dataset import (
     load_coco_images,
 )
-from agri_vision_edge.runtime.inference.tflite import (
-    TFLiteRuntime,
+from agri_vision_edge.runtime.inference.factory import (
+    build_runtime,
 )
 
 
@@ -60,6 +60,7 @@ def benchmark_model(
     image_records,
     output_root: Path,
     delegate: str | None,
+    iou: float,
 ):
     """
     Benchmark a single model.
@@ -67,9 +68,13 @@ def benchmark_model(
 
     print(f"\n=== Benchmarking: {model_path.name} ===")
 
-    runtime = TFLiteRuntime(
+    # The factory selects SSD (post-NMS) vs YOLOv7-tiny (raw grids) by output
+    # shape; score_threshold stays 0.0 so COCO eval sees every detection (the
+    # YOLO runtime floors candidates internally to keep NMS tractable).
+    runtime = build_runtime(
         model_path=model_path,
         delegate_path=delegate,
+        iou_threshold=iou,
     )
 
     result = benchmark_runtime(
@@ -123,6 +128,16 @@ def main(argv=None):
     )
 
     parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.65,
+        help=(
+            "IoU threshold for YOLO NMS (ignored for SSD, whose graph already "
+            "runs NMS) (default: %(default)s)"
+        ),
+    )
+
+    parser.add_argument(
         "--delegate",
         default="/usr/lib/libteflon.so",
         help=(
@@ -167,6 +182,7 @@ def main(argv=None):
                 image_records=image_records,
                 output_root=output_root,
                 delegate=delegate,
+                iou=args.iou,
             )
 
             success += 1
