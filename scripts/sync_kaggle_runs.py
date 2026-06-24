@@ -6,29 +6,31 @@ Pull a config's finetune + QAT Kaggle kernel outputs and merge their manifests.
 Each config is trained as independent Kaggle notebooks that each publish only
 their own slice of the experiment:
 
-    finetune  ->  manifest.json        + ptq/
-    qat0      ->  manifest.qat0.json   + qat0/
-    qat1      ->  manifest.qat1.json   + qat1/
-    qat2      ->  manifest.qat2.json   + qat2/
-    qat3      ->  manifest.qat3.json   + qat3/
+    finetune         ->  manifest.json                   + ptq/
+    qat              ->  manifest.qat.json               + qat/
+    qat_per-channel  ->  manifest.qat_per-channel.json   + qat_per-channel/
+
+``qat`` is the per-tensor int8 QAT run (i.MX8M Plus); ``qat_per-channel`` is the
+per-channel variant (i.MX93 Ethos-U) -- a separate kernel/folder so it never
+clobbers the per-tensor one. Both resume from the shared finetune ``ptq/`` base.
 
 This script downloads each kernel's output into one local config directory (the
-finetune's ``manifest.json`` and the qatN ``manifest.qatN.json`` fragments don't
-collide, and ``ptq/`` / ``qatN/`` land side by side), then folds every fragment
-into the finetune's full ``manifest.json`` -- the same stage/artifact/result
-merge as ``ExperimentManifest.merge``, but idempotent (re-merging an already
--merged stage overwrites instead of raising), so it is safe to re-run.
+finetune's ``manifest.json`` and the ``manifest.<stage>.json`` fragments don't
+collide, and ``ptq/`` / ``<stage>/`` land side by side), then folds every
+fragment into the finetune's full ``manifest.json`` -- the same
+stage/artifact/result merge as ``ExperimentManifest.merge``, but idempotent
+(re-merging an already-merged stage overwrites instead of raising), so it is safe
+to re-run.
 
 Kaggle slug convention (override per stage with --slug if a kernel was titled
 differently): ``<owner>/<config '_'->'-' lowercased>-<stage>``, e.g.
-``freimutdiener/ssd-mn2-sc-phenobench-320-qat0``.
+``freimutdiener/ssd-mn2-fpnlite-sc-phenobench-320-qat``.
 
-Usage:
+Usage (pulls finetune + qat + qat_per-channel by default):
     scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320
     scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320 --dest artifacts/tf/ssd-mn2_sc_phenobench_320
     scripts/sync_kaggle_runs.py <config> --no-download        # re-merge what's on disk
-    scripts/sync_kaggle_runs.py <config> --stages finetune,qat0,qat2
-    scripts/sync_kaggle_runs.py <config> --per-channel        # the qatN_per-channel kernels
+    scripts/sync_kaggle_runs.py <config> --stages finetune,qat   # subset
 """
 
 from __future__ import annotations
@@ -47,7 +49,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from agri_vision_edge.experiment import ExperimentManifest  # noqa: E402
 
 DEFAULT_OWNER = "freimutdiener"
-DEFAULT_STAGES = ["finetune", "qat0", "qat1", "qat2", "qat3"]
+# finetune publishes the fp32 base + ptq/ export; qat / qat_per-channel are the
+# per-tensor (i.MX8M Plus) and per-channel (i.MX93 Ethos-U) int8 runs. Pulling
+# all three by default collects the whole config in one go; a stage whose kernel
+# is not published yet is just skipped with a warning.
+DEFAULT_STAGES = ["finetune", "qat", "qat_per-channel"]
 ARTIFACTS_TF = Path(__file__).resolve().parent.parent / "artifacts" / "tf"
 
 
@@ -60,8 +66,8 @@ def kernel_slug(owner: str, config: str, stage: str) -> str:
     """``<owner>/<config-and-stage as a kaggle slug>``.
 
     Kaggle slugs are lowercase with hyphens only, so the whole ``config-stage``
-    body is hyphenated -- including a per-channel stage like ``qat2_per-channel``
-    -> ``...-qat2-per-channel``.
+    body is hyphenated -- including the per-channel stage ``qat_per-channel``
+    -> ``...-qat-per-channel``.
     """
     body = f"{config}-{stage}".replace("_", "-").lower()
     return f"{owner}/{body}"
@@ -80,7 +86,7 @@ def download_kernel(slug: str, dest: Path, *, force: bool, quiet: bool) -> bool:
     not zip, unlike ``kaggle datasets download``), but we still detect and
     extract a ``*.zip`` defensively in case that ever changes. The kernel
     ``*.log`` is skipped. Returns False (with a warning) if the kernel can't be
-    fetched -- e.g. a qatN run that hasn't been published yet.
+    fetched -- e.g. a qat run that hasn't been published yet.
     """
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
@@ -122,7 +128,7 @@ def download_kernel(slug: str, dest: Path, *, force: bool, quiet: bool) -> bool:
 
 def merge_fragments(dest: Path, stages: list[str]) -> ExperimentManifest:
     """
-    Fold every present qatN fragment into the finetune ``manifest.json``.
+    Fold every present qat fragment into the finetune ``manifest.json``.
 
     Mirrors ``ExperimentManifest.merge`` (stages + artifact files + results) but
     is idempotent: an already-merged stage is overwritten rather than raising,
@@ -194,17 +200,6 @@ def sync_config(config: str, args: argparse.Namespace) -> None:
     slug_overrides = dict(args.slug or [])
     stages = args.stages
 
-    if args.per_channel:
-        # Target the per-channel QAT kernels/folders: each non-finetune stage
-        # gets a "_per-channel" suffix (separate Kaggle notebooks publish
-        # qatN_per-channel/ + manifest.qatN_per-channel.json). finetune is the
-        # shared fp32 base, so it stays as-is. Run once without and once with
-        # --per-channel into the same dest to collect both into one manifest.
-        stages = [
-            s if (s == "finetune" or s.endswith("_per-channel")) else f"{s}_per-channel"
-            for s in stages
-        ]
-
     print(f"== {config} -> {dest}")
 
     if not args.no_download:
@@ -254,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         "--stages",
         type=lambda s: [x.strip() for x in s.split(",") if x.strip()],
         default=DEFAULT_STAGES,
-        help="comma-separated stages (default: finetune,qat0,qat1,qat2,qat3)",
+        help="comma-separated stages (default: finetune,qat,qat_per-channel)",
     )
     parser.add_argument(
         "--slug",
@@ -262,15 +257,6 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="STAGE=OWNER/SLUG",
         help="override a stage's kernel slug (repeatable)",
-    )
-    parser.add_argument(
-        "--per-channel",
-        action="store_true",
-        help=(
-            "target the per-channel QAT kernels: suffix each non-finetune stage "
-            "with '_per-channel' (qatN -> qatN_per-channel). Run with and without "
-            "to collect both per-tensor and per-channel into one manifest."
-        ),
     )
     parser.add_argument(
         "--no-download",
@@ -285,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--keep-fragments",
         action="store_true",
-        help="keep the manifest.qatN.json fragments after merging",
+        help="keep the manifest.<stage>.json fragments after merging",
     )
     parser.add_argument("--quiet", action="store_true", help="quiet kaggle download")
     args = parser.parse_args(argv)
