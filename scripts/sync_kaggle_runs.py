@@ -27,10 +27,12 @@ differently): ``<owner>/<config '_'->'-' lowercased>-<stage>``, e.g.
 ``freimutdiener/ssd-mn2-fpnlite-sc-phenobench-320-qat``.
 
 Usage (pulls finetune + qat + qat_per-channel by default):
+    scripts/sync_kaggle_runs.py                               # all eight SSD configs
     scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320
     scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320 --dest artifacts/tf/ssd-mn2_sc_phenobench_320
     scripts/sync_kaggle_runs.py <config> --no-download        # re-merge what's on disk
     scripts/sync_kaggle_runs.py <config> --stages finetune,qat   # subset
+    scripts/sync_kaggle_runs.py --no-download                 # re-merge all eight on disk
 """
 
 from __future__ import annotations
@@ -56,10 +58,31 @@ DEFAULT_OWNER = "freimutdiener"
 DEFAULT_STAGES = ["finetune", "qat", "qat_per-channel"]
 ARTIFACTS_TF = Path(__file__).resolve().parent.parent / "artifacts" / "tf"
 
+# The eight SSD configs — {plain SSD, FPNLite} × {sc, mc} × {untiled, tiled} —
+# synced by default when no config slug is given on the command line.
+SSD_CONFIGS = [
+    "ssd-mn2_sc_phenobench_320",
+    "ssd-mn2_mc_phenobench_320",
+    "ssd-mn2_sc_phenobench-tiled_320",
+    "ssd-mn2_mc_phenobench-tiled_320",
+    "ssd-mn2-fpnlite_sc_phenobench_320",
+    "ssd-mn2-fpnlite_mc_phenobench_320",
+    "ssd-mn2-fpnlite_sc_phenobench-tiled_320",
+    "ssd-mn2-fpnlite_mc_phenobench-tiled_320",
+]
+
 
 def stage_manifest_name(stage: str) -> str:
     """Fragment filename a stage's notebook publishes."""
     return "manifest.json" if stage == "finetune" else f"manifest.{stage}.json"
+
+
+# Kaggle caps a notebook's title (hence its slug body) at 50 characters. When the
+# full ``...-qat-per-channel`` body would exceed that, the kernel is titled with
+# the abbreviated ``...-qat-pc`` suffix instead (the per-tensor ``qat`` body is
+# always short enough). The internal stage name, fragment manifest, and artifact
+# folder stay ``qat_per-channel`` regardless -- only the Kaggle slug abbreviates.
+KAGGLE_SLUG_MAX = 50
 
 
 def kernel_slug(owner: str, config: str, stage: str) -> str:
@@ -67,9 +90,13 @@ def kernel_slug(owner: str, config: str, stage: str) -> str:
 
     Kaggle slugs are lowercase with hyphens only, so the whole ``config-stage``
     body is hyphenated -- including the per-channel stage ``qat_per-channel``
-    -> ``...-qat-per-channel``.
+    -> ``...-qat-per-channel``. If that body would exceed Kaggle's 50-char title
+    cap, the ``-per-channel`` suffix is abbreviated to ``-pc`` to match how the
+    kernel had to be titled (e.g. the FPNLite tiled per-channel configs).
     """
     body = f"{config}-{stage}".replace("_", "-").lower()
+    if len(body) > KAGGLE_SLUG_MAX and body.endswith("-qat-per-channel"):
+        body = body[: -len("-per-channel")] + "-pc"
     return f"{owner}/{body}"
 
 
@@ -235,8 +262,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "configs",
-        nargs="+",
-        help="config slug(s), e.g. ssd-mn2_sc_phenobench-320",
+        nargs="*",
+        help=(
+            "config slug(s), e.g. ssd-mn2_sc_phenobench_320; "
+            "omit to sync all eight SSD configs"
+        ),
     )
     parser.add_argument(
         "--owner", default=DEFAULT_OWNER, help="Kaggle owner (default: %(default)s)"
@@ -276,10 +306,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quiet", action="store_true", help="quiet kaggle download")
     args = parser.parse_args(argv)
 
-    if args.dest and len(args.configs) > 1:
+    # No slugs given -> sync the whole eight-config SSD matrix.
+    configs = args.configs or SSD_CONFIGS
+
+    if args.dest and len(configs) > 1:
         parser.error("--dest is only valid with a single config")
 
-    for config in args.configs:
+    for config in configs:
         sync_config(config, args)
 
     return 0
