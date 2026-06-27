@@ -52,6 +52,16 @@ def main(argv=None):
         help="NMS IoU threshold baked into the post-processing op (default: 0.5)",
     )
     parser.add_argument(
+        "--no-native-resize",
+        dest="native_resize",
+        action="store_false",
+        help=(
+            "build FPN models with the legacy PACK/reshape upsample instead of the "
+            "default NPU-delegatable RESIZE_NEAREST_NEIGHBOR op (no-op for non-FPN "
+            "models)"
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="reconvert even if the output .tflite already exists",
@@ -86,6 +96,7 @@ def main(argv=None):
             datasets_dir=args.datasets,
             out_dir=args.out,
             iou_threshold=args.iou,
+            native_resize=args.native_resize,
             overwrite=args.overwrite,
         )
         total += len(written)

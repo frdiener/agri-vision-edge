@@ -153,8 +153,15 @@ def _convert_one(
     datasets_dir: Path,
     out_path: Path,
     iou_threshold: float,
+    native_resize: bool = True,
 ) -> None:
-    """Rebuild + convert a single target and embed its metadata."""
+    """Rebuild + convert a single target and embed its metadata.
+
+    ``native_resize`` (default True) builds FPN models with the NPU-delegatable
+    ``RESIZE_NEAREST_NEIGHBOR`` upsample instead of the ``PACK``-based reshape
+    trick; it is a no-op for non-FPN models. See
+    ``agri_vision_edge.tfod.fpn_native_resize_upsampling``.
+    """
     import tensorflow as tf
 
     from agri_vision_edge.third_party import setup_tensorflow_models
@@ -166,7 +173,10 @@ def _convert_one(
 
     from agri_vision_edge.conversion.metadata import write_object_detector_metadata
     from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
-    from agri_vision_edge.tfod import load_pipeline_config
+    from agri_vision_edge.tfod import (
+        fpn_native_resize_upsampling,
+        load_pipeline_config,
+    )
     from agri_vision_edge.tfod.qat import (
         ensure_model_is_built_for_qat,
         quantize_backbone,
@@ -183,7 +193,8 @@ def _convert_one(
     score_threshold = nms.score_threshold
     resolution = pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.width
 
-    detection_model = model_builder.build(pipeline_config.model, is_training=False)
+    with fpn_native_resize_upsampling(native_resize):
+        detection_model = model_builder.build(pipeline_config.model, is_training=False)
     ensure_model_is_built_for_qat(detection_model, pipeline_config)
 
     # Rebuild the exact QAT graph the checkpoint was trained with so the weights
@@ -268,6 +279,7 @@ def convert_variant(
     out_dir: Path,
     targets: tuple[ConversionTarget, ...] = STANDARD_TARGETS,
     iou_threshold: float = 0.5,
+    native_resize: bool = True,
     overwrite: bool = False,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
@@ -277,6 +289,11 @@ def convert_variant(
     A target is converted only when its backing stage directory is present;
     existing outputs are skipped unless ``overwrite`` is set. Returns the list of
     written ``.tflite`` paths.
+
+    ``native_resize`` (default True) builds FPN models with the NPU-delegatable
+    ``RESIZE_NEAREST_NEIGHBOR`` upsample instead of the ``PACK`` reshape trick, so
+    the full FPN graph delegates to the Teflon/etnaviv NPU; no-op for non-FPN
+    models.
     """
     written: list[Path] = []
 
@@ -294,7 +311,14 @@ def convert_variant(
             continue
 
         log(f"  convert {target.label} -> {out_path.name}")
-        _convert_one(variant_dir, target, datasets_dir, out_path, iou_threshold)
+        _convert_one(
+            variant_dir,
+            target,
+            datasets_dir,
+            out_path,
+            iou_threshold,
+            native_resize=native_resize,
+        )
         written.append(out_path)
 
     return written

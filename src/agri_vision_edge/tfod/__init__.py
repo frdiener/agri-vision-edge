@@ -1,4 +1,5 @@
 from .common import (
+    fpn_native_resize_upsampling,
     get_tf_models_research_dir,
 )
 from .config import (
@@ -20,6 +21,7 @@ __all__ = [
     # Common
     #
     "get_tf_models_research_dir",
+    "fpn_native_resize_upsampling",
     #
     # Config
     #
