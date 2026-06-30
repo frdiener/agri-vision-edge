@@ -249,39 +249,43 @@ def _quantize_combined(model, *, per_channel, weight_only_names, box_predictor_n
 
     def clone_function(layer):
         name = layer.name
-        # Whole box-predictor region: convs weight-only, everything else float.
-        # The weight-only box predictor (qat._quantize_weights_only) leaves its
-        # tower ReLU6 / reshapes unpinned; pinning them under the per-channel
-        # scheme breaks the converter (concat requant / quantizer abort), so we
-        # exclude the entire region from the generator's ReLU6/Add pinning.
-        if name in box_predictor_names:
-            if isinstance(layer, _CONV):
-                return tfmot.quantization.keras.quantize_annotate_layer(
-                    layer, quantize_config=weight_only_cfg
-                )
-            return layer
+        is_box_predictor = name in box_predictor_names
 
         if isinstance(layer, _CONV):
-            if name in weight_only_names:
-                config = weight_only_cfg
-            elif name in relu6_fed:
+            # Must take precedence over the box-predictor weight-only rule:
+            # this Conv's output is the input to a ReLU6, so its output
+            # quantizer must be fixed to the ReLU6 range.
+            if name in relu6_fed:
                 config = relu6_conv_cfg
+
+            # Keep all other predictor convolutions weight-only, especially
+            # the terminal box/class prediction convolutions before concat.
+            elif is_box_predictor or name in weight_only_names:
+                config = weight_only_cfg
+
             else:
                 config = signed_cfg
+
             return tfmot.quantization.keras.quantize_annotate_layer(
-                layer, quantize_config=config
+                layer,
+                quantize_config=config,
             )
 
-        # Generator/coarse ReLU6 + residual Add are pinned only in the
-        # per-channel scheme (matches the backbone).
-        if relu6_layer_cfg is not None and _is_relu6(layer):
-            return tfmot.quantization.keras.quantize_annotate_layer(
-                layer, quantize_config=relu6_layer_cfg
-            )
-        if add_cfg is not None and isinstance(layer, tf.keras.layers.Add):
-            return tfmot.quantization.keras.quantize_annotate_layer(
-                layer, quantize_config=add_cfg
-            )
+        # In the per-channel path, preserve the existing explicit ReLU6/Add
+        # annotations for the non-box-predictor FPN region.
+        if not is_box_predictor:
+            if relu6_layer_cfg is not None and _is_relu6(layer):
+                return tfmot.quantization.keras.quantize_annotate_layer(
+                    layer,
+                    quantize_config=relu6_layer_cfg,
+                )
+
+            if add_cfg is not None and isinstance(layer, tf.keras.layers.Add):
+                return tfmot.quantization.keras.quantize_annotate_layer(
+                    layer,
+                    quantize_config=add_cfg,
+                )
+
         return layer
 
     with tfmot.quantization.keras.quantize_scope(
