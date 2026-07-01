@@ -67,10 +67,30 @@ prediction path while retaining QAT-trained weights.
 For the same reason, graph boundaries matter. Tensors passed between separately
 quantized functional submodels may acquire incompatible quantization domains or
 extra Quantize/Dequantize/Requantize operations at export. Where a feature-map
-tensor is consumed by multiple head components, the preferred representation is
-one combined functional graph folded and passed through `quantize_apply` once.
-This keeps the relevant producer, consumers, and concat paths in a single QAT
-graph.
+tensor is consumed by multiple components, the preferred representation is one
+combined functional graph folded and passed through `quantize_apply` once. This
+keeps the relevant producer, consumers, and concat paths in a single QAT graph.
+
+`quantize_detection_model` is the single self-contained entry point (callers do
+not pre-fold / pre-quantize the backbone). It dispatches on architecture:
+
+  * FPNLite folds + quantizes the backbone as its own graph, then rebuilds the
+    whole post-backbone head (FPN generator + coarse blocks + weight-shared box
+    predictor) as one combined functional graph. Its backbone taps are signed /
+    Add outputs, not free-relu6 tensors, so the backbone/head boundary is clean.
+
+  * plain SSD INLINES the backbone with the head into a single full-model
+    functional graph (image -> backbone -> feature-map generator -> box/class
+    predictor), folded and quantized in one pass. This is required because the
+    SSD tap `layer_15/expansion_output` is `block_13_expand`'s ReLU6 output,
+    which is DUAL-USE (it feeds the backbone's own `block_13_depthwise` and is
+    exported as a feature map). In the per-channel scheme relu6 outputs are
+    free-calibrated; a separately quantized backbone and head would calibrate
+    that shared tensor independently, pick mismatched (scale, zero_point), and
+    force the converter to dequantize + recompute the conv in float + requantize
+    per consumer -- stray ops the NPU delegate cannot consume. One full-model
+    graph makes the tap interior, so it is calibrated once, both consumers share
+    the scale, no stray requant appears, and per-channel weights are retained.
 
 Per-channel fake-quant nodes are intentionally avoided. In this conversion
 pipeline, baking `fake_quant_with_min_max_vars_per_channel` into the model
@@ -478,57 +498,100 @@ def _clone_conv_unique(layer, name):
     return new
 
 
-def quantize_detection_head(detection_model, image_size, *, per_channel=False):
+def quantize_detection_model(detection_model, image_size, *, per_channel=False):
     """
     Quantize the detection head in place via weight-preserving functional
     rebuilds, so QAT covers the whole graph up to the postprocess. Call AFTER the
     backbone has been folded + quantized.
 
-    ``per_channel`` must match the backbone. Dispatches on the head architecture:
+    Self-contained: it folds + quantizes the backbone itself, so callers pass a
+    freshly built (unfolded, unquantized) detection model -- they must NOT
+    pre-fold / pre-quantize ``classification_backbone``. ``per_channel`` selects
+    the deployment weight granularity. Dispatches on the head architecture:
+
+      * FPNLite (KerasFpnTopDownFeatureMaps + WeightSharedConvolutionalBox
+        Predictor): the backbone is folded + quantized as its OWN graph, then the
+        whole post-backbone head (FPN generator + coarse blocks + weight-shared
+        box predictor) is rebuilt as ONE combined functional graph and quantized
+        in ONE pass -- see ``_quantize_fpn_detection_head``. The FPN taps are not
+        free-relu6 dual-use tensors, so the backbone/head boundary stays clean.
 
       * plain SSD MobileNetV2 (KerasMultiResolutionFeatureMaps +
-        ConvolutionalBoxPredictor) -- see ``_quantize_ssd_detection_head``.
-      * FPNLite (KerasFpnTopDownFeatureMaps + WeightSharedConvolutionalBox
-        Predictor) -- see ``_quantize_fpn_detection_head``.
-
-    In both, the whole post-backbone head (feature generator + box/class
-    predictor) is rebuilt as ONE functional model and quantized in ONE
-    quantize_apply pass (full scheme; box/class predictor convs weight-only),
-    so no QAT/model boundary is left between the generator and the predictor.
+        ConvolutionalBoxPredictor): the backbone is INLINED with the head into a
+        single full-model functional graph, folded + quantized in ONE pass -- see
+        ``_quantize_ssd_detection_head``. This is required because the SSD tap
+        ``layer_15/expansion_output`` is a free-relu6 tensor used both inside the
+        backbone and by the head; a separate backbone graph would calibrate it
+        inconsistently and leave stray requant nodes.
     """
     fe = detection_model.feature_extractor
     if hasattr(fe, "_fpn_features_generator"):
+        fe.classification_backbone = fold_model(fe.classification_backbone)
+        fe.classification_backbone = quantize_backbone(
+            fe.classification_backbone, per_channel=per_channel
+        )
         return _quantize_fpn_detection_head(
             detection_model, image_size, per_channel=per_channel
         )
 
-    return _quantize_ssd_detection_head(
+    return _quantize_ssd_detection_model(
         detection_model, image_size, per_channel=per_channel
     )
 
 
 # =========================================================
-# Plain SSD MobileNetV2 head QAT (KerasMultiResolutionFeatureMaps +
-# ConvolutionalBoxPredictor).
+# Plain SSD MobileNetV2 QAT -- ONE full-model combined functional graph.
 #
-# Like the FPNLite head, the WHOLE post-backbone head (feature-map generator +
-# box/class predictor) is rebuilt as ONE functional model and quantized in ONE
-# quantize_apply pass. Previously the generator and predictor were quantized as
-# two separate models, leaving a QAT/model boundary at every generated feature
-# map. In the per-channel scheme the relu6-fed convs have free-calibrated
-# outputs, so conversion could assign incompatible activation-quant domains on
-# the two sides of such a boundary and insert stray QUANTIZE / DEQUANTIZE /
-# requant nodes the NPU delegate cannot consume. One combined graph keeps the
-# feature-map producer, its consumers, and the reshape/CONCAT prediction path
-# interior to a single quantize_apply, so the converter aligns compatible scales
-# through the concat while still emitting per-channel weights.
+# Unlike the FPNLite head (which starts from backbone feature inputs, keeping the
+# backbone a separate quantized graph), the plain SSD path folds+quantizes the
+# WHOLE model -- backbone + feature-map generator + box/class predictor -- as a
+# single functional graph in ONE quantize_apply pass:
 #
-# Installation mirrors the FPN adapters: the meta-arch calls extract_features
-# (-> feature_maps) and the box predictor as two separate steps, but the
-# combined model must run ONCE. The generator adapter runs it and caches
-# (feature_maps, box, cls); the box-predictor adapter returns the cached
-# box/class tensors.
+#     padded image
+#       -> MobileNetV2 backbone (inlined)  -> layer_15/expansion & layer_19 taps
+#       -> feature-map generator
+#       -> box/class predictor convs -> reshape
+#
+# Why the backbone must be INSIDE this graph (not quantized separately): the SSD
+# backbone tap ``layer_15/expansion_output`` is ``block_13_expand``'s ReLU6
+# output, which is DUAL-USE -- it feeds the backbone's own ``block_13_depthwise``
+# AND is exported as a feature map. In the per-channel scheme relu6 outputs are
+# free-calibrated; a separately-quantized backbone and head calibrate that shared
+# tensor INDEPENDENTLY, pick mismatched (scale, zero_point), and the converter
+# then dequantizes + recomputes ``block_13_expand`` in float + requantizes per
+# consumer -> stray QUANTIZE/DEQUANTIZE. Folding+quantizing the backbone together
+# with the head makes the tap interior to ONE quantize_apply, so it is calibrated
+# ONCE, both consumers share the same scale, and no stray requant appears -- while
+# TFLite still emits per-channel weights (the relu6-fed convs stay weight-only).
+#
+# Installation: the meta-arch calls extract_features -- which calls
+# classification_backbone then feature_map_generator -- and then the box
+# predictor, as separate steps; but the combined model must run ONCE. The
+# BACKBONE adapter runs it (it is the first call, and receives the padded image =
+# the combined graph's input) and caches (feature_maps, box, cls); the generator
+# and box-predictor adapters return their cached slice.
 # =========================================================
+
+
+def _replay_functional(model, input_tensor):
+    """
+    Re-apply a functional Keras model's layers onto ``input_tensor``, reusing the
+    original layer objects (weights preserved), and return the model's output
+    tensor(s). This flattens a nested model into the surrounding functional graph
+    -- needed so ``fold_model`` (which folds conv/BN/ReLU6 across ``model.layers``)
+    can see the backbone's layers instead of an opaque nested Model. Mirrors
+    ``fold_model``'s single-input, single-inbound-node replay; the backbone is a
+    single-input graph, exactly what ``fold_mobilenetv2_backbone`` already folds.
+    """
+    out: dict[str, tf.Tensor] = {}
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.InputLayer):
+            out[layer.name] = input_tensor
+            continue
+        parents = list(tf.nest.flatten(layer.inbound_nodes[0].inbound_layers))
+        inputs = [out[p.name] for p in parents]
+        out[layer.name] = layer(inputs[0] if len(inputs) == 1 else inputs)
+    return [out[t._keras_history.layer.name] for t in model.outputs]
 
 
 def _ssd_bp_body(box_predictor, feature_tensors, conv_sink):
@@ -583,14 +646,21 @@ def _ssd_bp_body(box_predictor, feature_tensors, conv_sink):
 
 def _build_combined_ssd_functional(detection_model, image_size):
     """
-    Build ONE functional model for the plain SSD head: backbone feature inputs ->
-    feature-map generator -> box/class predictor -> [feature_maps..., box_out...,
-    cls_out...]. Converged layers are reused (weights preserved); ReLU6 Lambdas
-    are swapped for explicit ``keras.layers.ReLU`` so ``fold_model`` can pre-fold
-    them into the conv (a conv + Lambda(relu6) does NOT fuse in TFLite -- it
-    leaves a dequant->relu6->quant sandwich the NPU delegate cannot consume).
+    Build ONE functional model for the WHOLE plain SSD model: padded image ->
+    MobileNetV2 backbone (inlined) -> feature-map generator -> box/class predictor
+    -> [feature_maps..., box_out..., cls_out...]. Converged layers are reused
+    (weights preserved, BN/ReLU6 still present so ``fold_model`` folds the whole
+    graph at once); ReLU6 Lambdas in the generator are swapped for explicit
+    ``keras.layers.ReLU`` so folding pre-folds them into the conv (a conv +
+    Lambda(relu6) does NOT fuse in TFLite -- it leaves a dequant->relu6->quant
+    sandwich the NPU delegate cannot consume).
 
-    Returns (model, feature_map_keys, num_feature_maps, box_predictor_conv_names).
+    The backbone is INLINED (not a separate quantized graph) so its dual-use tap
+    ``layer_15/expansion_output`` is interior to one quantize_apply -- see the
+    section banner.
+
+    Returns (model, feature_map_keys, num_feature_maps, num_taps,
+    box_predictor_conv_names).
     """
     from object_detection.utils import ops as od_ops
 
@@ -598,27 +668,29 @@ def _build_combined_ssd_functional(detection_model, image_size):
     fmg = fe.feature_map_generator
     backbone = fe.classification_backbone
 
-    keys = [fl for fl in fmg.feature_map_layout["from_layer"] if fl]
+    tap_keys = [fl for fl in fmg.feature_map_layout["from_layer"] if fl]
     pp, _ = detection_model.preprocess(
         tf.zeros([1, image_size, image_size, 3], dtype=tf.float32)
     )
-    feats = backbone(od_ops.pad_to_multiple(pp, fe._pad_to_multiple))
-    feature_specs = collections.OrderedDict(
-        (k, feats[i].shape) for i, k in enumerate(keys)
+    padded = od_ops.pad_to_multiple(pp, fe._pad_to_multiple)
+    # Concrete run to recover the fmg output key order.
+    feats = backbone(padded)
+    out_keys = list(
+        fmg({k: feats[i] for i, k in enumerate(tap_keys)}).keys()
     )
-    # Feature-map output keys, in the order KerasMultiResolutionFeatureMaps emits.
-    out_keys = list(fmg({k: tf.zeros(v) for k, v in feature_specs.items()}).keys())
 
-    inp = collections.OrderedDict(
-        (k, tf.keras.Input(shape=tuple(v.as_list()[1:]), name=k.replace("/", "__")))
-        for k, v in feature_specs.items()
+    # Inline the raw backbone into the combined graph (single image input).
+    image_input = tf.keras.Input(
+        shape=tuple(padded.shape.as_list()[1:]), name="padded_image"
     )
+    taps = _replay_functional(backbone, image_input)
+    tap_map = {k: taps[i] for i, k in enumerate(tap_keys)}
 
     # Feature-map generator body (KerasMultiResolutionFeatureMaps).
     fmaps = []
     for index, from_layer in enumerate(fmg.feature_map_layout["from_layer"]):
         if from_layer:
-            fm = inp[from_layer]
+            fm = tap_map[from_layer]
         else:
             fm = fmaps[-1]
             for layer in fmg.convolutions[index]:
@@ -633,14 +705,14 @@ def _build_combined_ssd_functional(detection_model, image_size):
         detection_model._box_predictor, feature_maps, bp_convs
     )
 
-    model = tf.keras.Model(list(inp.values()), feature_maps + box_out + cls_out)
-    return model, out_keys, len(feature_maps), bp_convs
+    model = tf.keras.Model(image_input, feature_maps + box_out + cls_out)
+    return model, out_keys, len(feature_maps), len(tap_keys), bp_convs
 
 
 class _CombinedSsdHead:
-    """Runs the combined SSD model once and caches (feature_maps, box, cls) so the
-    generator and box-predictor adapters can each return their slice from a
-    single graph evaluation."""
+    """Runs the combined full SSD model (image -> everything) once and caches
+    (feature_maps, box, cls) so the backbone / generator / box-predictor adapters
+    can each return their slice from a single graph evaluation."""
 
     def __init__(self, qmodel, feature_map_keys, num_maps):
         self.q = qmodel
@@ -648,8 +720,8 @@ class _CombinedSsdHead:
         self.num_maps = num_maps
         self._cache = None
 
-    def run(self, feats_by_input_order):
-        outs = self.q(feats_by_input_order)
+    def run(self, padded_image):
+        outs = self.q(padded_image)
         outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
         maps = outs[: self.num_maps]
         rest = outs[self.num_maps :]
@@ -659,18 +731,35 @@ class _CombinedSsdHead:
         return maps, box, cls
 
 
+class _SsdBackboneAdapter:
+    """Drop-in for ``feature_extractor.classification_backbone``. extract_features
+    calls it FIRST, with the padded image (= the combined graph's input), so it
+    RUNS the full combined model once and caches (feature_maps, box, cls). It
+    returns ``num_taps`` placeholder tap tensors purely to satisfy
+    ``image_features[0]``/``[1]`` indexing in extract_features -- the
+    feature-map-generator adapter ignores them and returns the cached maps."""
+
+    def __init__(self, head, num_taps):
+        self.head = head
+        self.num_taps = num_taps
+
+    def __call__(self, padded_image):
+        maps, _box, _cls = self.head.run(padded_image)
+        # The returned taps are only handed to the (cache-returning) fmg adapter,
+        # so any tensors of the right count suffice; reuse a real feature map.
+        return [maps[0]] * self.num_taps
+
+
 class _SsdGenAdapter:
-    """Drop-in for ``feature_extractor.feature_map_generator``: runs the combined
-    model (caching everything) and returns just the feature maps as the
-    meta-arch's dict-in / OrderedDict-out contract expects."""
+    """Drop-in for ``feature_extractor.feature_map_generator``: returns the cached
+    feature maps (the backbone adapter already ran the combined model) as the
+    meta-arch's OrderedDict contract expects."""
 
     def __init__(self, head):
         self.head = head
 
     def __call__(self, image_features):
-        san = {k.replace("/", "__"): v for k, v in image_features.items()}
-        feats = [san[name] for name in self.head.q.input_names]
-        maps, _box, _cls = self.head.run(feats)
+        maps, _box, _cls = self.head._cache
         # NB: no `strict=` -- under @tf.function autograph rewrites `zip` into its
         # own `zip_`, which does not accept Python 3.10's strict keyword.
         return collections.OrderedDict(
@@ -681,7 +770,7 @@ class _SsdGenAdapter:
 class _SsdBoxPredictorAdapter(tf.keras.layers.Layer):
     """Drop-in for ``_box_predictor``: returns the cached box/class tensors as
     the {BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND} dict (the combined
-    model already computed them when the generator adapter ran)."""
+    model already computed them when the backbone adapter ran)."""
 
     def __init__(self, head, **kw):
         super().__init__(**kw)
@@ -701,16 +790,27 @@ class _SsdBoxPredictorAdapter(tf.keras.layers.Layer):
         }
 
 
-def _quantize_ssd_detection_head(detection_model, image_size, *, per_channel=False):
+def _quantize_ssd_detection_model(detection_model, image_size, *, per_channel=False):
     """
-    Plain SSD head QAT via ONE combined functional model + ONE quantize_apply.
-    Call AFTER the backbone has been folded + quantized. See the section banner.
+    Plain SSD QAT via ONE full-model combined functional graph (backbone + head)
+    + ONE quantize_apply. Call with the ORIGINAL (unfolded, unquantized) backbone
+    -- this path folds+quantizes the backbone together with the head so the
+    dual-use ``layer_15/expansion_output`` tap is interior. See the section banner.
     """
     fe = detection_model.feature_extractor
-    model, out_keys, num_maps, bp_convs = _build_combined_ssd_functional(
+    model, out_keys, num_maps, num_taps, bp_convs = _build_combined_ssd_functional(
         detection_model, image_size
     )
-    folded = fold_model(model)
+
+    # Inlining the backbone REUSES its layers, so those layers now carry two
+    # inbound nodes (their original backbone-graph node + the one just created).
+    # ``fold_model`` reads ``inbound_nodes[0]`` (the original), which points at the
+    # backbone's own InputLayer and is not part of this combined graph. Clone the
+    # combined model to fresh single-node layers (copying the trained weights) so
+    # folding sees only this graph's connectivity.
+    clean = tf.keras.models.clone_model(model)
+    clean.set_weights(model.get_weights())
+    folded = fold_model(clean)
 
     # Box/class predictor convs are linear (no BN), so no "_folded" suffix; the
     # variant is included defensively in case a configured tower conv folds BN.
@@ -719,7 +819,8 @@ def _quantize_ssd_detection_head(detection_model, image_size, *, per_channel=Fal
     q = _quantize_full(folded, per_channel=per_channel, weight_only_names=weight_only)
 
     head = _CombinedSsdHead(q, out_keys, num_maps)
-    fe._q_combined_head = q  # track variables for conversion
+    fe._q_combined_model = q  # track variables for conversion/training
+    fe.classification_backbone = _SsdBackboneAdapter(head, num_taps)
     fe.feature_map_generator = _SsdGenAdapter(head)
     detection_model._box_predictor = _SsdBoxPredictorAdapter(head)
     return detection_model

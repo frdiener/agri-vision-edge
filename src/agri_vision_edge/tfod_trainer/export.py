@@ -116,31 +116,21 @@ def export_run(
     )
 
     if qat:
-        from agri_vision_edge.tfod import fold_mobilenetv2_backbone
         from agri_vision_edge.tfod.qat import (
             ensure_model_is_built_for_qat,
-            quantize_backbone,
-            quantize_detection_head,
+            quantize_detection_model,
         )
 
         ensure_model_is_built_for_qat(detection_model, pipeline_config)
-        fe = detection_model.feature_extractor
 
-        print("Folding batchnorms into the convolutions...")
-        fe.classification_backbone = fold_mobilenetv2_backbone(
-            fe.classification_backbone
-        )
-
-        print("Adding fake quantization nodes to the backbone (full int8)...")
-        fe.classification_backbone = quantize_backbone(
-            fe.classification_backbone, per_channel=qat_per_channel
-        )
-
-        # The head quantization must run after the backbone is quantized
-        # (it reads the backbone's output shapes).
-        print("Quantizing the detection head (feature maps + box predictor)...")
+        # quantize_detection_model is self-contained: it folds BatchNorms and
+        # inserts the fake-quant nodes for the WHOLE model, reproducing the exact
+        # trained QAT graph so the checkpoint restores. FPN folds+quantizes the
+        # backbone as its own graph then the combined head; plain SSD inlines the
+        # backbone with the head into ONE combined functional graph.
+        print("Folding + quantizing the full model (backbone + detection head)...")
         image_size = pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.height
-        quantize_detection_head(
+        quantize_detection_model(
             detection_model,
             image_size,
             per_channel=qat_per_channel,

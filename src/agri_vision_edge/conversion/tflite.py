@@ -172,15 +172,13 @@ def _convert_one(
     from object_detection.export_tflite_graph_lib_tf2 import SSDModule
 
     from agri_vision_edge.conversion.metadata import write_object_detector_metadata
-    from agri_vision_edge.tfod import fold_mobilenetv2_backbone as fold
     from agri_vision_edge.tfod import (
         fpn_native_resize_upsampling,
         load_pipeline_config,
     )
     from agri_vision_edge.tfod.qat import (
         ensure_model_is_built_for_qat,
-        quantize_backbone,
-        quantize_detection_head,
+        quantize_detection_model,
     )
 
     stage_dir = variant_dir / target.stage_subdir
@@ -198,17 +196,12 @@ def _convert_one(
     ensure_model_is_built_for_qat(detection_model, pipeline_config)
 
     # Rebuild the exact QAT graph the checkpoint was trained with so the weights
-    # restore cleanly: fold BatchNorms, quantize_backbone (full int8 scheme),
-    # then quantize_detection_head. per_channel must match the trained checkpoint.
+    # restore cleanly. quantize_detection_model is self-contained: it folds +
+    # quantizes the backbone (FPN: as its own graph; plain SSD: inlined into one
+    # full-model combined graph) and the head in one path. per_channel must match
+    # the trained checkpoint.
     if target.quantization != "ptq":
-        backbone_folded = fold(
-            detection_model.feature_extractor.classification_backbone
-        )
-        qat_backbone = quantize_backbone(
-            backbone_folded, per_channel=target.per_channel
-        )
-        detection_model.feature_extractor.classification_backbone = qat_backbone
-        quantize_detection_head(
+        quantize_detection_model(
             detection_model, resolution, per_channel=target.per_channel
         )
 
@@ -248,7 +241,7 @@ def _convert_one(
         converter.representative_dataset = _representative_dataset_fn(
             variant_dir.name, datasets_dir, resolution
         )
-        converter._experimental_new_quantizer = False
+        converter._experimental_new_quantizer = True # this may be set to false if problems arise.
         converter._experimental_disable_per_channel = not target.per_channel
     else:  # fp32: keep float weights, no calibration, float builtins only.
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]

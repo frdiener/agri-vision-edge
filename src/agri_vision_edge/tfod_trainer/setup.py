@@ -310,28 +310,16 @@ def apply_graph_modifications(
     )
 
     # Imported lazily to mirror train_loop and avoid import cycles.
-    from agri_vision_edge.tfod import fold_mobilenetv2_backbone
-    from agri_vision_edge.tfod.qat import (
-        quantize_backbone,
-        quantize_detection_head,
-    )
+    from agri_vision_edge.tfod.qat import quantize_detection_model
 
-    feature_extractor = detection_model.feature_extractor
-
-    print("Folding batchnorms into the convolutions...")
-    feature_extractor.classification_backbone = fold_mobilenetv2_backbone(
-        feature_extractor.classification_backbone
-    )
-
-    print("Adding fake quantization nodes to the backbone (full int8)...")
-    feature_extractor.classification_backbone = quantize_backbone(
-        feature_extractor.classification_backbone,
-        per_channel=trainer_cfg.qat_per_channel,
-    )
-
-    print("Quantizing the detection head (feature maps + box predictor)...")
+    # quantize_detection_model is self-contained: it folds BatchNorms and inserts
+    # the fake-quant nodes for the WHOLE model. FPN folds+quantizes the backbone
+    # as its own graph then the combined head; plain SSD inlines the backbone with
+    # the head into ONE combined functional graph (so the dual-use relu6 tap is
+    # interior and no stray requant is left at the backbone/head boundary).
+    print("Folding + quantizing the full model (backbone + detection head)...")
     image_size = runtime.configs["model"].ssd.image_resizer.fixed_shape_resizer.height
-    quantize_detection_head(
+    quantize_detection_model(
         detection_model,
         image_size,
         per_channel=trainer_cfg.qat_per_channel,
