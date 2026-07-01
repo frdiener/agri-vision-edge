@@ -7,7 +7,7 @@ from .config import (
     load_pipeline_config,
     save_pipeline_config,
 )
-from .mobilenetv2_bn_folding import fold_mobilenetv2_backbone
+from .folding import fold_mobilenetv2_backbone
 
 # NOTE: the QAT helpers (quantize_backbone / quantize_detection_head) live in
 # .qat, which imports tensorflow_model_optimization at module load. They are
