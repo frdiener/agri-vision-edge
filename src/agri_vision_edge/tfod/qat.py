@@ -1,43 +1,93 @@
 """
 Quantization-aware training for folded TFOD SSD / SSD-FPNLite MobileNetV2.
 
-The deployment accelerators want a fully int8 graph. Every model -- the
-MobileNetV2 backbone and the functionally-rebuilt detection heads alike -- is
-first **folded** (``folding.fold_model``: BN folded into the conv, ReLU6
-pre-folded into the conv's intrinsic ``activation``) and then quantized by the
-single "full" scheme below (``quantize_backbone``). Only Conv2D /
-DepthwiseConv2D (plus residual ``Add`` in the per-channel target) are annotated;
-activation ranges are pinned explicitly where it matters.
+The deployment targets require an int8 TFLite graph. Before QAT, every
+functional subgraph is folded with `folding.fold_model`: BatchNorm parameters
+are absorbed into their preceding convolution and a following ReLU6 is moved
+into that convolution's intrinsic `activation`. Consequently, the folded
+Conv2D / DepthwiseConv2D output is the post-ReLU6 tensor that TFLite may fuse
+into the corresponding convolution operator.
 
-Two variants are selected by ``per_channel`` -- the deployment target's WEIGHT
-granularity. The [0, 6] ReLU6 range is what both variants must deliver on the
-tensor that survives TFLite's conv+ReLU6 fusion; pre-folding the ReLU6 into the
-conv makes the conv's OWN output that surviving tensor, so:
+`quantize_backbone` applies the common convolutional QAT scheme. Conv2D and
+DepthwiseConv2D layers are annotated throughout; residual `Add` outputs are
+also annotated for the per-channel target. Detection heads are rebuilt as
+functional graphs before applying the same machinery, because TFOD's original
+head components are subclassed models whose layers cannot safely be replaced
+in place for SavedModel/TFLite export.
 
-    * per_channel=False (i.MX8M Plus / stock delegate): the relu6-fed conv gets
-      a fixed [0, 6] output quantizer (``ReLU6ConvQuantConfig``). The conv is
-      then a self-contained quantized op, so TFLite keeps PER-TENSOR weights
-      through the conv+ReLU6 fusion. This is what forces a strictly per-tensor
-      int8 graph.
+`per_channel` selects the intended *deployment weight granularity*, not the
+granularity of the QAT fake-quant variables. In both modes,
+`BaseQuantConfig` uses per-tensor, symmetric weight fake-quant. Per-channel
+TFLite weights are deliberately left to the converter: weight-only QAT layers,
+combined with `_experimental_disable_per_channel=False`, allow conversion to
+choose per-channel weight quantization without inserting per-channel
+fake-quant nodes into the training graph.
 
-    * per_channel=True (i.MX93 Ethos-U): the relu6-fed conv is left WEIGHT-ONLY
-      (``FreeOutputConvQuantConfig``), so TFLite is free to emit PER-CHANNEL weights
-      for it. The [0, 6] range still lands exactly (scale 6/255, zero_point
-      -128) because the conv carries an intrinsic ``tf.nn.relu6`` and TFLite
-      pins the fused activation to relu6's known range.
+The two modes differ primarily in whether QAT explicitly constrains the output
+of a folded ReLU6 convolution:
 
-In BOTH variants the weight FAKE-QUANT is per-tensor (see ``BaseQuantConfig``).
-Per-channel weights, when wanted, are produced by the CONVERTER (weight-only
-convs + ``_experimental_disable_per_channel=False``), never by per-channel
-fake-quant nodes -- baking ``fake_quant_with_min_max_vars_per_channel`` into the
-graph makes the TFLite int8 calibration collect ~0 activation ranges and
-collapses AP. So ``per_channel`` only chooses the pin placement.
+```
+* ``per_channel=False`` (per-tensor deployment target, e.g. the i.MX8M
+  Plus path): a convolution carrying intrinsic ``tf.nn.relu6`` receives
+  ``ReLU6ConvQuantConfig``. Its output is fake-quantized to the fixed
+  interval ``[0, 6]``. This explicitly establishes the post-ReLU6
+  activation quantization used by the per-tensor QAT path and avoids
+  relying on converter calibration for that tensor.
 
-With correct [-1, 1] calibration plain PTQ already lands near fp32, so QAT
-exists to make int8 deployment robust rather than to recover accuracy.
+* ``per_channel=True`` (per-channel deployment target, e.g. Ethos-U):
+  a convolution carrying intrinsic ``tf.nn.relu6`` receives
+  ``FreeOutputConvQuantConfig``. Its weights are fake-quantized during
+  QAT, but its output is not given a QAT output fake-quantizer. During
+  TFLite conversion, calibration selects the activation quantization
+  parameters and may emit per-channel weights. The intrinsic ReLU6 still
+  constrains the real-valued activation to ``[0, 6]``, but it is not an
+  explicit fixed-QAT pin and does not by itself guarantee
+  ``scale == 6 / 255`` or ``zero_point == -128``.
+
+  Leaving the output free (rather than pinning [0, 6] as the per-tensor
+  scheme does) is required, not merely preferred, and was validated on the
+  combined FPN graph (experiments/fpn_qat_probe,
+  out/PIN_VS_FREE_FINDINGS.md): an explicit [0, 6] output pin here CRASHES
+  the FPN export (native abort in flatbuffer_export) under BOTH the legacy
+  and the new converter/quantizer, and -- even where it converts -- makes
+  each relu6-fed conv a self-contained per-tensor op, which drops
+  per-channel weight emission to zero. Per-channel weights + per-tensor
+  int8 activations are otherwise the intended, working representation (the
+  free path emits per-channel weights with no stray requant and aligned
+  concat inputs); the incompatibility is specifically the fixed-pin /
+  per-channel converter interaction, not per-channel weights themselves.
+```
+
+Linear box-predictor convolutions are also kept output-free. Their outputs feed
+reshape/concat paths across feature-map levels, where independently fixed
+output scales would require requantization to make concat inputs compatible.
+Leaving these outputs free lets conversion choose compatible scales for the
+prediction path while retaining QAT-trained weights.
+
+For the same reason, graph boundaries matter. Tensors passed between separately
+quantized functional submodels may acquire incompatible quantization domains or
+extra Quantize/Dequantize/Requantize operations at export. Where a feature-map
+tensor is consumed by multiple head components, the preferred representation is
+one combined functional graph folded and passed through `quantize_apply` once.
+This keeps the relevant producer, consumers, and concat paths in a single QAT
+graph.
+
+Per-channel fake-quant nodes are intentionally avoided. In this conversion
+pipeline, baking `fake_quant_with_min_max_vars_per_channel` into the model
+graph interferes with activation calibration and has previously produced
+near-zero collected activation ranges and severe AP loss. Therefore,
+`per_channel` changes output-pin placement and permits converter-side
+per-channel weight emission; it does not request per-channel fake-quant during
+training.
+
+With a representative dataset normalized to `[-1, 1]`, plain PTQ can already
+remain close to floating-point accuracy. QAT is used here chiefly to make the
+exported int8 graph and its activation ranges more stable and deployment-safe,
+rather than as a prerequisite for recovering baseline accuracy.
 """
 
 import collections
+import contextlib
 import itertools
 
 import numpy as np
@@ -49,6 +99,35 @@ from tensorflow.keras.utils import register_keras_serializable
 from agri_vision_edge.tfod.folding import fold_model, is_relu6
 
 _CONV = (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D)
+
+
+# ---------------------------------------------------------------------------
+# Validation hook (default OFF -- does not affect production export).
+#
+# Normally the per-channel scheme leaves relu6-fed conv outputs FREE (calibrated
+# by the converter) so TFLite may emit per-channel weights, and pins a fixed
+# [0, 6] output only in the per-tensor scheme. This flag lets a probe force the
+# explicit ReLU6ConvQuantConfig ([0, 6] pin) on intrinsic-relu6 convs *even in
+# per_channel mode*, to empirically test whether an explicit activation pin is
+# compatible with converter-emitted per-channel weights. Toggle only via the
+# ``force_relu6_pin_in_per_channel`` context manager below; leave False for
+# real exports.
+# ---------------------------------------------------------------------------
+_FORCE_RELU6_PIN_IN_PER_CHANNEL = False
+
+
+@contextlib.contextmanager
+def force_relu6_pin_in_per_channel(enabled: bool = True):
+    """Temporarily pin relu6-fed conv outputs to a fixed [0, 6] even under the
+    per-channel scheme (validation/probe use only). Restores the previous value
+    on exit. See ``_FORCE_RELU6_PIN_IN_PER_CHANNEL``."""
+    global _FORCE_RELU6_PIN_IN_PER_CHANNEL
+    previous = _FORCE_RELU6_PIN_IN_PER_CHANNEL
+    _FORCE_RELU6_PIN_IN_PER_CHANNEL = enabled
+    try:
+        yield
+    finally:
+        _FORCE_RELU6_PIN_IN_PER_CHANNEL = previous
 
 
 # =========================================================
@@ -112,9 +191,24 @@ class FreeOutputConvQuantConfig(BaseQuantConfig):
       (a) per-channel relu6-fed convs: a free output range lets TFLite emit
           PER-CHANNEL weights, while the intrinsic ``tf.nn.relu6`` still pins the
           fused output MIN at 0 (zp -128) and the converter calibrates the MAX
-          (<= 6). A fixed [0,6] output pin cannot be used here: TFMOT cannot
-          quantize tf.nn.relu6 as an activation, and a fixed OUTPUT pin combined
-          with per-channel weights crashes the legacy converter on the FPN head.
+          (<= 6). A fixed [0,6] output pin cannot be used here -- validated
+          empirically on the combined FPN graph (see
+          experiments/fpn_qat_probe/out/PIN_VS_FREE_FINDINGS.md):
+            * TFMOT cannot quantize tf.nn.relu6 as an activation; the pin can
+              only live on the conv OUTPUT.
+            * That explicit output pin + per-channel weights CRASHES the FPN
+              export (native SIGABRT in flatbuffer_export) under BOTH the legacy
+              AND the new quantizer (``_experimental_new_quantizer`` False/True).
+            * Even where it converts (backbone alone, no FPN fanout), the pin
+              defeats per-channel weight emission entirely (104 -> 0 per-channel
+              weight tensors): an explicit output quantizer makes the conv a
+              self-contained per-tensor op, so the converter emits PER-TENSOR
+              weights. Explicit output pin and per-channel weights are mutually
+              exclusive on the same conv -- a QAT/converter interaction limit,
+              not a limit of per-channel weight quantization.
+          Hence per-channel keeps free outputs; the exact (6/255, -128) pin is
+          reserved for the per-TENSOR scheme (ReLU6ConvQuantConfig), which wants
+          per-tensor weights anyway.
 
       (b) box-predictor convs (linear, feeding a concat): a free scale lets the
           converter align all concat inputs to one scale -- no stray requant
@@ -305,7 +399,11 @@ def _quantize_full(model, *, per_channel: bool, weight_only_names=frozenset()):
     """
     signed_cfg = SignedConvQuantConfig()
     weight_only_cfg = FreeOutputConvQuantConfig()
-    relu6_conv_cfg = FreeOutputConvQuantConfig() if per_channel else ReLU6ConvQuantConfig()
+    # Per-tensor always pins relu6 to [0, 6]. Per-channel normally leaves it free
+    # (so TFLite can emit per-channel weights); the validation hook can force the
+    # [0, 6] pin in per-channel mode to test converter compatibility.
+    pin_relu6 = (not per_channel) or _FORCE_RELU6_PIN_IN_PER_CHANNEL
+    relu6_conv_cfg = ReLU6ConvQuantConfig() if pin_relu6 else FreeOutputConvQuantConfig()
     add_cfg = AddOutputConfig() if per_channel else None
 
     def clone_function(layer):
@@ -380,33 +478,6 @@ def _clone_conv_unique(layer, name):
     return new
 
 
-def _quantize_weights_only(model):
-    """
-    Annotate every conv weight-only (no output fake-quant) and quantize_apply.
-
-    Used for the SSD box predictor: its 1x1 box/class convs feed reshape ->
-    CONCAT (across feature maps) -> the float TFLite_Detection_PostProcess.
-    Pinning each conv's output scale would give the feature maps different
-    scales, forcing stray requant QUANTIZE ops before the concat that the NPU
-    delegate cannot consume. Leaving the output scale FREE lets the converter
-    align all concat inputs to one scale (exactly like PTQ). Weights are still
-    QAT-trained; per-tensor vs per-channel emission is the converter's call.
-    """
-    cfg = FreeOutputConvQuantConfig()
-
-    def clone_function(layer):
-        if isinstance(layer, _CONV):
-            return tfmot.quantization.keras.quantize_annotate_layer(
-                layer, quantize_config=cfg
-            )
-        return layer
-
-    with tfmot.quantization.keras.quantize_scope(_QUANT_SCOPE):
-        return tfmot.quantization.keras.quantize_apply(
-            tf.keras.models.clone_model(model, clone_function=clone_function)
-        )
-
-
 def quantize_detection_head(detection_model, image_size, *, per_channel=False):
     """
     Quantize the detection head in place via weight-preserving functional
@@ -416,12 +487,14 @@ def quantize_detection_head(detection_model, image_size, *, per_channel=False):
     ``per_channel`` must match the backbone. Dispatches on the head architecture:
 
       * plain SSD MobileNetV2 (KerasMultiResolutionFeatureMaps +
-        ConvolutionalBoxPredictor) -- below.
+        ConvolutionalBoxPredictor) -- see ``_quantize_ssd_detection_head``.
       * FPNLite (KerasFpnTopDownFeatureMaps + WeightSharedConvolutionalBox
         Predictor) -- see ``_quantize_fpn_detection_head``.
 
-    In both, the feature generator uses the full scheme (same pin placement as
-    the backbone) and the box predictor is always weight-only.
+    In both, the whole post-backbone head (feature generator + box/class
+    predictor) is rebuilt as ONE functional model and quantized in ONE
+    quantize_apply pass (full scheme; box/class predictor convs weight-only),
+    so no QAT/model boundary is left between the generator and the predictor.
     """
     fe = detection_model.feature_extractor
     if hasattr(fe, "_fpn_features_generator"):
@@ -429,8 +502,99 @@ def quantize_detection_head(detection_model, image_size, *, per_channel=False):
             detection_model, image_size, per_channel=per_channel
         )
 
+    return _quantize_ssd_detection_head(
+        detection_model, image_size, per_channel=per_channel
+    )
+
+
+# =========================================================
+# Plain SSD MobileNetV2 head QAT (KerasMultiResolutionFeatureMaps +
+# ConvolutionalBoxPredictor).
+#
+# Like the FPNLite head, the WHOLE post-backbone head (feature-map generator +
+# box/class predictor) is rebuilt as ONE functional model and quantized in ONE
+# quantize_apply pass. Previously the generator and predictor were quantized as
+# two separate models, leaving a QAT/model boundary at every generated feature
+# map. In the per-channel scheme the relu6-fed convs have free-calibrated
+# outputs, so conversion could assign incompatible activation-quant domains on
+# the two sides of such a boundary and insert stray QUANTIZE / DEQUANTIZE /
+# requant nodes the NPU delegate cannot consume. One combined graph keeps the
+# feature-map producer, its consumers, and the reshape/CONCAT prediction path
+# interior to a single quantize_apply, so the converter aligns compatible scales
+# through the concat while still emitting per-channel weights.
+#
+# Installation mirrors the FPN adapters: the meta-arch calls extract_features
+# (-> feature_maps) and the box predictor as two separate steps, but the
+# combined model must run ONCE. The generator adapter runs it and caches
+# (feature_maps, box, cls); the box-predictor adapter returns the cached
+# box/class tensors.
+# =========================================================
+
+
+def _ssd_bp_body(box_predictor, feature_tensors, conv_sink):
+    """Replay a ConvolutionalBoxPredictor over the feature tensors; return
+    (box_out, cls_out). Box/class heads are one 1x1 conv each (no BN) followed by
+    a reshape; the convs share names across heads, so each is cloned to a unique
+    name. Every conv touched (optional shared tower + box/class heads) is
+    recorded in ``conv_sink`` and forced weight-only, so the reshape/CONCAT
+    prediction path can share one scale (any relu6-fed tower conv keeps its
+    intrinsic-relu6 handling via ``_has_intrinsic_relu6`` precedence in
+    ``_quantize_full``)."""
+    from object_detection.core.box_predictor import (
+        BOX_ENCODINGS,
+        CLASS_PREDICTIONS_WITH_BACKGROUND,
+    )
+
+    box_out, cls_out = [], []
+    for i, x0 in enumerate(feature_tensors):
+        x = x0
+        for layer in box_predictor._shared_nets[i]:  # empty unless a tower is configured
+            if isinstance(layer, _CONV):
+                conv_sink.add(layer.name)
+            x = layer(x)
+
+        bh = box_predictor._prediction_heads[BOX_ENCODINGS][i]
+        b = x
+        for layer in bh._box_encoder_layers:
+            if isinstance(layer, _CONV):
+                layer = _clone_conv_unique(layer, f"BoxEncodingPredictor_{i}")
+                conv_sink.add(layer.name)
+            b = layer(b)
+        box_out.append(
+            tf.keras.layers.Reshape(
+                (-1, 1, bh._box_code_size), name=f"box_reshape_{i}"
+            )(b)
+        )
+
+        ch = box_predictor._prediction_heads[CLASS_PREDICTIONS_WITH_BACKGROUND][i]
+        c = x
+        for layer in ch._class_predictor_layers:
+            if isinstance(layer, _CONV):
+                layer = _clone_conv_unique(layer, f"ClassPredictor_{i}")
+                conv_sink.add(layer.name)
+            c = layer(c)
+        cls_out.append(
+            tf.keras.layers.Reshape((-1, ch._num_class_slots), name=f"cls_reshape_{i}")(
+                c
+            )
+        )
+    return box_out, cls_out
+
+
+def _build_combined_ssd_functional(detection_model, image_size):
+    """
+    Build ONE functional model for the plain SSD head: backbone feature inputs ->
+    feature-map generator -> box/class predictor -> [feature_maps..., box_out...,
+    cls_out...]. Converged layers are reused (weights preserved); ReLU6 Lambdas
+    are swapped for explicit ``keras.layers.ReLU`` so ``fold_model`` can pre-fold
+    them into the conv (a conv + Lambda(relu6) does NOT fuse in TFLite -- it
+    leaves a dequant->relu6->quant sandwich the NPU delegate cannot consume).
+
+    Returns (model, feature_map_keys, num_feature_maps, box_predictor_conv_names).
+    """
     from object_detection.utils import ops as od_ops
 
+    fe = detection_model.feature_extractor
     fmg = fe.feature_map_generator
     backbone = fe.classification_backbone
 
@@ -442,45 +606,15 @@ def quantize_detection_head(detection_model, image_size, *, per_channel=False):
     feature_specs = collections.OrderedDict(
         (k, feats[i].shape) for i, k in enumerate(keys)
     )
-    fmg_outputs = fmg({k: tf.zeros(v) for k, v in feature_specs.items()})
-    out_keys = list(fmg_outputs.keys())
-    feature_shapes = [t.shape for t in fmg_outputs.values()]
+    # Feature-map output keys, in the order KerasMultiResolutionFeatureMaps emits.
+    out_keys = list(fmg({k: tf.zeros(v) for k, v in feature_specs.items()}).keys())
 
-    qfmg = quantize_backbone(
-        fold_model(rebuild_feature_map_generator_functional(fmg, feature_specs)),
-        per_channel=per_channel,
-    )
-    fe.feature_map_generator = FMGAdapter(qfmg, out_keys)
-
-    qbp = _quantize_weights_only(
-        rebuild_box_predictor_functional(detection_model._box_predictor, feature_shapes)
-    )
-    detection_model._box_predictor = BoxPredictorAdapter(qbp, len(feature_shapes))
-
-    return detection_model
-
-
-# ---------------------------------------------------------
-# Plain SSD MobileNetV2 head (KerasMultiResolutionFeatureMaps +
-# ConvolutionalBoxPredictor).
-# ---------------------------------------------------------
-
-
-def rebuild_feature_map_generator_functional(fmg, feature_specs):
-    """
-    Functionally reconstruct a KerasMultiResolutionFeatureMaps, reusing its
-    converged layers (weights preserved). ``feature_specs`` is an OrderedDict
-    {backbone_feature_key: TensorShape} for the inputs it consumes.
-
-    ReLU6 ``Lambda`` layers are swapped for an explicit ``keras.layers.ReLU``
-    (same name, no weights) so ``fold_model`` can pre-fold them into the conv
-    (a conv + Lambda(relu6) does NOT fuse in TFLite -- it leaves a
-    dequant->relu6->quant sandwich the NPU delegate cannot consume).
-    """
     inp = collections.OrderedDict(
         (k, tf.keras.Input(shape=tuple(v.as_list()[1:]), name=k.replace("/", "__")))
         for k, v in feature_specs.items()
     )
+
+    # Feature-map generator body (KerasMultiResolutionFeatureMaps).
     fmaps = []
     for index, from_layer in enumerate(fmg.feature_map_layout["from_layer"]):
         if from_layer:
@@ -492,88 +626,66 @@ def rebuild_feature_map_generator_functional(fmg, feature_specs):
                     layer = tf.keras.layers.ReLU(max_value=6.0, name=layer.name)
                 fm = layer(fm)
         fmaps.append(fm)
-    return tf.keras.Model(inputs=inp, outputs=fmaps)
+    feature_maps = fmaps  # aligned with out_keys
 
-
-class FMGAdapter(tf.keras.layers.Layer):
-    """Drop-in for ``feature_extractor.feature_map_generator``: wraps the
-    quantized functional generator (tracked sublayer, so it serializes) and
-    adapts the meta-arch's dict-in / OrderedDict-out contract."""
-
-    def __init__(self, func_model, output_keys, **kw):
-        super().__init__(**kw)
-        self.func = func_model
-        self.output_keys = list(output_keys)
-
-    def call(self, image_features):
-        san = {k.replace("/", "__"): v for k, v in image_features.items()}
-        ordered = [san[name] for name in self.func.input_names]
-        outs = self.func(ordered)
-        outs = outs if isinstance(outs, (list, tuple)) else [outs]
-        # NB: no `strict=` -- under @tf.function autograph rewrites `zip` into its
-        # own `zip_`, which does not accept Python 3.10's strict keyword.
-        return collections.OrderedDict(zip(self.output_keys, outs))  # noqa: B905
-
-
-def rebuild_box_predictor_functional(box_predictor, feature_shapes):
-    """
-    Functionally reconstruct a ConvolutionalBoxPredictor, preserving weights.
-    Box/class heads are one 1x1 conv each (no BN) followed by a reshape; the
-    convs share names across heads so each is cloned to a unique name. Outputs
-    are the box-encoding tensors followed by the class tensors.
-    """
-    from object_detection.core.box_predictor import (
-        BOX_ENCODINGS,
-        CLASS_PREDICTIONS_WITH_BACKGROUND,
+    bp_convs = set()
+    box_out, cls_out = _ssd_bp_body(
+        detection_model._box_predictor, feature_maps, bp_convs
     )
 
-    inputs = [
-        tf.keras.Input(shape=tuple(s.as_list()[1:]), name=f"bp_in_{i}")
-        for i, s in enumerate(feature_shapes)
-    ]
-    box_out, cls_out = [], []
-    for i, x0 in enumerate(inputs):
-        x = x0
-        for layer in box_predictor._shared_nets[i]:  # empty unless a tower is configured
-            x = layer(x)
-        bh = box_predictor._prediction_heads[BOX_ENCODINGS][i]
-        b = x
-        for layer in bh._box_encoder_layers:
-            b = (
-                _clone_conv_unique(layer, f"BoxEncodingPredictor_{i}")
-                if isinstance(layer, _CONV)
-                else layer
-            )(b)
-        box_out.append(
-            tf.keras.layers.Reshape(
-                (-1, 1, bh._box_code_size), name=f"box_reshape_{i}"
-            )(b)
+    model = tf.keras.Model(list(inp.values()), feature_maps + box_out + cls_out)
+    return model, out_keys, len(feature_maps), bp_convs
+
+
+class _CombinedSsdHead:
+    """Runs the combined SSD model once and caches (feature_maps, box, cls) so the
+    generator and box-predictor adapters can each return their slice from a
+    single graph evaluation."""
+
+    def __init__(self, qmodel, feature_map_keys, num_maps):
+        self.q = qmodel
+        self.feature_map_keys = list(feature_map_keys)
+        self.num_maps = num_maps
+        self._cache = None
+
+    def run(self, feats_by_input_order):
+        outs = self.q(feats_by_input_order)
+        outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
+        maps = outs[: self.num_maps]
+        rest = outs[self.num_maps :]
+        half = len(rest) // 2
+        box, cls = rest[:half], rest[half:]
+        self._cache = (maps, box, cls)
+        return maps, box, cls
+
+
+class _SsdGenAdapter:
+    """Drop-in for ``feature_extractor.feature_map_generator``: runs the combined
+    model (caching everything) and returns just the feature maps as the
+    meta-arch's dict-in / OrderedDict-out contract expects."""
+
+    def __init__(self, head):
+        self.head = head
+
+    def __call__(self, image_features):
+        san = {k.replace("/", "__"): v for k, v in image_features.items()}
+        feats = [san[name] for name in self.head.q.input_names]
+        maps, _box, _cls = self.head.run(feats)
+        # NB: no `strict=` -- under @tf.function autograph rewrites `zip` into its
+        # own `zip_`, which does not accept Python 3.10's strict keyword.
+        return collections.OrderedDict(
+            zip(self.head.feature_map_keys, maps)  # noqa: B905
         )
-        ch = box_predictor._prediction_heads[CLASS_PREDICTIONS_WITH_BACKGROUND][i]
-        c = x
-        for layer in ch._class_predictor_layers:
-            c = (
-                _clone_conv_unique(layer, f"ClassPredictor_{i}")
-                if isinstance(layer, _CONV)
-                else layer
-            )(c)
-        cls_out.append(
-            tf.keras.layers.Reshape((-1, ch._num_class_slots), name=f"cls_reshape_{i}")(
-                c
-            )
-        )
-    return tf.keras.Model(inputs, box_out + cls_out)
 
 
-class BoxPredictorAdapter(tf.keras.layers.Layer):
-    """Drop-in for ``_box_predictor``: wraps the quantized functional predictor
-    and returns the {BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND} dict the
-    meta-arch consumes."""
+class _SsdBoxPredictorAdapter(tf.keras.layers.Layer):
+    """Drop-in for ``_box_predictor``: returns the cached box/class tensors as
+    the {BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND} dict (the combined
+    model already computed them when the generator adapter ran)."""
 
-    def __init__(self, func_model, num_feature_maps, **kw):
+    def __init__(self, head, **kw):
         super().__init__(**kw)
-        self.func = func_model
-        self.n = num_feature_maps
+        self.head = head
         self.is_keras_model = True
 
     def call(self, image_features):
@@ -582,12 +694,35 @@ class BoxPredictorAdapter(tf.keras.layers.Layer):
             CLASS_PREDICTIONS_WITH_BACKGROUND,
         )
 
-        outs = self.func(list(image_features))
-        outs = outs if isinstance(outs, (list, tuple)) else [outs]
+        _maps, box, cls = self.head._cache
         return {
-            BOX_ENCODINGS: list(outs[: self.n]),
-            CLASS_PREDICTIONS_WITH_BACKGROUND: list(outs[self.n :]),
+            BOX_ENCODINGS: list(box),
+            CLASS_PREDICTIONS_WITH_BACKGROUND: list(cls),
         }
+
+
+def _quantize_ssd_detection_head(detection_model, image_size, *, per_channel=False):
+    """
+    Plain SSD head QAT via ONE combined functional model + ONE quantize_apply.
+    Call AFTER the backbone has been folded + quantized. See the section banner.
+    """
+    fe = detection_model.feature_extractor
+    model, out_keys, num_maps, bp_convs = _build_combined_ssd_functional(
+        detection_model, image_size
+    )
+    folded = fold_model(model)
+
+    # Box/class predictor convs are linear (no BN), so no "_folded" suffix; the
+    # variant is included defensively in case a configured tower conv folds BN.
+    weight_only = set(bp_convs) | {f"{n}_folded" for n in bp_convs}
+
+    q = _quantize_full(folded, per_channel=per_channel, weight_only_names=weight_only)
+
+    head = _CombinedSsdHead(q, out_keys, num_maps)
+    fe._q_combined_head = q  # track variables for conversion
+    fe.feature_map_generator = _SsdGenAdapter(head)
+    detection_model._box_predictor = _SsdBoxPredictorAdapter(head)
+    return detection_model
 
 
 # =========================================================
@@ -610,7 +745,10 @@ class BoxPredictorAdapter(tf.keras.layers.Layer):
 # cannot fuse and TFLite emits a stray float-ReLU6 island (DEQUANTIZE -> ReLU6 ->
 # QUANTIZE per consumer) the NPU delegate cannot consume. One combined graph lets
 # it fuse: 0 stray quant/dequant AND (per-tensor) 0 per-channel weight tensors.
-# Per-channel converts equally cleanly through the same graph.
+# Keeping the head in one quantized functional graph avoids quantization-domain
+# boundaries between feature generation and prediction, which is particularly
+# important for per-channel conversion where several outputs intentionally remain
+# free-calibrated.
 #
 # Installation: the meta-arch calls extract_features (-> feature_maps) and the
 # box predictor as two separate steps, but the combined model must run ONCE. So
