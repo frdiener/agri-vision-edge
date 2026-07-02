@@ -117,6 +117,7 @@ def save_best_checkpoint(
     """
     state.best_metric = metric_value
     state.patience_counter = 0
+    state.plateau_counter = 0
 
     checkpoint_path = runtime.manager.save()
 
@@ -131,6 +132,103 @@ def save_best_checkpoint(
     )
 
     return checkpoint_path
+
+
+def apply_lr_warmup(runtime, step):
+    """
+    Linearly ramp ``runtime.lr_var`` from the warmup LR to the base LR over the
+    first ``lr_warmup_steps`` steps, then leave it at the base value.
+
+    No-op unless the plateau schedule is active (``lr_var`` is set) and a warmup
+    is configured. Once warmup is done the plateau logic (in ``train``) owns the
+    LR, so this only touches ``lr_var`` for ``step <= lr_warmup_steps``.
+    """
+    if runtime.lr_var is None or runtime.lr_warmup_steps <= 0:
+        return
+
+    if step > runtime.lr_warmup_steps:
+        return
+
+    frac = min(step / float(runtime.lr_warmup_steps), 1.0)
+    warmed = runtime.lr_warmup + (runtime.lr_base - runtime.lr_warmup) * frac
+    runtime.lr_var.assign(warmed)
+
+
+def maybe_reduce_lr_on_plateau(
+    detection_model,
+    runtime,
+    trainer_cfg,
+    state,
+    current_step,
+):
+    """
+    ReduceLROnPlateau step, called on every *non-improving* evaluation.
+
+    Counts consecutive non-improving evals; once the count reaches
+    ``lr_plateau_patience`` (and no cooldown is active) it multiplies ``lr_var``
+    by ``lr_plateau_factor`` (floored at ``lr_plateau_min_lr``) and opens a
+    ``lr_plateau_cooldown`` grace window. When ``lr_plateau_restore_best`` is set
+    the best checkpoint is restored first (warm restart: best weights + optimizer
+    slots, current step count preserved) before the lower LR is applied.
+
+    No-op unless the plateau schedule is active. Independent of the
+    early-stopping patience counter, so LR drops happen before early stopping.
+    """
+    if not trainer_cfg.lr_plateau or runtime.lr_var is None:
+        return
+
+    # Still warming up: don't count plateaus against the ramp.
+    if current_step <= runtime.lr_warmup_steps:
+        return
+
+    if state.cooldown_counter > 0:
+        state.cooldown_counter -= 1
+        state.plateau_counter = 0
+        return
+
+    state.plateau_counter += 1
+
+    if state.plateau_counter < trainer_cfg.lr_plateau_patience:
+        return
+
+    old_lr = float(runtime.lr_var.numpy())
+    new_lr = max(
+        old_lr * trainer_cfg.lr_plateau_factor,
+        trainer_cfg.lr_plateau_min_lr,
+    )
+
+    # Reset the counter and open the cooldown window regardless of whether we
+    # can still reduce (so we don't re-trigger every eval at the LR floor).
+    state.plateau_counter = 0
+    state.cooldown_counter = trainer_cfg.lr_plateau_cooldown
+
+    if new_lr >= old_lr:
+        print(
+            f"LR plateau: already at min_lr ({old_lr:.3e}); not reducing "
+            f"(step {current_step})."
+        )
+        return
+
+    # Warm restart: rewind to the best weights/optimizer state before dropping
+    # the LR. Restoring the checkpoint also rewinds global_step, so save and
+    # re-assign it to keep the training horizon intact.
+    if trainer_cfg.lr_plateau_restore_best and runtime.manager.latest_checkpoint:
+        best_path = runtime.manager.latest_checkpoint
+        saved_step = int(runtime.global_step.numpy())
+        runtime.ckpt.restore(best_path).expect_partial()
+        runtime.global_step.assign(saved_step)
+        print(
+            f"LR plateau: restored best checkpoint ({best_path}) for warm "
+            f"restart."
+        )
+
+    # Assign AFTER the restore, so a checkpoint-restored LR can't clobber it.
+    runtime.lr_var.assign(new_lr)
+
+    print(
+        f"LR plateau: reduced learning rate {old_lr:.3e} -> {new_lr:.3e} "
+        f"at step {current_step} (cooldown {trainer_cfg.lr_plateau_cooldown})."
+    )
 
 
 def assert_finite_model(detection_model, step):
@@ -278,6 +376,10 @@ def train(
             runtime.global_step.numpy()
         )
 
+        # Warmup ramp for the plateau schedule (no-op otherwise). Runs every
+        # step so the LR variable tracks the ramp before plateau reductions.
+        apply_lr_warmup(runtime, current_step)
+
         if (
             current_step
             % trainer_cfg.log_every
@@ -340,7 +442,12 @@ def train(
             ]
         )
 
-        if metric_value > state.best_metric:
+        improved = (
+            metric_value
+            > state.best_metric + trainer_cfg.early_stopping_min_delta
+        )
+
+        if improved:
             print(
                 f"Metric improved: {metric_value} > {state.best_metric}."
                 f" saving checkpoint..."
@@ -360,6 +467,15 @@ def train(
                 f" (patience {state.patience_counter}/{trainer_cfg.early_stopping_patience})"
             )
             state.patience_counter += 1
+
+            # Metric-driven LR annealing (no-op unless lr_plateau is enabled).
+            maybe_reduce_lr_on_plateau(
+                detection_model,
+                runtime,
+                trainer_cfg,
+                state,
+                current_step,
+            )
 
         if (
             state.patience_counter

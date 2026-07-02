@@ -40,6 +40,27 @@ class TrainerConfig:
     # itself instead of a checkpoint below it.
     initial_eval_checkpoint: bool = False
 
+    # Metric-driven "reduce LR on plateau" schedule, layered on top of the
+    # existing best-metric / early-stopping tracker. When enabled the LR becomes
+    # a mutable tf.Variable (see tfod_trainer.setup): it warms up from the
+    # pipeline's warmup LR to its base, then -- each time the monitored metric
+    # fails to improve for `lr_plateau_patience` consecutive evals -- is
+    # multiplied by `lr_plateau_factor` (floored at `lr_plateau_min_lr`), after a
+    # `lr_plateau_cooldown` grace period following each drop. Decouples LR
+    # annealing from a guessed `num_steps` horizon, which is exactly what the
+    # cosine schedule cannot do once early stopping cuts the run short.
+    lr_plateau: bool = False
+    lr_plateau_factor: float = 0.5
+    lr_plateau_patience: int = 8
+    lr_plateau_cooldown: int = 3
+    lr_plateau_min_lr: float = 1e-6
+
+    # On each plateau LR drop, restore the best checkpoint first (a "warm
+    # restart": resume the best weights + optimizer slots, keep the current step
+    # count) before applying the lower LR. Turns each drop into "rewind to the
+    # best point, then refine more gently".
+    lr_plateau_restore_best: bool = True
+
     # Enable quantization-aware training. False = plain finetune (-> PTQ at
     # conversion). True = the full int8 scheme: BatchNorms folded into the convs,
     # backbone + SSD head fake-quantized up to the float postprocess (see

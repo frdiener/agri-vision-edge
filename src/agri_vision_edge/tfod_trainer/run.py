@@ -70,6 +70,17 @@ class FinetuneRunConfig:
     # can plateau at (or dip below) the finetune baseline.
     initial_eval_checkpoint: bool = False
 
+    # Reduce-LR-on-plateau schedule (see TrainerConfig). qat=False finetune runs
+    # benefit most: the LR anneals in response to the val-mAP plateau rather than
+    # a fixed cosine horizon. Turns the LR into a mutable tf.Variable driven from
+    # the training loop.
+    lr_plateau: bool = False
+    lr_plateau_factor: float = 0.5
+    lr_plateau_patience: int = 8
+    lr_plateau_cooldown: int = 3
+    lr_plateau_min_lr: float = 1e-6
+    lr_plateau_restore_best: bool = True
+
     # QAT. qat=False => plain finetune (-> PTQ at conversion). qat=True => the
     # full int8 scheme (fold BN + fake-quant backbone + head). reset_optimizer is
     # tri-state: None ("auto") resolves to True under QAT or resume_full (both
@@ -164,6 +175,12 @@ class FinetuneRunConfig:
             save_metrics_history=self.save_metrics_history,
             reset_optimizer=self.reset_optimizer,
             initial_eval_checkpoint=self.initial_eval_checkpoint,
+            lr_plateau=self.lr_plateau,
+            lr_plateau_factor=self.lr_plateau_factor,
+            lr_plateau_patience=self.lr_plateau_patience,
+            lr_plateau_cooldown=self.lr_plateau_cooldown,
+            lr_plateau_min_lr=self.lr_plateau_min_lr,
+            lr_plateau_restore_best=self.lr_plateau_restore_best,
             qat=self.qat,
             qat_per_channel=self.qat_per_channel,
         )
@@ -247,6 +264,7 @@ def run_finetune(cfg) -> RunResult:
         configs,
         trainer_cfg.train_dir,
         checkpoint_max_to_keep=cfg.checkpoint_max_to_keep,
+        lr_plateau=trainer_cfg.lr_plateau,
     )
 
     train(detection_model, runtime, trainer_cfg)
