@@ -55,6 +55,15 @@ class TrainerConfig:
     lr_plateau_cooldown: int = 3
     lr_plateau_min_lr: float = 1e-6
 
+    # Minimum metric gain that counts as an improvement for the plateau stall
+    # counter (absolute, in metric units). Decoupled from checkpointing: the best
+    # checkpoint still tracks the true strict maximum, but the plateau counter
+    # only resets on a gain larger than this, so an optimizer that jitters around
+    # a plateau while occasionally nudging a microscopic new best still triggers
+    # an LR drop. Set to roughly the eval noise floor (COCO mAP on a small val
+    # set jitters ~1e-3). 0.0 reproduces the old "any improvement resets it".
+    lr_plateau_min_delta: float = 1e-3
+
     # On each plateau LR drop, restore the best checkpoint first (a "warm
     # restart": resume the best weights + optimizer slots, keep the current step
     # count) before applying the lower LR. Turns each drop into "rewind to the
