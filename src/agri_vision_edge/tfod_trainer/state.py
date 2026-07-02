@@ -33,6 +33,13 @@ class TrainerState:
     plateau_ref: float = -np.inf
     cooldown_counter: int = 0
 
+    # LR-exhausted stop: `lr_floored` latches once a reduction reaches
+    # `lr_plateau_min_lr`; `min_lr_stall_counter` then counts "floored stall"
+    # events (plateau triggers that can no longer lower the LR) so the run can
+    # stop early once further annealing is impossible.
+    lr_floored: bool = False
+    min_lr_stall_counter: int = 0
+
     metrics_history: list[dict] = field(
         default_factory=list
     )

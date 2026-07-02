@@ -70,6 +70,15 @@ class TrainerConfig:
     # best point, then refine more gently".
     lr_plateau_restore_best: bool = True
 
+    # Stop once the LR schedule is spent: after the plateau logic tries to reduce
+    # but is already at `lr_plateau_min_lr`, that is a "floored stall" -- further
+    # drops cannot help. Stop after this many such events (0 disables it; the
+    # global `early_stopping_patience` still applies as a hard cap). Counted in
+    # floored-stall events, each ~`lr_plateau_patience` (+cooldown) evals apart,
+    # so this fires well before the generous global patience meant to span the
+    # LR annealing.
+    lr_plateau_exhausted_patience: int = 2
+
     # Enable quantization-aware training. False = plain finetune (-> PTQ at
     # conversion). True = the full int8 scheme: BatchNorms folded into the convs,
     # backbone + SSD head fake-quantized up to the float postprocess (see

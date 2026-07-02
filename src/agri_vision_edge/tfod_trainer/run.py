@@ -81,6 +81,7 @@ class FinetuneRunConfig:
     lr_plateau_min_lr: float = 1e-6
     lr_plateau_min_delta: float = 1e-3
     lr_plateau_restore_best: bool = True
+    lr_plateau_exhausted_patience: int = 2
 
     # QAT. qat=False => plain finetune (-> PTQ at conversion). qat=True => the
     # full int8 scheme (fold BN + fake-quant backbone + head). reset_optimizer is
@@ -183,6 +184,7 @@ class FinetuneRunConfig:
             lr_plateau_min_lr=self.lr_plateau_min_lr,
             lr_plateau_min_delta=self.lr_plateau_min_delta,
             lr_plateau_restore_best=self.lr_plateau_restore_best,
+            lr_plateau_exhausted_patience=self.lr_plateau_exhausted_patience,
             qat=self.qat,
             qat_per_channel=self.qat_per_channel,
         )

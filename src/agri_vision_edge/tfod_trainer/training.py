@@ -176,23 +176,28 @@ def maybe_reduce_lr_on_plateau(
 
     No-op unless the plateau schedule is active. Independent of the
     early-stopping patience counter, so LR drops happen before early stopping.
+
+    Returns:
+        bool: True when the LR schedule is exhausted -- i.e. the plateau logic
+        has hit the ``lr_plateau_min_lr`` floor for ``lr_plateau_exhausted_patience``
+        stalls and the caller should stop training.
     """
     if not trainer_cfg.lr_plateau or runtime.lr_var is None:
-        return
+        return False
 
     # Still warming up: don't count plateaus against the ramp.
     if current_step <= runtime.lr_warmup_steps:
-        return
+        return False
 
     if state.cooldown_counter > 0:
         state.cooldown_counter -= 1
         state.plateau_counter = 0
-        return
+        return False
 
     state.plateau_counter += 1
 
     if state.plateau_counter < trainer_cfg.lr_plateau_patience:
-        return
+        return False
 
     old_lr = float(runtime.lr_var.numpy())
     new_lr = max(
@@ -206,11 +211,21 @@ def maybe_reduce_lr_on_plateau(
     state.cooldown_counter = trainer_cfg.lr_plateau_cooldown
 
     if new_lr >= old_lr:
+        # Floored stall: the LR is already at the min and further reductions
+        # cannot help. Count it; once we have exhausted our patience the run has
+        # nothing left to try, so signal the caller to stop.
+        state.lr_floored = True
+        state.min_lr_stall_counter += 1
         print(
-            f"LR plateau: already at min_lr ({old_lr:.3e}); not reducing "
+            f"LR plateau: already at min_lr ({old_lr:.3e}); floored stall "
+            f"{state.min_lr_stall_counter}/{trainer_cfg.lr_plateau_exhausted_patience} "
             f"(step {current_step})."
         )
-        return
+        return (
+            trainer_cfg.lr_plateau_exhausted_patience > 0
+            and state.min_lr_stall_counter
+            >= trainer_cfg.lr_plateau_exhausted_patience
+        )
 
     # Warm restart: rewind to the best weights/optimizer state before dropping
     # the LR. Restoring the checkpoint also rewinds global_step, so save and
@@ -228,10 +243,15 @@ def maybe_reduce_lr_on_plateau(
     # Assign AFTER the restore, so a checkpoint-restored LR can't clobber it.
     runtime.lr_var.assign(new_lr)
 
+    # Latch the floored flag if this reduction landed exactly on the min LR.
+    if new_lr <= trainer_cfg.lr_plateau_min_lr:
+        state.lr_floored = True
+
     print(
         f"LR plateau: reduced learning rate {old_lr:.3e} -> {new_lr:.3e} "
         f"at step {current_step} (cooldown {trainer_cfg.lr_plateau_cooldown})."
     )
+    return False
 
 
 def assert_finite_model(detection_model, step):
@@ -443,6 +463,11 @@ def train(
                 f"/{trainer_cfg.lr_plateau_patience}"
             )
             sched_parts.append(f"cooldown={state.cooldown_counter}")
+            if state.lr_floored:
+                sched_parts.append(
+                    f"min_lr_stall={state.min_lr_stall_counter}"
+                    f"/{trainer_cfg.lr_plateau_exhausted_patience}"
+                )
 
         print(
             f"Step {current_step}: "
@@ -507,6 +532,8 @@ def train(
 
         # 3) Plateau counter, delta-gated against its own reference; on a stall
         #    it drives the LR reduction (no-op unless lr_plateau is enabled).
+        #    A True return means the LR schedule is exhausted (floored for
+        #    `lr_plateau_exhausted_patience` stalls) -> stop.
         if trainer_cfg.lr_plateau:
             if (
                 metric_value
@@ -514,18 +541,32 @@ def train(
             ):
                 state.plateau_ref = metric_value
                 state.plateau_counter = 0
+                state.min_lr_stall_counter = 0
             else:
-                maybe_reduce_lr_on_plateau(
+                lr_exhausted = maybe_reduce_lr_on_plateau(
                     detection_model,
                     runtime,
                     trainer_cfg,
                     state,
                     current_step,
                 )
+                if lr_exhausted:
+                    print(
+                        f"Stopping at step {current_step}: LR schedule exhausted "
+                        f"(at min_lr {trainer_cfg.lr_plateau_min_lr:.3e} with no "
+                        f"improvement for {state.min_lr_stall_counter} floored "
+                        f"stalls)."
+                    )
+                    break
 
         if (
             state.patience_counter
             >= trainer_cfg
                 .early_stopping_patience
         ):
+            print(
+                f"Stopping at step {current_step}: early-stopping patience "
+                f"{state.patience_counter}/{trainer_cfg.early_stopping_patience} "
+                f"reached."
+            )
             break
