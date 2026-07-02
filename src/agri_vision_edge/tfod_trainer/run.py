@@ -65,10 +65,21 @@ class FinetuneRunConfig:
 
     # QAT. qat=False => plain finetune (-> PTQ at conversion). qat=True => the
     # full int8 scheme (fold BN + fake-quant backbone + head). reset_optimizer is
-    # tri-state: None ("auto") resolves to True under QAT (which normally wants
-    # the optimizer state reset) and False otherwise; explicit True/False wins.
+    # tri-state: None ("auto") resolves to True under QAT or resume_full (both
+    # want a fresh optimizer/LR schedule) and False otherwise; explicit True/
+    # False wins.
     qat: bool = False
     reset_optimizer: bool | None = None
+
+    # Resume OUR OWN converged export (matching num_classes), restoring the
+    # box/class prediction heads too (fine_tune_checkpoint_type="full"), as
+    # opposed to bootstrapping from a foreign detection checkpoint (e.g. COCO,
+    # different num_classes) whose heads must be dropped and reinitialised
+    # ("detection"). QAT always resumes our own export, so it implies this; a
+    # plain-float PTQ base (qat=False) that resumes the finetune export must set
+    # it explicitly, otherwise its heads are dropped and it retrains from cold
+    # (near-zero AP, stuck loss). Independent of quantization.
+    resume_full: bool = False
 
     # Per-channel QAT weight quantization. Default False = per-tensor (i.MX8M
     # Plus Vivante/Teflon NPU). Set True for i.MX93 Arm Ethos-U65, which accepts
@@ -81,7 +92,7 @@ class FinetuneRunConfig:
         self.output_dir = Path(self.output_dir)
 
         if self.reset_optimizer is None:
-            self.reset_optimizer = self.qat
+            self.reset_optimizer = self.qat or self.resume_full
 
     # --- derived paths -------------------------------------------------
 
@@ -173,11 +184,12 @@ def write_pipeline(cfg: FinetuneRunConfig) -> Path:
 
     cfg.pipeline_config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Resuming our own full model (QAT from a finetune export) must restore the
-    # box/class prediction heads too, so use "full". A plain finetune bootstraps
-    # from a foreign detection checkpoint (e.g. COCO, different num_classes) where
-    # the heads must be dropped and reinitialised, so it stays "detection".
-    fine_tune_checkpoint_type = "full" if cfg.qat else "detection"
+    # Resuming our own full model (QAT, or a resume_full PTQ base, from a finetune
+    # export) must restore the box/class prediction heads too, so use "full". A
+    # plain finetune bootstraps from a foreign detection checkpoint (e.g. COCO,
+    # different num_classes) where the heads must be dropped and reinitialised, so
+    # it stays "detection".
+    fine_tune_checkpoint_type = "full" if (cfg.qat or cfg.resume_full) else "detection"
 
     configure_ssd_pipeline(
         config=cfg.finetune,
