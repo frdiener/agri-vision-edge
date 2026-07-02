@@ -63,6 +63,13 @@ class FinetuneRunConfig:
     metric_name: str = "DetectionBoxes_Precision/mAP"
     save_metrics_history: bool = True
 
+    # Evaluate + checkpoint the restored weights before the first train step, so
+    # the best-metric tracker is seeded with that baseline. Guarantees the run
+    # exports a checkpoint no worse than its starting weights -- useful for a
+    # PTQ float base resuming a converged finetune, where the reduced schedule
+    # can plateau at (or dip below) the finetune baseline.
+    initial_eval_checkpoint: bool = False
+
     # QAT. qat=False => plain finetune (-> PTQ at conversion). qat=True => the
     # full int8 scheme (fold BN + fake-quant backbone + head). reset_optimizer is
     # tri-state: None ("auto") resolves to True under QAT or resume_full (both
@@ -156,6 +163,7 @@ class FinetuneRunConfig:
             early_stopping_min_delta=self.finetune.early_stopping_min_delta,
             save_metrics_history=self.save_metrics_history,
             reset_optimizer=self.reset_optimizer,
+            initial_eval_checkpoint=self.initial_eval_checkpoint,
             qat=self.qat,
             qat_per_channel=self.qat_per_channel,
         )

@@ -32,6 +32,14 @@ class TrainerConfig:
 
     reset_optimizer: bool = False
 
+    # Evaluate the restored weights once before the first train step, seeding
+    # the best-metric tracker with that baseline and checkpointing it. This
+    # guarantees the exported "best" checkpoint is never worse than the starting
+    # weights: a reduced-schedule refinement (e.g. the PTQ float base resuming a
+    # converged finetune) that only ever regresses will export the baseline
+    # itself instead of a checkpoint below it.
+    initial_eval_checkpoint: bool = False
+
     # Enable quantization-aware training. False = plain finetune (-> PTQ at
     # conversion). True = the full int8 scheme: BatchNorms folded into the convs,
     # backbone + SSD head fake-quantized up to the float postprocess (see

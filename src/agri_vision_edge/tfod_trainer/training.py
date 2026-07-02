@@ -78,6 +78,61 @@ def create_train_dataset(
     ).repeat()
 
 
+def run_evaluation(detection_model, runtime):
+    """
+    Run one evaluation pass, transparently swapping EMA weights in/out.
+
+    With EMA enabled the moving-average weights are evaluated (swapped in, then
+    the raw training weights swapped back), mirroring
+    ``object_detection.model_lib_v2.train_loop``.
+    """
+    if runtime.use_moving_average:
+        runtime.optimizer.swap_weights()
+
+    metrics = evaluate(
+        detection_model,
+        create_eval_dataset(
+            detection_model,
+            runtime.configs,
+        ),
+        runtime,
+    )
+
+    if runtime.use_moving_average:
+        runtime.optimizer.swap_weights()
+
+    return metrics
+
+
+def save_best_checkpoint(
+    runtime,
+    trainer_cfg,
+    state,
+    current_step,
+    metric_value,
+):
+    """
+    Record ``metric_value`` as the new best, checkpoint the weights and write
+    ``best_metric.json``. Resets the early-stopping patience counter.
+    """
+    state.best_metric = metric_value
+    state.patience_counter = 0
+
+    checkpoint_path = runtime.manager.save()
+
+    write_json(
+        trainer_cfg.best_metric_path,
+        {
+            "step": current_step,
+            "metric_name": trainer_cfg.metric_name,
+            "metric_value": metric_value,
+            "checkpoint": checkpoint_path,
+        },
+    )
+
+    return checkpoint_path
+
+
 def assert_finite_model(detection_model, step):
     """
     Abort training if any model weight is non-finite.
@@ -133,7 +188,10 @@ def train(
         train_ds,
     )
 
-    if graph_modified:
+    # When we are going to seed the best-metric tracker with a scored baseline
+    # eval below, skip this purely-informational (unscored) eval to avoid
+    # evaluating the same initial weights twice.
+    if graph_modified and not trainer_cfg.initial_eval_checkpoint:
         print(
             "\nEvaluating initial modified "
             "configuration..."
@@ -150,6 +208,47 @@ def train(
             eval_input,
             use_tpu=False,
             global_step=runtime.global_step,
+        )
+
+    # Seed the best-metric tracker with the restored (baseline) weights, and
+    # checkpoint them, before the first train step. This guarantees the exported
+    # "best" checkpoint is never worse than the starting point: a reduced
+    # schedule that only ever regresses (e.g. a PTQ float base resuming an
+    # already-converged finetune) will export the baseline itself.
+    if trainer_cfg.initial_eval_checkpoint:
+        current_step = int(runtime.global_step.numpy())
+
+        print(
+            "\nEvaluating initial weights to seed the best-metric baseline..."
+        )
+
+        metrics = run_evaluation(detection_model, runtime)
+
+        record = {"step": current_step}
+        record.update(metrics_to_float(metrics))
+        state.metrics_history.append(record)
+
+        if trainer_cfg.save_metrics_history:
+            write_json(
+                trainer_cfg.history_path,
+                state.metrics_history,
+            )
+
+        metric_value = float(
+            metrics[trainer_cfg.metric_name]
+        )
+
+        save_best_checkpoint(
+            runtime,
+            trainer_cfg,
+            state,
+            current_step,
+            metric_value,
+        )
+
+        print(
+            f"Initial baseline {trainer_cfg.metric_name}={metric_value}; "
+            "checkpoint saved. Training must beat it to overwrite."
         )
 
     iterator = iter(train_ds)
@@ -216,23 +315,9 @@ def train(
             )
         )
 
-        # With EMA enabled, evaluate the moving-average weights by swapping
-        # them in, then swap the raw training weights back before saving
-        # (matches object_detection.model_lib_v2.train_loop).
-        if runtime.use_moving_average:
-            runtime.optimizer.swap_weights()
-
-        metrics = evaluate(
-            detection_model,
-            create_eval_dataset(
-                detection_model,
-                runtime.configs,
-            ),
-            runtime,
-        )
-
-        if runtime.use_moving_average:
-            runtime.optimizer.swap_weights()
+        # Evaluate (swapping EMA weights in/out when enabled, matching
+        # object_detection.model_lib_v2.train_loop).
+        metrics = run_evaluation(detection_model, runtime)
 
         # Record this step's metrics for later plotting. Eval metrics go in
         # first so the training Loss/* values (and LR / throughput) from
@@ -261,27 +346,12 @@ def train(
                 f" saving checkpoint..."
             )
 
-            state.best_metric = (
-                metric_value
-            )
-
-            state.patience_counter = 0
-
-            checkpoint_path = (
-                runtime.manager.save()
-            )
-
-            write_json(
-                trainer_cfg.best_metric_path,
-                {
-                    "step": current_step,
-                    "metric_name":
-                        trainer_cfg.metric_name,
-                    "metric_value":
-                        metric_value,
-                    "checkpoint":
-                        checkpoint_path,
-                },
+            save_best_checkpoint(
+                runtime,
+                trainer_cfg,
+                state,
+                current_step,
+                metric_value,
             )
 
         else:
