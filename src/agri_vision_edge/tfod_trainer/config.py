@@ -55,11 +55,29 @@ class TrainerConfig:
     lr_plateau_cooldown: int = 3
     lr_plateau_min_lr: float = 1e-6
 
+    # Minimum metric gain that counts as an improvement for the plateau stall
+    # counter (absolute, in metric units). Decoupled from checkpointing: the best
+    # checkpoint still tracks the true strict maximum, but the plateau counter
+    # only resets on a gain larger than this, so an optimizer that jitters around
+    # a plateau while occasionally nudging a microscopic new best still triggers
+    # an LR drop. Set to roughly the eval noise floor (COCO mAP on a small val
+    # set jitters ~1e-3). 0.0 reproduces the old "any improvement resets it".
+    lr_plateau_min_delta: float = 1e-3
+
     # On each plateau LR drop, restore the best checkpoint first (a "warm
     # restart": resume the best weights + optimizer slots, keep the current step
     # count) before applying the lower LR. Turns each drop into "rewind to the
     # best point, then refine more gently".
     lr_plateau_restore_best: bool = True
+
+    # Stop once the LR schedule is spent: after the plateau logic tries to reduce
+    # but is already at `lr_plateau_min_lr`, that is a "floored stall" -- further
+    # drops cannot help. Stop after this many such events (0 disables it; the
+    # global `early_stopping_patience` still applies as a hard cap). Counted in
+    # floored-stall events, each ~`lr_plateau_patience` (+cooldown) evals apart,
+    # so this fires well before the generous global patience meant to span the
+    # LR annealing.
+    lr_plateau_exhausted_patience: int = 2
 
     # Enable quantization-aware training. False = plain finetune (-> PTQ at
     # conversion). True = the full int8 scheme: BatchNorms folded into the convs,
