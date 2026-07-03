@@ -163,6 +163,7 @@ def maybe_reduce_lr_on_plateau(
     trainer_cfg,
     state,
     current_step,
+    metric_value,
 ):
     """
     ReduceLROnPlateau step, called on every *non-improving* evaluation.
@@ -187,6 +188,13 @@ def maybe_reduce_lr_on_plateau(
 
     # Still warming up: don't count plateaus against the ramp.
     if current_step <= runtime.lr_warmup_steps:
+        return False
+
+    # Only anneal once the metric has cleared 0 + tolerance (reusing the plateau
+    # min_delta as the tolerance). Early on the model detects nothing and the
+    # metric sits at ~0; "no improvement" there is meaningless, so annealing
+    # would needlessly kill the LR before the model gets going.
+    if metric_value <= trainer_cfg.lr_plateau_min_delta:
         return False
 
     if state.cooldown_counter > 0:
@@ -549,6 +557,7 @@ def train(
                     trainer_cfg,
                     state,
                     current_step,
+                    metric_value,
                 )
                 if lr_exhausted:
                     print(
