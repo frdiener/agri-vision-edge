@@ -420,53 +420,29 @@ def apply_graph_modifications(
     train_dataset,
 ):
     """
-    Apply optimizer reset, BatchNorm folding and backbone QAT.
+    Apply BatchNorm folding and backbone QAT.
 
-    Functionally mirrors the corresponding block in
-    ``object_detection.model_lib_v2.train_loop``, in order:
-
-      1. ``reset_optimizer``: zero the global step and rebuild the optimizer
-         from the pipeline config.
-      2. ``qat``: fold BatchNorms into the convs, then fake-quantize the
-         backbone + SSD head (the full int8 scheme,
-         ``agri_vision_edge.tfod.qat``).
+    Mirrors the graph-modification block in
+    ``object_detection.model_lib_v2.train_loop``: when ``qat`` is set, fold
+    BatchNorms into the convs, then fake-quantize the backbone + SSD head (the
+    full int8 scheme, ``agri_vision_edge.tfod.qat``).
 
     Must run after ``restore_weights`` (so the loaded weights are folded /
-    quantized) and before the train step is traced (so the rebuilt optimizer
-    and modified backbone are captured). Mutates ``runtime`` and
-    ``detection_model`` in place.
+    quantized) and before the train step is traced (so the modified backbone is
+    captured). Mutates ``runtime`` and ``detection_model`` in place.
+
+    Note: there is deliberately no optimizer reset here. PTQ/QAT resume from an
+    exported model-only ``ckpt-0`` (``load_fine_tune_checkpoint`` restores model
+    weights only, never the optimizer or step), so the optimizer built in
+    ``create_runtime`` is already fresh and starts at step 0. Keeping that single
+    optimizer instance also keeps ``runtime.ckpt`` coherent, so the
+    ``lr_plateau_restore_best`` warm restart actually restores the live model +
+    optimizer under QAT/PTQ.
 
     Returns:
         bool: True if the backbone graph was modified (QAT), so the caller can
         run an initial evaluation of the new configuration.
     """
-
-    train_config = runtime.configs["train_config"]
-
-    if trainer_cfg.control.reset_optimizer:
-        print("Resetting the optimizer...")
-        runtime.global_step.assign(0)
-        if runtime.lr_var is not None:
-            # Plateau schedule: rebuild the variable-LR optimizer and reset the
-            # LR variable to its warmup/base starting value.
-            initial_lr = (
-                runtime.lr_warmup
-                if runtime.lr_warmup_steps > 0
-                else runtime.lr_base
-            )
-            runtime.lr_var.assign(initial_lr)
-            runtime.optimizer = build_optimizer_with_lr_var(
-                train_config.optimizer,
-                runtime.lr_var,
-            )
-            runtime.learning_rate = runtime.lr_var
-        else:
-            optimizer, (learning_rate,) = optimizer_builder.build(
-                train_config.optimizer,
-                global_step=runtime.global_step,
-            )
-            runtime.optimizer = optimizer
-            runtime.learning_rate = learning_rate
 
     if not trainer_cfg.control.qat:
         return False

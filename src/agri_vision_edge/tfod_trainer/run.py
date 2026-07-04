@@ -14,8 +14,7 @@ two can be driven head-less from Python::
         output_dir="runs/finetune",
     ))
 
-QAT is the same call with ``qat=True`` (and optionally ``qat_per_channel`` /
-``reset_optimizer``) set.
+QAT is the same call with ``qat=True`` (and optionally ``qat_per_channel``) set.
 """
 
 from __future__ import annotations
@@ -72,9 +71,8 @@ class FinetuneRunConfig:
 
     ``control`` (a :class:`TrainingControlConfig`):
         Every custom training-loop knob -- early stopping, reduce-LR-on-plateau,
-        logging / checkpointing, and the QAT flags (``qat`` / ``qat_per_channel``
-        / ``reset_optimizer``). These are consumed by the trainer via
-        :meth:`to_trainer_config`.
+        logging / checkpointing, and the QAT flags (``qat`` / ``qat_per_channel``).
+        These are consumed by the trainer via :meth:`to_trainer_config`.
     """
 
     model_path: Path
@@ -91,13 +89,6 @@ class FinetuneRunConfig:
         self.model_path = Path(self.model_path)
         self.dataset_bundle_path = Path(self.dataset_bundle_path)
         self.output_dir = Path(self.output_dir)
-
-        # reset_optimizer is tri-state: None ("auto") resolves to True under QAT
-        # or resume_full (both want a fresh optimizer/LR schedule) and False
-        # otherwise; explicit True/False wins. Resolved here because it depends
-        # on both control.qat and the orchestration-level resume_full.
-        if self.control.reset_optimizer is None:
-            self.control.reset_optimizer = self.control.qat or self.resume_full
 
     # --- QAT convenience (read-through to control) ---------------------
 
@@ -150,9 +141,9 @@ class FinetuneRunConfig:
 
         Backward compatible with the pre-nesting layout: ``early_stopping_*``
         found inside ``finetune`` and any flat control knobs (``qat``,
-        ``qat_per_channel``, ``reset_optimizer``, ``lr_plateau*``, ``log_every``,
-        ...) sitting at the top level are folded into ``control``, so historical
-        manifests keep loading.
+        ``qat_per_channel``, ``lr_plateau*``, ``log_every``, ...) sitting at the
+        top level are folded into ``control``, so historical manifests keep
+        loading. A legacy ``reset_optimizer`` (now removed) is dropped.
         """
         data = dict(data)
 
@@ -174,6 +165,12 @@ class FinetuneRunConfig:
             if isinstance(augmentation, dict):
                 finetune["augmentation"] = AugmentationConfig(**augmentation)
             data["finetune"] = FineTuneConfig(**finetune)
+
+        # `reset_optimizer` was removed (vestigial once PTQ/QAT resume from an
+        # exported model-only ckpt-0 rather than the finetune train dir). Drop any
+        # legacy occurrence -- top level or nested -- so old manifests still load.
+        data.pop("reset_optimizer", None)
+        control_data.pop("reset_optimizer", None)
 
         if control_data:
             data["control"] = TrainingControlConfig(**control_data)

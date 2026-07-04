@@ -38,12 +38,6 @@ class TrainingControlConfig:
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
 
-    # Rebuild a fresh optimizer / LR schedule before training. Tri-state: None
-    # ("auto") is resolved by ``FinetuneRunConfig`` to True under QAT or
-    # resume_full and False otherwise; explicit True/False wins. When a
-    # ``TrainerConfig`` is built directly (no master), None is treated as False.
-    reset_optimizer: bool | None = None
-
     # Evaluate the restored weights once before the first train step, seeding
     # the best-metric tracker with that baseline and checkpointing it. This
     # guarantees the exported "best" checkpoint is never worse than the starting
