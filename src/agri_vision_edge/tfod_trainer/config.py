@@ -4,20 +4,23 @@ Configuration objects for TFOD training.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
 @dataclass(slots=True)
-class TrainerConfig:
+class TrainingControlConfig:
     """
-    High-level training configuration.
+    Custom training-loop control policy.
 
-    Independent from TFOD protobuf configuration.
+    The single home for every knob that drives OUR training loop rather than the
+    TFOD protobuf pipeline: metric-based checkpointing, early stopping, the
+    reduce-LR-on-plateau schedule, and the graph-modification flags (optimizer
+    reset + QAT). None of these are pipeline/model semantics (those live in
+    ``FineTuneConfig``) nor run orchestration/paths (those live in
+    ``FinetuneRunConfig``); they are the trainer's own contract, so they are
+    declared here exactly once and consumed via ``TrainerConfig.control``.
     """
-
-    pipeline_config: Path
-    train_dir: Path
 
     log_every: int = 100
 
@@ -25,12 +28,17 @@ class TrainerConfig:
 
     metric_name: str = "DetectionBoxes_Precision/mAP"
 
+    save_metrics_history: bool = True
+
+    # Custom metric-based early stopping (patience counted in eval intervals).
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 0.0
 
-    save_metrics_history: bool = True
-
-    reset_optimizer: bool = False
+    # Rebuild a fresh optimizer / LR schedule before training. Tri-state: None
+    # ("auto") is resolved by ``FinetuneRunConfig`` to True under QAT or
+    # resume_full and False otherwise; explicit True/False wins. When a
+    # ``TrainerConfig`` is built directly (no master), None is treated as False.
+    reset_optimizer: bool | None = None
 
     # Evaluate the restored weights once before the first train step, seeding
     # the best-metric tracker with that baseline and checkpointing it. This
@@ -91,6 +99,23 @@ class TrainerConfig:
     # touch more accurate. Maps to `per_channel` on quantize_backbone (it selects
     # the pin placement; the converter, not the fake-quant, emits per-channel).
     qat_per_channel: bool = False
+
+
+@dataclass(slots=True)
+class TrainerConfig:
+    """
+    High-level training configuration.
+
+    Independent from TFOD protobuf configuration. Only needs a rendered pipeline
+    config + a train dir; every other knob lives in ``control``
+    (a :class:`TrainingControlConfig`), so this stays a narrow, model-source- and
+    UI-agnostic contract the trainer can be driven with directly.
+    """
+
+    pipeline_config: Path
+    train_dir: Path
+
+    control: TrainingControlConfig = field(default_factory=TrainingControlConfig)
 
     @property
     def history_path(self) -> Path:
