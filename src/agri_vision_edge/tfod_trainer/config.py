@@ -31,7 +31,11 @@ class TrainingControlConfig:
     save_metrics_history: bool = True
 
     # Custom metric-based early stopping (patience counted in eval intervals).
-    early_stopping_patience: int = 10
+    # 0 disables the stop (the default): the non-improvement counter is still
+    # advanced and logged (as `patience=N/off`), it just never terminates the
+    # run -- so the LR-plateau schedule is left to decide when to stop, while the
+    # counter stays visible for diagnostics.
+    early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
 
     # Rebuild a fresh optimizer / LR schedule before training. Tri-state: None
@@ -69,8 +73,8 @@ class TrainingControlConfig:
     # only resets on a gain larger than this, so an optimizer that jitters around
     # a plateau while occasionally nudging a microscopic new best still triggers
     # an LR drop. Set to roughly the eval noise floor (COCO mAP on a small val
-    # set jitters ~1e-3). 0.0 reproduces the old "any improvement resets it".
-    lr_plateau_min_delta: float = 1e-3
+    # set jitters ~1e-3). 0.0 (the default) means "any improvement resets it".
+    lr_plateau_min_delta: float = 0.0
 
     # On each plateau LR drop, restore the best checkpoint first (a "warm
     # restart": resume the best weights + optimizer slots, keep the current step

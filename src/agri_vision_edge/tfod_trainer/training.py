@@ -460,10 +460,13 @@ def train(
             if state.best_metric == float("-inf")
             else f"{state.best_metric:.4f}"
         )
+        # early_stopping_patience == 0 means the stop is disabled; the counter
+        # is still tracked, so show its limit as "off" rather than "/0".
+        es_patience = trainer_cfg.control.early_stopping_patience
+        es_limit = es_patience if es_patience else "off"
         sched_parts = [
             f"best_{best_tag}={best_str}",
-            f"patience={state.patience_counter}"
-            f"/{trainer_cfg.control.early_stopping_patience}",
+            f"patience={state.patience_counter}/{es_limit}",
         ]
         if trainer_cfg.control.lr_plateau:
             sched_parts.append(
@@ -532,10 +535,12 @@ def train(
             state.patience_counter = 0
         else:
             state.patience_counter += 1
+            es_patience = trainer_cfg.control.early_stopping_patience
+            es_limit = es_patience if es_patience else "off"
             print(
                 f"No early-stop improvement (> {trainer_cfg.control.early_stopping_min_delta}) "
                 f"over {state.es_ref:.5f} | patience "
-                f"{state.patience_counter}/{trainer_cfg.control.early_stopping_patience}"
+                f"{state.patience_counter}/{es_limit}"
             )
 
         # 3) Plateau counter, delta-gated against its own reference; on a stall
@@ -568,10 +573,13 @@ def train(
                     )
                     break
 
+        # early_stopping_patience == 0 disables the stop entirely (the counter
+        # above is still advanced + logged for diagnostics); the LR-plateau
+        # schedule then owns termination.
         if (
-            state.patience_counter
-            >= trainer_cfg.control
-                .early_stopping_patience
+            trainer_cfg.control.early_stopping_patience
+            and state.patience_counter
+            >= trainer_cfg.control.early_stopping_patience
         ):
             print(
                 f"Stopping at step {current_step}: early-stopping patience "
