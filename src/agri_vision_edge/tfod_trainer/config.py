@@ -61,10 +61,15 @@ class TrainingControlConfig:
     # `lr_plateau_cooldown` grace period following each drop. Decouples LR
     # annealing from a guessed `num_steps` horizon, which is exactly what the
     # cosine schedule cannot do once early stopping cuts the run short.
+    # Defaults tuned for accuracy over run time (empirically: aggressive
+    # patience/cooldown + a >0 min_delta collapse the LR before the model has
+    # exploited each level, and hurt final mAP). Keep each LR level long and only
+    # drop on a genuine flat; let num_steps bound the run rather than an
+    # aggressive exhausted-stall stop.
     lr_plateau: bool = False
     lr_plateau_factor: float = 0.5
-    lr_plateau_patience: int = 8
-    lr_plateau_cooldown: int = 3
+    lr_plateau_patience: int = 15
+    lr_plateau_cooldown: int = 5
     lr_plateau_min_lr: float = 1e-6
 
     # Minimum metric gain that counts as an improvement for the plateau stall
