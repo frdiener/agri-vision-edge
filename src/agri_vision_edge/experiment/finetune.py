@@ -160,12 +160,10 @@ class FineTuneConfig:
     # positive value (e.g. 10.0) only if a run shows genuine gradient blow-up.
     gradient_clipping_by_norm: float = 0.0
 
-    #
-    # Custom early stopping
-    #
-
-    early_stopping_patience: int = 50
-    early_stopping_min_delta: float = 0.0
+    # NOTE: early stopping and the reduce-LR-on-plateau schedule are NOT pipeline
+    # semantics -- they drive our custom training loop, not the TFOD protobuf --
+    # so they live in ``tfod_trainer.config.TrainingControlConfig`` (surfaced on
+    # ``FinetuneRunConfig.control``), keeping this class a pure pipeline wrapper.
 
     #
     # Image sizing
