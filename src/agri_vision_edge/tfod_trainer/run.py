@@ -20,20 +20,32 @@ QAT is the same call with ``qat=True`` (and optionally ``qat_per_channel`` /
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from agri_vision_edge.experiment import AugmentationConfig, FineTuneConfig
 
-from .config import TrainerConfig
+from .config import TrainerConfig, TrainingControlConfig
+
+
+# Legacy flat keys that used to live directly on ``FinetuneRunConfig`` (or, for
+# early stopping, on the nested ``FineTuneConfig``). ``from_mapping`` folds them
+# into ``control`` so historical manifests / head-less dicts keep loading.
+_LEGACY_CONTROL_KEYS = frozenset(
+    f.name for f in TrainingControlConfig.__dataclass_fields__.values()  # type: ignore[attr-defined]
+)
 
 
 @dataclass
 class FinetuneRunConfig:
     """
-    Everything needed to run one finetune (or QAT) job.
+    The single master configuration for one finetune (or QAT) job.
 
-    Required:
+    This is the whole notebook / Python API and the object committed to the
+    experiment manifest (see :meth:`to_mapping` / :meth:`from_mapping`). Its
+    fields fall into three cohesive groups:
+
+    Orchestration (top level):
         model_path:
             Pretrained base model directory. Must contain ``pipeline.config``
             and ``checkpoint/ckpt-0.*`` (the TF model-zoo layout).
@@ -44,10 +56,25 @@ class FinetuneRunConfig:
             Number of detection classes.
         output_dir:
             Where the as-run pipeline config and checkpoints are written.
+        resume_full:
+            Resume OUR OWN converged export (matching num_classes), restoring
+            the box/class prediction heads too (fine_tune_checkpoint_type=
+            "full"), as opposed to bootstrapping from a foreign detection
+            checkpoint (e.g. COCO, different num_classes) whose heads must be
+            dropped and reinitialised ("detection"). QAT always resumes our own
+            export, so it implies this; a plain-float PTQ base (qat=False) that
+            resumes the finetune export must set it explicitly, otherwise its
+            heads are dropped and it retrains from cold. Independent of
+            quantization.
 
-    The semantic pipeline tuning lives in ``finetune`` (a ``FineTuneConfig``);
-    the remaining fields fill in the ``TrainerConfig`` knobs, including the
-    QAT options (``qat`` / ``qat_per_channel`` / ``reset_optimizer``).
+    ``finetune`` (a :class:`FineTuneConfig`):
+        The pure pipeline / model semantics rendered into the TFOD protobuf.
+
+    ``control`` (a :class:`TrainingControlConfig`):
+        Every custom training-loop knob -- early stopping, reduce-LR-on-plateau,
+        logging / checkpointing, and the QAT flags (``qat`` / ``qat_per_channel``
+        / ``reset_optimizer``). These are consumed by the trainer via
+        :meth:`to_trainer_config`.
     """
 
     model_path: Path
@@ -56,63 +83,31 @@ class FinetuneRunConfig:
     output_dir: Path
 
     finetune: FineTuneConfig = field(default_factory=FineTuneConfig)
+    control: TrainingControlConfig = field(default_factory=TrainingControlConfig)
 
-    # TrainerConfig knobs (early-stopping comes from `finetune`).
-    log_every: int = 100
-    checkpoint_max_to_keep: int = 3
-    metric_name: str = "DetectionBoxes_Precision/mAP"
-    save_metrics_history: bool = True
-
-    # Evaluate + checkpoint the restored weights before the first train step, so
-    # the best-metric tracker is seeded with that baseline. Guarantees the run
-    # exports a checkpoint no worse than its starting weights -- useful for a
-    # PTQ float base resuming a converged finetune, where the reduced schedule
-    # can plateau at (or dip below) the finetune baseline.
-    initial_eval_checkpoint: bool = False
-
-    # Reduce-LR-on-plateau schedule (see TrainerConfig). qat=False finetune runs
-    # benefit most: the LR anneals in response to the val-mAP plateau rather than
-    # a fixed cosine horizon. Turns the LR into a mutable tf.Variable driven from
-    # the training loop.
-    lr_plateau: bool = False
-    lr_plateau_factor: float = 0.5
-    lr_plateau_patience: int = 8
-    lr_plateau_cooldown: int = 3
-    lr_plateau_min_lr: float = 1e-6
-    lr_plateau_min_delta: float = 1e-3
-    lr_plateau_restore_best: bool = True
-    lr_plateau_exhausted_patience: int = 2
-
-    # QAT. qat=False => plain finetune (-> PTQ at conversion). qat=True => the
-    # full int8 scheme (fold BN + fake-quant backbone + head). reset_optimizer is
-    # tri-state: None ("auto") resolves to True under QAT or resume_full (both
-    # want a fresh optimizer/LR schedule) and False otherwise; explicit True/
-    # False wins.
-    qat: bool = False
-    reset_optimizer: bool | None = None
-
-    # Resume OUR OWN converged export (matching num_classes), restoring the
-    # box/class prediction heads too (fine_tune_checkpoint_type="full"), as
-    # opposed to bootstrapping from a foreign detection checkpoint (e.g. COCO,
-    # different num_classes) whose heads must be dropped and reinitialised
-    # ("detection"). QAT always resumes our own export, so it implies this; a
-    # plain-float PTQ base (qat=False) that resumes the finetune export must set
-    # it explicitly, otherwise its heads are dropped and it retrains from cold
-    # (near-zero AP, stuck loss). Independent of quantization.
     resume_full: bool = False
-
-    # Per-channel QAT weight quantization. Default False = per-tensor (i.MX8M
-    # Plus Vivante/Teflon NPU). Set True for i.MX93 Arm Ethos-U65, which accepts
-    # per-channel weights. The conversion + export reproduce this flag.
-    qat_per_channel: bool = False
 
     def __post_init__(self):
         self.model_path = Path(self.model_path)
         self.dataset_bundle_path = Path(self.dataset_bundle_path)
         self.output_dir = Path(self.output_dir)
 
-        if self.reset_optimizer is None:
-            self.reset_optimizer = self.qat or self.resume_full
+        # reset_optimizer is tri-state: None ("auto") resolves to True under QAT
+        # or resume_full (both want a fresh optimizer/LR schedule) and False
+        # otherwise; explicit True/False wins. Resolved here because it depends
+        # on both control.qat and the orchestration-level resume_full.
+        if self.control.reset_optimizer is None:
+            self.control.reset_optimizer = self.control.qat or self.resume_full
+
+    # --- QAT convenience (read-through to control) ---------------------
+
+    @property
+    def qat(self) -> bool:
+        return self.control.qat
+
+    @property
+    def qat_per_channel(self) -> bool:
+        return self.control.qat_per_channel
 
     # --- derived paths -------------------------------------------------
 
@@ -144,49 +139,76 @@ class FinetuneRunConfig:
     def train_dir(self) -> Path:
         return self.output_dir / "train"
 
-    # --- construction from a plain mapping (e.g. JSON / UI dict) --------
+    # --- (de)serialization for the manifest / head-less dicts ----------
 
     @classmethod
     def from_mapping(cls, data) -> FinetuneRunConfig:
         """
-        Build from a plain dict, expanding a nested ``finetune`` (and its
-        ``augmentation``) sub-dict into the proper dataclasses.
+        Build from a plain dict (e.g. a manifest stage config or UI dict),
+        expanding the nested ``finetune`` / ``control`` (and ``augmentation``)
+        sub-dicts into their dataclasses.
+
+        Backward compatible with the pre-nesting layout: ``early_stopping_*``
+        found inside ``finetune`` and any flat control knobs (``qat``,
+        ``qat_per_channel``, ``reset_optimizer``, ``lr_plateau*``, ``log_every``,
+        ...) sitting at the top level are folded into ``control``, so historical
+        manifests keep loading.
         """
         data = dict(data)
+
+        # Collect control knobs from an explicit nested "control" plus any legacy
+        # flat top-level keys (the flat keys lose to an explicit nested value).
+        control_data = dict(data.pop("control", {}) or {})
+        for key in list(data):
+            if key in _LEGACY_CONTROL_KEYS:
+                control_data.setdefault(key, data.pop(key))
 
         finetune = data.get("finetune")
         if isinstance(finetune, dict):
             finetune = dict(finetune)
+            # Legacy: early stopping used to live on FineTuneConfig.
+            for key in ("early_stopping_patience", "early_stopping_min_delta"):
+                if key in finetune:
+                    control_data.setdefault(key, finetune.pop(key))
             augmentation = finetune.get("augmentation")
             if isinstance(augmentation, dict):
                 finetune["augmentation"] = AugmentationConfig(**augmentation)
             data["finetune"] = FineTuneConfig(**finetune)
 
+        if control_data:
+            data["control"] = TrainingControlConfig(**control_data)
+
         return cls(**data)
 
+    def to_mapping(self) -> dict:
+        """
+        Serialize the whole config to a plain (JSON-friendly) dict.
+
+        Round-trips through :meth:`from_mapping`; this is exactly what the
+        notebooks commit to the experiment manifest so a run is fully
+        reconstructable. Paths are stringified.
+        """
+        return {
+            "model_path": str(self.model_path),
+            "dataset_bundle_path": str(self.dataset_bundle_path),
+            "num_classes": self.num_classes,
+            "output_dir": str(self.output_dir),
+            "resume_full": self.resume_full,
+            "finetune": asdict(self.finetune),
+            "control": asdict(self.control),
+        }
+
     def to_trainer_config(self) -> TrainerConfig:
-        """Map onto the lower-level ``TrainerConfig`` the trainer consumes."""
+        """
+        Project onto the lower-level ``TrainerConfig`` the trainer consumes.
+
+        No field copy: the trainer shares this config's ``control`` instance and
+        receives only the derived paths on top.
+        """
         return TrainerConfig(
             pipeline_config=self.pipeline_config_path,
             train_dir=self.train_dir,
-            log_every=self.log_every,
-            checkpoint_max_to_keep=self.checkpoint_max_to_keep,
-            metric_name=self.metric_name,
-            early_stopping_patience=self.finetune.early_stopping_patience,
-            early_stopping_min_delta=self.finetune.early_stopping_min_delta,
-            save_metrics_history=self.save_metrics_history,
-            reset_optimizer=self.reset_optimizer,
-            initial_eval_checkpoint=self.initial_eval_checkpoint,
-            lr_plateau=self.lr_plateau,
-            lr_plateau_factor=self.lr_plateau_factor,
-            lr_plateau_patience=self.lr_plateau_patience,
-            lr_plateau_cooldown=self.lr_plateau_cooldown,
-            lr_plateau_min_lr=self.lr_plateau_min_lr,
-            lr_plateau_min_delta=self.lr_plateau_min_delta,
-            lr_plateau_restore_best=self.lr_plateau_restore_best,
-            lr_plateau_exhausted_patience=self.lr_plateau_exhausted_patience,
-            qat=self.qat,
-            qat_per_channel=self.qat_per_channel,
+            control=self.control,
         )
 
 
@@ -267,8 +289,8 @@ def run_finetune(cfg) -> RunResult:
         detection_model,
         configs,
         trainer_cfg.train_dir,
-        checkpoint_max_to_keep=cfg.checkpoint_max_to_keep,
-        lr_plateau=trainer_cfg.lr_plateau,
+        checkpoint_max_to_keep=cfg.control.checkpoint_max_to_keep,
+        lr_plateau=cfg.control.lr_plateau,
     )
 
     train(detection_model, runtime, trainer_cfg)

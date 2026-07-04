@@ -1,4 +1,4 @@
-from .config import TrainerConfig
+from .config import TrainerConfig, TrainingControlConfig
 from .export import (
     ExportResult,
     export_run,
@@ -23,6 +23,7 @@ from .training import train
 
 __all__ = [
     "TrainerConfig",
+    "TrainingControlConfig",
     "ExportResult",
     "export_run",
     "FinetuneRunConfig",
