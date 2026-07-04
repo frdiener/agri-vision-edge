@@ -128,7 +128,7 @@ def save_best_checkpoint(
         trainer_cfg.best_metric_path,
         {
             "step": current_step,
-            "metric_name": trainer_cfg.metric_name,
+            "metric_name": trainer_cfg.control.metric_name,
             "metric_value": metric_value,
             "checkpoint": checkpoint_path,
         },
@@ -183,7 +183,7 @@ def maybe_reduce_lr_on_plateau(
         has hit the ``lr_plateau_min_lr`` floor for ``lr_plateau_exhausted_patience``
         stalls and the caller should stop training.
     """
-    if not trainer_cfg.lr_plateau or runtime.lr_var is None:
+    if not trainer_cfg.control.lr_plateau or runtime.lr_var is None:
         return False
 
     # Still warming up: don't count plateaus against the ramp.
@@ -194,7 +194,7 @@ def maybe_reduce_lr_on_plateau(
     # min_delta as the tolerance). Early on the model detects nothing and the
     # metric sits at ~0; "no improvement" there is meaningless, so annealing
     # would needlessly kill the LR before the model gets going.
-    if metric_value <= trainer_cfg.lr_plateau_min_delta:
+    if metric_value <= trainer_cfg.control.lr_plateau_min_delta:
         return False
 
     if state.cooldown_counter > 0:
@@ -204,19 +204,19 @@ def maybe_reduce_lr_on_plateau(
 
     state.plateau_counter += 1
 
-    if state.plateau_counter < trainer_cfg.lr_plateau_patience:
+    if state.plateau_counter < trainer_cfg.control.lr_plateau_patience:
         return False
 
     old_lr = float(runtime.lr_var.numpy())
     new_lr = max(
-        old_lr * trainer_cfg.lr_plateau_factor,
-        trainer_cfg.lr_plateau_min_lr,
+        old_lr * trainer_cfg.control.lr_plateau_factor,
+        trainer_cfg.control.lr_plateau_min_lr,
     )
 
     # Reset the counter and open the cooldown window regardless of whether we
     # can still reduce (so we don't re-trigger every eval at the LR floor).
     state.plateau_counter = 0
-    state.cooldown_counter = trainer_cfg.lr_plateau_cooldown
+    state.cooldown_counter = trainer_cfg.control.lr_plateau_cooldown
 
     if new_lr >= old_lr:
         # Floored stall: the LR is already at the min and further reductions
@@ -226,19 +226,19 @@ def maybe_reduce_lr_on_plateau(
         state.min_lr_stall_counter += 1
         print(
             f"LR plateau: already at min_lr ({old_lr:.3e}); floored stall "
-            f"{state.min_lr_stall_counter}/{trainer_cfg.lr_plateau_exhausted_patience} "
+            f"{state.min_lr_stall_counter}/{trainer_cfg.control.lr_plateau_exhausted_patience} "
             f"(step {current_step})."
         )
         return (
-            trainer_cfg.lr_plateau_exhausted_patience > 0
+            trainer_cfg.control.lr_plateau_exhausted_patience > 0
             and state.min_lr_stall_counter
-            >= trainer_cfg.lr_plateau_exhausted_patience
+            >= trainer_cfg.control.lr_plateau_exhausted_patience
         )
 
     # Warm restart: rewind to the best weights/optimizer state before dropping
     # the LR. Restoring the checkpoint also rewinds global_step, so save and
     # re-assign it to keep the training horizon intact.
-    if trainer_cfg.lr_plateau_restore_best and runtime.manager.latest_checkpoint:
+    if trainer_cfg.control.lr_plateau_restore_best and runtime.manager.latest_checkpoint:
         best_path = runtime.manager.latest_checkpoint
         saved_step = int(runtime.global_step.numpy())
         runtime.ckpt.restore(best_path).expect_partial()
@@ -252,12 +252,12 @@ def maybe_reduce_lr_on_plateau(
     runtime.lr_var.assign(new_lr)
 
     # Latch the floored flag if this reduction landed exactly on the min LR.
-    if new_lr <= trainer_cfg.lr_plateau_min_lr:
+    if new_lr <= trainer_cfg.control.lr_plateau_min_lr:
         state.lr_floored = True
 
     print(
         f"LR plateau: reduced learning rate {old_lr:.3e} -> {new_lr:.3e} "
-        f"at step {current_step} (cooldown {trainer_cfg.lr_plateau_cooldown})."
+        f"at step {current_step} (cooldown {trainer_cfg.control.lr_plateau_cooldown})."
     )
     return False
 
@@ -320,7 +320,7 @@ def train(
     # When we are going to seed the best-metric tracker with a scored baseline
     # eval below, skip this purely-informational (unscored) eval to avoid
     # evaluating the same initial weights twice.
-    if graph_modified and not trainer_cfg.initial_eval_checkpoint:
+    if graph_modified and not trainer_cfg.control.initial_eval_checkpoint:
         print(
             "\nEvaluating initial modified "
             "configuration..."
@@ -344,7 +344,7 @@ def train(
     # "best" checkpoint is never worse than the starting point: a reduced
     # schedule that only ever regresses (e.g. a PTQ float base resuming an
     # already-converged finetune) will export the baseline itself.
-    if trainer_cfg.initial_eval_checkpoint:
+    if trainer_cfg.control.initial_eval_checkpoint:
         current_step = int(runtime.global_step.numpy())
 
         print(
@@ -357,14 +357,14 @@ def train(
         record.update(metrics_to_float(metrics))
         state.metrics_history.append(record)
 
-        if trainer_cfg.save_metrics_history:
+        if trainer_cfg.control.save_metrics_history:
             write_json(
                 trainer_cfg.history_path,
                 state.metrics_history,
             )
 
         metric_value = float(
-            metrics[trainer_cfg.metric_name]
+            metrics[trainer_cfg.control.metric_name]
         )
 
         save_best_checkpoint(
@@ -382,7 +382,7 @@ def train(
         state.plateau_ref = metric_value
 
         print(
-            f"Initial baseline {trainer_cfg.metric_name}={metric_value}; "
+            f"Initial baseline {trainer_cfg.control.metric_name}={metric_value}; "
             "checkpoint saved. Training must beat it to overwrite."
         )
 
@@ -419,7 +419,7 @@ def train(
 
         if (
             current_step
-            % trainer_cfg.log_every
+            % trainer_cfg.control.log_every
             != 0
         ):
             continue
@@ -454,7 +454,7 @@ def train(
         # Scheduler / tracker state as of the last completed eval: the running
         # best, the early-stopping patience, and -- when the plateau schedule is
         # active -- its stall counter and cooldown window.
-        best_tag = trainer_cfg.metric_name.split("/")[-1]
+        best_tag = trainer_cfg.control.metric_name.split("/")[-1]
         best_str = (
             "n/a"
             if state.best_metric == float("-inf")
@@ -463,18 +463,18 @@ def train(
         sched_parts = [
             f"best_{best_tag}={best_str}",
             f"patience={state.patience_counter}"
-            f"/{trainer_cfg.early_stopping_patience}",
+            f"/{trainer_cfg.control.early_stopping_patience}",
         ]
-        if trainer_cfg.lr_plateau:
+        if trainer_cfg.control.lr_plateau:
             sched_parts.append(
                 f"plateau={state.plateau_counter}"
-                f"/{trainer_cfg.lr_plateau_patience}"
+                f"/{trainer_cfg.control.lr_plateau_patience}"
             )
             sched_parts.append(f"cooldown={state.cooldown_counter}")
             if state.lr_floored:
                 sched_parts.append(
                     f"min_lr_stall={state.min_lr_stall_counter}"
-                    f"/{trainer_cfg.lr_plateau_exhausted_patience}"
+                    f"/{trainer_cfg.control.lr_plateau_exhausted_patience}"
                 )
 
         print(
@@ -495,7 +495,7 @@ def train(
         record.update(train_metrics)
         state.metrics_history.append(record)
 
-        if trainer_cfg.save_metrics_history:
+        if trainer_cfg.control.save_metrics_history:
             write_json(
                 trainer_cfg.history_path,
                 state.metrics_history,
@@ -503,7 +503,7 @@ def train(
 
         metric_value = float(
             metrics[
-                trainer_cfg.metric_name
+                trainer_cfg.control.metric_name
             ]
         )
 
@@ -511,7 +511,7 @@ def train(
         #    misses a genuinely better model -- even a microscopic gain.
         if metric_value > state.best_metric:
             print(
-                f"New best {trainer_cfg.metric_name}: {metric_value:.5f} "
+                f"New best {trainer_cfg.control.metric_name}: {metric_value:.5f} "
                 f"(prev {state.best_metric:.5f}); saving checkpoint..."
             )
             save_best_checkpoint(
@@ -526,26 +526,26 @@ def train(
         #    sub-noise improvements don't keep the run alive indefinitely.
         if (
             metric_value
-            > state.es_ref + trainer_cfg.early_stopping_min_delta
+            > state.es_ref + trainer_cfg.control.early_stopping_min_delta
         ):
             state.es_ref = metric_value
             state.patience_counter = 0
         else:
             state.patience_counter += 1
             print(
-                f"No early-stop improvement (> {trainer_cfg.early_stopping_min_delta}) "
+                f"No early-stop improvement (> {trainer_cfg.control.early_stopping_min_delta}) "
                 f"over {state.es_ref:.5f} | patience "
-                f"{state.patience_counter}/{trainer_cfg.early_stopping_patience}"
+                f"{state.patience_counter}/{trainer_cfg.control.early_stopping_patience}"
             )
 
         # 3) Plateau counter, delta-gated against its own reference; on a stall
         #    it drives the LR reduction (no-op unless lr_plateau is enabled).
         #    A True return means the LR schedule is exhausted (floored for
         #    `lr_plateau_exhausted_patience` stalls) -> stop.
-        if trainer_cfg.lr_plateau:
+        if trainer_cfg.control.lr_plateau:
             if (
                 metric_value
-                > state.plateau_ref + trainer_cfg.lr_plateau_min_delta
+                > state.plateau_ref + trainer_cfg.control.lr_plateau_min_delta
             ):
                 state.plateau_ref = metric_value
                 state.plateau_counter = 0
@@ -562,7 +562,7 @@ def train(
                 if lr_exhausted:
                     print(
                         f"Stopping at step {current_step}: LR schedule exhausted "
-                        f"(at min_lr {trainer_cfg.lr_plateau_min_lr:.3e} with no "
+                        f"(at min_lr {trainer_cfg.control.lr_plateau_min_lr:.3e} with no "
                         f"improvement for {state.min_lr_stall_counter} floored "
                         f"stalls)."
                     )
@@ -570,12 +570,12 @@ def train(
 
         if (
             state.patience_counter
-            >= trainer_cfg
+            >= trainer_cfg.control
                 .early_stopping_patience
         ):
             print(
                 f"Stopping at step {current_step}: early-stopping patience "
-                f"{state.patience_counter}/{trainer_cfg.early_stopping_patience} "
+                f"{state.patience_counter}/{trainer_cfg.control.early_stopping_patience} "
                 f"reached."
             )
             break

@@ -443,7 +443,7 @@ def apply_graph_modifications(
 
     train_config = runtime.configs["train_config"]
 
-    if trainer_cfg.reset_optimizer:
+    if trainer_cfg.control.reset_optimizer:
         print("Resetting the optimizer...")
         runtime.global_step.assign(0)
         if runtime.lr_var is not None:
@@ -468,7 +468,7 @@ def apply_graph_modifications(
             runtime.optimizer = optimizer
             runtime.learning_rate = learning_rate
 
-    if not trainer_cfg.qat:
+    if not trainer_cfg.control.qat:
         return False
 
     # Folding and cloning require the backbone variables to exist.
@@ -491,7 +491,7 @@ def apply_graph_modifications(
     quantize_detection_model(
         detection_model,
         image_size,
-        per_channel=trainer_cfg.qat_per_channel,
+        per_channel=trainer_cfg.control.qat_per_channel,
     )
 
     return True
