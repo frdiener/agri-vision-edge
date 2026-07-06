@@ -159,6 +159,20 @@ def evaluate(
             features,
         )
 
+        # Partial ("do-not-care") plants are carried in the record as
+        # is_partial, mirrored to groundtruth_is_crowd, which the COCO evaluator
+        # natively treats as ignore regions (a detection landing on one is not a
+        # false positive). Honour that only when ignore_partials is set; in the
+        # default strict mode clear the markers so partials are scored like any
+        # other ground-truth. A no-op on records built without partials (the
+        # field is then absent or already all-zero).
+        if not runtime.eval_ignore_partials:
+            crowd_key = fields.InputDataFields.groundtruth_is_crowd
+            if crowd_key in eval_dict:
+                eval_dict[crowd_key] = tf.zeros_like(
+                    eval_dict[crowd_key]
+                )
+
         for evaluator in runtime.evaluators:
             evaluator.add_eval_dict(
                 eval_dict

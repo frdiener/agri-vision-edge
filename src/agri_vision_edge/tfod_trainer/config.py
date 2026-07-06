@@ -103,6 +103,17 @@ class TrainingControlConfig:
     # the pin placement; the converter, not the fake-quant, emits per-channel).
     qat_per_channel: bool = False
 
+    # Treat PhenoBench partial ("do-not-care") plants as do-not-care during the
+    # continuous eval, matching the official protocol and the `ave evaluate
+    # --ignore-partials` final eval. Partials are carried in the val.record as
+    # `is_partial` (mirrored to `groundtruth_is_crowd`), which the TFOD COCO
+    # evaluator natively treats as ignore regions. When True the markers are
+    # honoured (a detection on a partial plant is not a false positive); when
+    # False (the default, strict) the markers are cleared so partials are scored
+    # like any other ground-truth. Only has an effect on records built with
+    # partials (include_partials=True); records without them are unaffected.
+    eval_ignore_partials: bool = False
+
 
 @dataclass(slots=True)
 class TrainerConfig:

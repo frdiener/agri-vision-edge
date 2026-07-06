@@ -288,6 +288,7 @@ def run_finetune(cfg) -> RunResult:
         trainer_cfg.train_dir,
         checkpoint_max_to_keep=cfg.control.checkpoint_max_to_keep,
         lr_plateau=cfg.control.lr_plateau,
+        eval_ignore_partials=cfg.control.eval_ignore_partials,
     )
 
     train(detection_model, runtime, trainer_cfg)

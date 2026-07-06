@@ -62,6 +62,12 @@ class Runtime:
     lr_warmup: float = 0.0
     lr_warmup_steps: int = 0
 
+    # When True, honour partial ("do-not-care") ground-truth markers
+    # (groundtruth_is_crowd, mirrored from is_partial in the record) during eval
+    # so detections on partial plants are not penalized. When False (default,
+    # strict) the markers are cleared and partials are scored normally.
+    eval_ignore_partials: bool = False
+
 
 def load_pipeline_configs(
     pipeline_path,
@@ -235,6 +241,7 @@ def create_runtime(
     train_dir,
     checkpoint_max_to_keep=3,
     lr_plateau=False,
+    eval_ignore_partials=False,
 ) -> Runtime:
 
     # Resolve `fine_tune_checkpoint_type` from the deprecated
@@ -315,6 +322,7 @@ def create_runtime(
         lr_base=lr_base,
         lr_warmup=lr_warmup,
         lr_warmup_steps=lr_warmup_steps,
+        eval_ignore_partials=eval_ignore_partials,
     )
 
 
