@@ -84,6 +84,7 @@ def export_coco_annotations(
     dataset,
     dataset_definition,
     indices=None,
+    include_partials=False,
 ):
     """
     Export dataset split as COCO annotations.
@@ -97,11 +98,24 @@ def export_coco_annotations(
 
                 target_types=["plant_bboxes"]
 
+            To carry partials, wrap it in
+            ``agri_vision_edge.data.plant_boxes.PartialAwarePhenoBench`` so each
+            ``plant_bboxes`` entry gains ``is_partial`` / ``visibility``.
+
         dataset_definition:
             Canonical dataset definition.
 
         indices:
             Optional subset indices.
+
+        include_partials:
+            When ``True``, partial ("do-not-care") plants are emitted as
+            annotations flagged ``ignore=1`` plus a custom ``partial=1`` and, if
+            available, ``visibility``. They are kept out of scoring by default
+            and consumed by the ``ignore_partials`` evaluation knob (see
+            :mod:`agri_vision_edge.evaluation.partials`). When ``False`` (the
+            default) partial boxes are skipped and the output is unchanged from
+            the pre-partials behaviour.
 
     Returns:
         COCO dictionary.
@@ -163,6 +177,17 @@ def export_coco_annotations(
             ):
                 continue
 
+            is_partial = bool(bbox.get("is_partial", False))
+
+            #
+            # Partial ("do-not-care") plants: skip entirely unless partials are
+            # requested, in which case emit them flagged so the evaluation
+            # ignore_partials knob can suppress detections landing on them.
+            #
+
+            if is_partial and not include_partials:
+                continue
+
             target_label = (
                 dataset_definition.label_mapping[
                     source_label
@@ -182,7 +207,7 @@ def export_coco_annotations(
                 * coco_bbox[3]
             )
 
-            annotations.append({
+            annotation = {
 
                 "id":
                     int(annotation_id),
@@ -203,7 +228,19 @@ def export_coco_annotations(
 
                 "iscrowd":
                     0,
-            })
+            }
+
+            if is_partial:
+                # COCO-standard ignore + explicit partial marker; keep visibility
+                # when the source carried it (upstream do-not-care criterion).
+                annotation["ignore"] = 1
+                annotation["partial"] = 1
+
+                visibility = bbox.get("visibility")
+                if visibility is not None:
+                    annotation["visibility"] = float(visibility)
+
+            annotations.append(annotation)
 
             annotation_id += 1
 

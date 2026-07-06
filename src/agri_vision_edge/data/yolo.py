@@ -94,6 +94,7 @@ def export_yolo_split(
     indices=None,
     min_box_size: float = 0.0,
     source_images_dir: str | Path | None = None,
+    include_partials: bool = False,
 ) -> dict:
     """
     Export one dataset split as images + YOLO label files.
@@ -121,6 +122,13 @@ def export_yolo_split(
         min_box_size:
             Drop boxes whose normalized width or height is below this value
             (degenerate fragments). ``0.0`` keeps everything.
+
+        include_partials:
+            When ``False`` (the default), partial ("do-not-care") boxes
+            (``is_partial``) are dropped -- YOLO has no do-not-care flag, and the
+            official upstream evaluator re-derives partial handling from the raw
+            masks at eval time, so partials are simply excluded from the label
+            files. When ``True`` they are written as ordinary boxes.
 
         source_images_dir:
             Optional directory of original image files. When a sample's image
@@ -184,6 +192,11 @@ def export_yolo_split(
             source_label = int(bbox["label"])
 
             if source_label not in label_mapping:
+                continue
+
+            # Drop partial ("do-not-care") plants unless explicitly kept.
+            if bbox.get("is_partial", False) and not include_partials:
+                num_skipped_boxes += 1
                 continue
 
             # COCO category ID (1-based) -> YOLO class index (0-based).

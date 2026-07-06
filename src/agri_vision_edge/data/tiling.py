@@ -20,6 +20,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+# Visibility masks store a 0..255 visible-fraction; normalize to [0, 1].
+_VISIBILITY_SCALE = 255.0
+
 # --------------------------------------------------
 # Geometry
 # --------------------------------------------------
@@ -182,6 +185,8 @@ def generate_plant_bboxes(
         tuple[int, int],
         int,
     ] | None = None,
+    partial_threshold: float | None = None,
+    plant_visibility: np.ndarray | None = None,
 ):
     """
     Regenerate plant bboxes from cropped masks.
@@ -190,6 +195,19 @@ def generate_plant_bboxes(
     fractions are computed against the original
     uncropped instance area and can be filtered
     via filter_config.min_visible_fraction.
+
+    If ``partial_threshold`` is set, each box additionally gets an
+    ``is_partial`` flag (do-not-care). Unlike ``filter_config.min_visible_fraction``
+    (which *drops* boxes), this only *tags* them, so downstream evaluation can
+    treat partials as do-not-care rather than removing them. The partiality
+    source depends on what is available:
+
+    * When ``plant_visibility`` (a cropped mask aligned with ``semantics``) is
+      given, partiality follows the **upstream PhenoBench criterion**: the box's
+      per-instance visibility (``max(plant_visibility[mask]) / 255``) ``<=
+      partial_threshold``. The visibility is also stored on the box.
+    * Otherwise it falls back to the tile-cut ``visible_fraction <=
+      partial_threshold`` (only available when ``instance_areas`` is provided).
     """
 
     boxes = []
@@ -302,6 +320,31 @@ def generate_plant_bboxes(
                     visible_fraction
                 )
 
+            # Upstream visibility (do-not-care criterion): the per-instance
+            # visibility value read from the cropped plant_visibility mask,
+            # normalized to [0, 1]. Takes precedence over visible_fraction for
+            # the is_partial decision when available.
+            upstream_visibility = None
+
+            if plant_visibility is not None:
+                upstream_visibility = (
+                    float(plant_visibility[mask].max())
+                    / _VISIBILITY_SCALE
+                )
+                bbox["visibility"] = upstream_visibility
+
+            if partial_threshold is not None:
+                partiality = (
+                    upstream_visibility
+                    if upstream_visibility is not None
+                    else visible_fraction
+                )
+
+                if partiality is not None:
+                    bbox["is_partial"] = bool(
+                        partiality <= partial_threshold
+                    )
+
             boxes.append(bbox)
 
     return boxes
@@ -339,6 +382,7 @@ def tile_sample(
     sample,
     tile: Tile,
     filter_config: FilterConfig,
+    partial_threshold: float | None = None,
 ):
 
     image = np.asarray(
@@ -366,6 +410,15 @@ def tile_sample(
         tile,
     )
 
+    # Upstream visibility mask (optional): cropped per tile so per-box
+    # visibility is read against the same tile coordinate frame.
+    visibility = sample.get("plant_visibility")
+    visibility_tile = (
+        crop_array(np.asarray(visibility), tile)
+        if visibility is not None
+        else None
+    )
+
     instance_areas = compute_instance_areas(
         semantics,
         plant_instances,
@@ -376,6 +429,8 @@ def tile_sample(
         instances_tile,
         filter_config,
         instance_areas=instance_areas,
+        partial_threshold=partial_threshold,
+        plant_visibility=visibility_tile,
     )
 
     result = dict(sample)
@@ -427,6 +482,7 @@ class TiledPhenoBench:
         cols: int = 2,
         overlap: float = 0.0,
         filter_config: FilterConfig | None = None,
+        partial_threshold: float | None = None,
     ):
         self.dataset = dataset
 
@@ -440,6 +496,10 @@ class TiledPhenoBench:
             if filter_config is not None
             else FilterConfig()
         )
+
+        # When set, boxes whose visible_fraction <= this are tagged is_partial
+        # (do-not-care) instead of being dropped.
+        self.partial_threshold = partial_threshold
 
         self.tiles_per_image = (
             rows * cols
@@ -491,6 +551,7 @@ class TiledPhenoBench:
             sample,
             tile,
             self.filter_config,
+            partial_threshold=self.partial_threshold,
         )
 
         image_path = Path(sample["image_name"])

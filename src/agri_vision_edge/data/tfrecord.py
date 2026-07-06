@@ -42,6 +42,7 @@ def create_tf_example(
     boxes,
     labels,
     categories,
+    is_partial=None,
 ):
     """
     Create TensorFlow Example.
@@ -58,6 +59,14 @@ def create_tf_example(
 
         categories:
             Exported category definitions.
+
+        is_partial:
+            Optional per-box partial ("do-not-care") flags (0/1), aligned with
+            ``boxes``. Written as the canonical ``image/object/is_partial`` and
+            mirrored into ``image/object/is_crowd`` so the TFOD eval input
+            pipeline surfaces it as ``groundtruth_is_crowd`` (PhenoBench has no
+            genuine crowds), letting the trainer's ignore_partials knob identify
+            partial ground-truth without a custom decoder. Defaults to all-zero.
     """
 
     class_names = build_class_names(
@@ -84,6 +93,14 @@ def create_tf_example(
     classes_text = [
         class_names[label]
         for label in labels
+    ]
+
+    if is_partial is None:
+        is_partial = [0] * len(boxes)
+
+    partial_flags = [
+        int(bool(flag))
+        for flag in is_partial
     ]
 
     feature = {
@@ -157,6 +174,23 @@ def create_tf_example(
                     value=classes_text
                 )
             ),
+
+        "image/object/is_partial":
+            tf.train.Feature(
+                int64_list=tf.train.Int64List(
+                    value=partial_flags
+                )
+            ),
+
+        # Mirror of is_partial: TFOD's standard decoder surfaces this as
+        # groundtruth_is_crowd, giving the trainer eval a decoder-native handle
+        # on partials (PhenoBench has no real crowds).
+        "image/object/is_crowd":
+            tf.train.Feature(
+                int64_list=tf.train.Int64List(
+                    value=partial_flags
+                )
+            ),
     }
 
     return tf.train.Example(
@@ -173,6 +207,7 @@ def build_record(
     indices: Iterable[int] | None = None,
     target_size: int = DEFAULT_TARGET_SIZE,
     skip_negatives=True,
+    include_partials=False,
 ):
     """
     Build TFRecord dataset.
@@ -182,7 +217,9 @@ def build_record(
             Output TFRecord path.
 
         dataset:
-            PhenoBench dataset.
+            PhenoBench dataset. To carry partials, wrap it in
+            ``agri_vision_edge.data.plant_boxes.PartialAwarePhenoBench`` so each
+            ``plant_bboxes`` entry gains an ``is_partial`` flag.
 
         dataset_definition:
             Canonical dataset definition.
@@ -195,6 +232,13 @@ def build_record(
 
         skip_negatives:
             Do not include images without GT instances.
+
+        include_partials:
+            When ``True``, partial ("do-not-care") plants are written to the
+            record flagged (``image/object/is_partial`` / ``is_crowd``) so the
+            trainer's ignore_partials eval knob can suppress detections on them.
+            When ``False`` (the default) partial boxes are dropped and the
+            output is unchanged from the pre-partials behaviour.
     """
 
     writer = tf.io.TFRecordWriter(
@@ -219,6 +263,8 @@ def build_record(
 
         labels = []
 
+        partial_flags = []
+
         for bbox in sample["plant_bboxes"]:
 
             source_label = int(
@@ -236,6 +282,16 @@ def build_record(
             ):
                 continue
 
+            is_partial = bool(bbox.get("is_partial", False))
+
+            #
+            # Partial ("do-not-care") plants: drop unless partials are
+            # requested, in which case keep them flagged.
+            #
+
+            if is_partial and not include_partials:
+                continue
+
             target_label = (
                 dataset_definition.label_mapping[
                     source_label
@@ -244,6 +300,10 @@ def build_record(
 
             labels.append(
                 target_label
+            )
+
+            partial_flags.append(
+                1 if is_partial else 0
             )
 
             raw_boxes.append(
@@ -279,6 +339,8 @@ def build_record(
             labels=labels,
 
             categories=dataset_definition.categories,
+
+            is_partial=partial_flags,
         )
 
         writer.write(
