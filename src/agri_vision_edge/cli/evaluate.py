@@ -21,6 +21,42 @@ from agri_vision_edge.evaluation.coco import (
     print_per_class,
     save_metrics,
 )
+from agri_vision_edge.evaluation.partials import DEFAULT_PARTIAL_THRESHOLD
+
+
+def _run_faithful(args):
+    """
+    Run the official PhenoBench evaluator on a single predictions file.
+    """
+
+    if not args.phenobench_dir:
+        raise SystemExit("--faithful requires --phenobench-dir")
+
+    input_path = Path(args.input)
+
+    if not input_path.is_file():
+        raise SystemExit(
+            "--faithful expects a predictions.json file, not a directory"
+        )
+
+    # Imported lazily so the lightweight path never pulls the torch stack.
+    from agri_vision_edge.evaluation.faithful import evaluate_faithful
+
+    metrics = evaluate_faithful(
+        annotations_path=args.annotations,
+        predictions_path=input_path,
+        phenobench_dir=args.phenobench_dir,
+        split=args.split,
+    )
+
+    metrics_path = input_path.with_name("metrics_faithful.json")
+    save_metrics(metrics, metrics_path)
+
+    print()
+    print(json.dumps(metrics, indent=2))
+    print(f"\nwrote {metrics_path}")
+
+    return
 
 
 def main(argv=None):
@@ -37,7 +73,60 @@ def main(argv=None):
         help=("predictions.json or benchmark_results directory"),
     )
 
+    parser.add_argument(
+        "--ignore-partials",
+        action="store_true",
+        help=(
+            "Treat PhenoBench partial (border / low-visibility) plants as "
+            "do-not-care: drop detections that land on them instead of counting "
+            "them as false positives (upstream containment rule). Requires the "
+            "annotations to carry partial/ignore/visibility flags."
+        ),
+    )
+
+    parser.add_argument(
+        "--partial-threshold",
+        type=float,
+        default=DEFAULT_PARTIAL_THRESHOLD,
+        help=(
+            "Visibility/containment threshold for the partial rule "
+            f"(default: {DEFAULT_PARTIAL_THRESHOLD})."
+        ),
+    )
+
+    parser.add_argument(
+        "--faithful",
+        action="store_true",
+        help=(
+            "Use the official PhenoBench evaluator (torchmetrics mAP + upstream "
+            "partial filtering) for leaderboard-comparable numbers instead of "
+            "the lightweight pycocotools path. Requires full-image predictions "
+            "and the 'faithful-eval' extra; --phenobench-dir is required."
+        ),
+    )
+
+    parser.add_argument(
+        "--phenobench-dir",
+        help=(
+            "Root of the raw PhenoBench dataset (with train/val/test splits). "
+            "Required with --faithful."
+        ),
+    )
+
+    parser.add_argument(
+        "--split",
+        default="val",
+        help="Dataset split the predictions correspond to (default: val).",
+    )
+
     args = parser.parse_args(argv)
+
+    #
+    # Faithful upstream evaluation (single predictions file only)
+    #
+
+    if args.faithful:
+        return _run_faithful(args)
 
     annotations_path = Path(args.annotations)
 
@@ -51,6 +140,8 @@ def main(argv=None):
         metrics = evaluate_predictions(
             annotations_path,
             input_path,
+            ignore_partials=args.ignore_partials,
+            partial_threshold=args.partial_threshold,
         )
 
         # Persist beside the predictions file (mirrors directory mode), so the
@@ -90,6 +181,8 @@ def main(argv=None):
         ok = evaluate_model_dir(
             model_dir,
             annotations_path,
+            ignore_partials=args.ignore_partials,
+            partial_threshold=args.partial_threshold,
         )
 
         if ok:

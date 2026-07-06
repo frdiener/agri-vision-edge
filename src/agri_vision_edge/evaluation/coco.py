@@ -6,6 +6,12 @@ from pathlib import Path
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
+from .partials import (
+    DEFAULT_PARTIAL_THRESHOLD,
+    filter_predictions_against_partials,
+    split_annotations_by_partial,
+)
+
 METRIC_NAMES = [
     "AP",
     "AP50",
@@ -80,15 +86,43 @@ def _per_class_metrics(
     return per_class
 
 
+def _coco_from_dict(dataset: dict) -> COCO:
+    """
+    Build an in-memory ``COCO`` from an already-parsed annotation dict.
+
+    ``COCO(path)`` only loads from a file; constructing empty and assigning
+    ``dataset`` lets us score against a *filtered* ground-truth (partials
+    removed) without writing a temporary file.
+    """
+
+    coco = COCO()
+    coco.dataset = dataset
+    coco.createIndex()
+
+    return coco
+
+
 def evaluate_predictions(
     annotations_path: str | Path,
     predictions_path: str | Path,
+    ignore_partials: bool = False,
+    partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
 ) -> dict:
     """
     Evaluate a COCO predictions file.
 
     Returns the 12 aggregate (class-averaged) metrics in ``METRIC_NAMES`` plus a
     ``per_class`` entry mapping each category name to its own 12 metrics.
+
+    Partial ("do-not-care") ground-truth annotations (flagged ``partial`` /
+    ``ignore`` / low ``visibility`` -- see
+    :mod:`agri_vision_edge.evaluation.partials`) are always excluded from the
+    scored ground-truth, matching the pre-partials behaviour. When
+    ``ignore_partials`` is set, the PhenoBench rule is additionally applied to
+    the predictions: any detection whose area is more than ``partial_threshold``
+    contained inside a partial ground-truth box is dropped, so a hit on a
+    partial plant is not counted as a false positive. Scoring stays
+    pycocotools-based, so numbers remain comparable across the pipeline.
     """
 
     with open(predictions_path) as f:
@@ -106,9 +140,36 @@ def evaluate_predictions(
 
         return metrics
 
-    coco_gt = COCO(str(annotations_path))
+    with open(annotations_path) as f:
+        gt_dataset = json.load(f)
 
-    coco_dt = coco_gt.loadRes(str(predictions_path))
+    scored_annotations, partial_annotations = split_annotations_by_partial(
+        gt_dataset.get("annotations", []),
+        threshold=partial_threshold,
+    )
+
+    #
+    # Drop detections that land on partial plants (do-not-care), per the
+    # upstream PhenoBench containment rule.
+    #
+
+    if ignore_partials and partial_annotations:
+        predictions = filter_predictions_against_partials(
+            predictions,
+            partial_annotations,
+            threshold=partial_threshold,
+        )
+
+    #
+    # Score against the non-partial ground-truth only.
+    #
+
+    scored_gt_dataset = dict(gt_dataset)
+    scored_gt_dataset["annotations"] = scored_annotations
+
+    coco_gt = _coco_from_dict(scored_gt_dataset)
+
+    coco_dt = coco_gt.loadRes(predictions)
 
     evaluator = COCOeval(
         coco_gt,
@@ -150,6 +211,8 @@ def save_metrics(
 def evaluate_model_dir(
     model_dir: Path,
     annotations_path: Path,
+    ignore_partials: bool = False,
+    partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
 ):
     """
     Evaluate one benchmark directory.
@@ -184,6 +247,8 @@ def evaluate_model_dir(
     metrics = evaluate_predictions(
         annotations_path,
         predictions_path,
+        ignore_partials=ignore_partials,
+        partial_threshold=partial_threshold,
     )
 
     save_metrics(

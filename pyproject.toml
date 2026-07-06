@@ -38,6 +38,18 @@ device = [
     "tflite-runtime>=2.14.0",
 ]
 
+# Faithful upstream PhenoBench evaluation: reuses the official
+# `phenobench.evaluation.evaluate_plant_bounding_boxes` (torchmetrics mAP) for
+# byte-for-byte leaderboard comparability, behind `ave evaluate --faithful`.
+# Heavy + a *separate* (non-pycocotools) metric stack, so it is opt-in only:
+# `pip install agri-vision-edge[faithful-eval]` (or `uv sync --extra faithful-eval`).
+# The default lightweight pycocotools path never imports these.
+faithful-eval = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "torchmetrics>=1.0",
+]
+
 [dependency-groups]
 # Preparation: training, fine-tuning, and TFLite conversion. A dependency-group
 # (not an extra) so it is installed by `uv sync` via default-groups below, while
