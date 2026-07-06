@@ -63,50 +63,31 @@ def compute_tiles(
             "overlap must be in [0, 1)"
         )
 
-    tile_w = width / cols
-    tile_h = height / rows
+    # Uniform tile size + stride so all tiles are the SAME size and together
+    # cover the frame exactly, overlapping by `overlap`. Solving
+    # ``(cols - 1) * stride + tile = width`` with ``stride = tile * (1 - overlap)``
+    # gives ``tile = width / ((cols - 1) * (1 - overlap) + 1)``. This avoids the
+    # non-square, clamped edge tiles the naive ``width / cols`` extend-and-clamp
+    # produced for overlap > 0 (those get stretched to a square on export). For
+    # overlap == 0 it reduces to the old ``width / cols`` grid.
+    tile_w = width / ((cols - 1) * (1.0 - overlap) + 1)
+    tile_h = height / ((rows - 1) * (1.0 - overlap) + 1)
 
-    overlap_w = tile_w * overlap
-    overlap_h = tile_h * overlap
+    stride_w = tile_w * (1.0 - overlap)
+    stride_h = tile_h * (1.0 - overlap)
 
     tiles = []
 
     for r in range(rows):
         for c in range(cols):
 
-            x0 = int(
-                round(
-                    c * tile_w
-                    - overlap_w / 2
-                )
-            )
+            x0 = int(round(c * stride_w))
+            y0 = int(round(r * stride_h))
 
-            y0 = int(
-                round(
-                    r * tile_h
-                    - overlap_h / 2
-                )
-            )
-
-            x1 = int(
-                round(
-                    (c + 1) * tile_w
-                    + overlap_w / 2
-                )
-            )
-
-            y1 = int(
-                round(
-                    (r + 1) * tile_h
-                    + overlap_h / 2
-                )
-            )
-
-            x0 = max(0, x0)
-            y0 = max(0, y0)
-
-            x1 = min(width, x1)
-            y1 = min(height, y1)
+            # Uniform extent; the construction lands the last tile on the frame
+            # edge (modulo rounding), so clamp defensively.
+            x1 = min(width, int(round(c * stride_w + tile_w)))
+            y1 = min(height, int(round(r * stride_h + tile_h)))
 
             tiles.append(
                 Tile(
