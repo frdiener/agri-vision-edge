@@ -16,6 +16,15 @@
 # benchmark_results/<hostname>_cpu/ instead, for a clean CPU-only run alongside
 # the delegated one.
 #
+# Pass --faithful to additionally run the official PhenoBench evaluator
+# (`ave evaluate --faithful`) on each model's predictions right after it is
+# benchmarked, pointing --phenobench-dir at the raw dataset that matches the
+# model: datasets/phenobench_raw_full for untiled models, datasets/
+# phenobench_raw_tiled for *phenobench-tiled* models. Override those locations
+# with the PHENOBENCH_RAW_FULL / PHENOBENCH_RAW_TILED env vars. This needs the
+# host 'faithful-eval' extra (torch/torchvision/torchmetrics); if it is not
+# installed the faithful step is reported as failed and the sweep continues.
+#
 # Any other extra arguments are forwarded to `ave benchmark`.
 
 set -uo pipefail
@@ -28,8 +37,15 @@ bundle_dir="${repo_root}/datasets/test-bundle"
 
 override=0
 cpu_only=0
+faithful=0
 delegate="/usr/lib/libteflon.so"
 forward_args=()
+
+# Raw PhenoBench datasets for the faithful (official upstream) evaluator, keyed
+# by tiling. Overridable via env so a device with the data mounted elsewhere can
+# point at it.
+raw_full_dir="${PHENOBENCH_RAW_FULL:-${repo_root}/datasets/phenobench_raw_full}"
+raw_tiled_dir="${PHENOBENCH_RAW_TILED:-${repo_root}/datasets/phenobench_raw_tiled}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,6 +54,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --cpu)
             cpu_only=1
+            ;;
+        --faithful)
+            faithful=1
             ;;
         --delegate)
             delegate="$2"
@@ -95,9 +114,11 @@ for model in "${models[@]}"; do
     if [[ "${name}" == *phenobench-tiled* ]]; then
         images="${bundle_dir}/images_tiled"
         annotations="${bundle_dir}/annotations_${cls}_tiled.json"
+        raw_dir="${raw_tiled_dir}"
     else
         images="${bundle_dir}/images"
         annotations="${bundle_dir}/annotations_${cls}.json"
+        raw_dir="${raw_full_dir}"
     fi
 
     # --cpu disables the delegate for every model; otherwise all models use it.
@@ -122,6 +143,26 @@ for model in "${models[@]}"; do
         --delegate "${model_delegate}" \
         ${forward_args[@]+"${forward_args[@]}"}
     ran=$((ran + 1))
+
+    # Optional: official upstream (faithful) evaluation on the fresh predictions,
+    # using the raw dataset that matches this model's tiling.
+    if [[ ${faithful} -eq 1 ]]; then
+        predictions="${output_root}/${stem}/predictions.json"
+        if [[ ! -f "${predictions}" ]]; then
+            echo "[warn] ${name}: no predictions.json to faithfully evaluate"
+        elif [[ ! -d "${raw_dir}" ]]; then
+            echo "[warn] ${name}: raw dataset not found at ${raw_dir}" >&2
+        else
+            echo "[faithful] ${name}  (phenobench-dir=$(basename "${raw_dir}"))"
+            "${script_dir}/ave" evaluate \
+                "${annotations}" \
+                "${predictions}" \
+                --faithful \
+                --phenobench-dir "${raw_dir}" \
+                || echo "[warn] faithful eval failed for ${name} (needs the host" \
+                        "'faithful-eval' extra: torch/torchvision/torchmetrics)" >&2
+        fi
+    fi
 done
 
 echo
