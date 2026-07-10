@@ -6,12 +6,11 @@ Tiling is applied before bbox generation.
 Bounding boxes are regenerated from
 cropped semantics + plant_instances.
 
-The primary filtering criterion is
-instance visibility (pixel count),
-which naturally removes tiny tile-border
-fragments without relying on bbox shape.
-
-Partial (do-not-care) tagging follows the
+Boxes are never dropped: every plant
+instance in a tile yields a box. Instead,
+tile-border fragments and otherwise
+partially-visible plants are *tagged*
+``is_partial`` (do-not-care) following the
 upstream PhenoBench ``visibility <= 0.5``
 rule applied to each box's effective
 visibility -- the fraction of the whole
@@ -147,21 +146,6 @@ def compute_instance_areas(
 # --------------------------------------------------
 # Filtering
 # --------------------------------------------------
-
-
-@dataclass(frozen=True)
-class FilterConfig:
-    min_instance_pixels: int = 0
-
-    min_bbox_width: int = 0
-    min_bbox_height: int = 0
-
-    min_bbox_area: int = 0
-
-    min_visible_fraction: float = 0.0
-
-
-# --------------------------------------------------
 # BBox regeneration
 # --------------------------------------------------
 
@@ -193,7 +177,6 @@ def _combine_visibility(
 def generate_plant_bboxes(
     semantics: np.ndarray,
     plant_instances: np.ndarray,
-    filter_config: FilterConfig,
     instance_areas: dict[
         tuple[int, int],
         int,
@@ -204,15 +187,14 @@ def generate_plant_bboxes(
     """
     Regenerate plant bboxes from cropped masks.
 
-    If instance_areas is provided, visibility
-    fractions are computed against the original
-    uncropped instance area and can be filtered
-    via filter_config.min_visible_fraction.
+    Every plant instance present in the (cropped) masks yields a box; there is
+    no size- or visibility-based *dropping*. Instead, partially-visible plants
+    -- including tile-border fragments -- are *tagged* ``is_partial``
+    (do-not-care) so downstream evaluation can ignore them without removing them.
 
-    If ``partial_threshold`` is set, each box additionally gets an
-    ``is_partial`` flag (do-not-care). Unlike ``filter_config.min_visible_fraction``
-    (which *drops* boxes), this only *tags* them, so downstream evaluation can
-    treat partials as do-not-care rather than removing them.
+    If ``instance_areas`` is provided, the per-instance ``visible_fraction``
+    (fraction of the original uncropped instance surviving the tile cut) is
+    computed and stored on the box; it also feeds the ``is_partial`` decision.
 
     Partiality applies the **upstream PhenoBench criterion** (``<=
     partial_threshold``) to the box's *effective visibility* -- the fraction of
@@ -259,12 +241,6 @@ def generate_plant_bboxes(
                 mask.sum()
             )
 
-            if (
-                visible_pixels
-                < filter_config.min_instance_pixels
-            ):
-                continue
-
             visible_fraction = None
 
             if instance_areas is not None:
@@ -285,12 +261,6 @@ def generate_plant_bboxes(
                         / original_pixels
                     )
 
-                    if (
-                        visible_fraction
-                        < filter_config.min_visible_fraction
-                    ):
-                        continue
-
             ys, xs = np.where(mask)
 
             if len(xs) == 0:
@@ -304,26 +274,6 @@ def generate_plant_bboxes(
 
             width = xmax - xmin
             height = ymax - ymin
-
-            area = width * height
-
-            if (
-                width
-                < filter_config.min_bbox_width
-            ):
-                continue
-
-            if (
-                height
-                < filter_config.min_bbox_height
-            ):
-                continue
-
-            if (
-                area
-                < filter_config.min_bbox_area
-            ):
-                continue
 
             bbox = {
                 "label": int(label),
@@ -418,7 +368,6 @@ def decode_tile_index(
 def tile_sample(
     sample,
     tile: Tile,
-    filter_config: FilterConfig,
     partial_threshold: float | None = None,
 ):
 
@@ -464,7 +413,6 @@ def tile_sample(
     plant_bboxes = generate_plant_bboxes(
         semantics_tile,
         instances_tile,
-        filter_config,
         instance_areas=instance_areas,
         partial_threshold=partial_threshold,
         plant_visibility=visibility_tile,
@@ -518,7 +466,6 @@ class TiledPhenoBench:
         rows: int = 2,
         cols: int = 2,
         overlap: float = 0.0,
-        filter_config: FilterConfig | None = None,
         partial_threshold: float | None = None,
     ):
         self.dataset = dataset
@@ -528,15 +475,9 @@ class TiledPhenoBench:
 
         self.overlap = overlap
 
-        self.filter_config = (
-            filter_config
-            if filter_config is not None
-            else FilterConfig()
-        )
-
         # When set, boxes whose effective visibility (upstream frame visibility
         # combined with the tile-cut fraction) is <= this are tagged is_partial
-        # (do-not-care) instead of being dropped. See generate_plant_bboxes.
+        # (do-not-care). See generate_plant_bboxes.
         self.partial_threshold = partial_threshold
 
         self.tiles_per_image = (
@@ -588,7 +529,6 @@ class TiledPhenoBench:
         tiled = tile_sample(
             sample,
             tile,
-            self.filter_config,
             partial_threshold=self.partial_threshold,
         )
 
@@ -763,7 +703,6 @@ class ConcatDataset:
 
 __all__ = [
     "Tile",
-    "FilterConfig",
     "compute_tiles",
     "crop_array",
     "generate_plant_bboxes",

@@ -9,9 +9,9 @@ embeds ObjectDetector metadata. Conversion + metadata only -- no evaluation.
 For each variant the standard targets below are produced *as long as the backing
 stage is present* (``ptq/``, ``qat/`` or ``qat_per-channel/``):
 
+    fp32_ptq               plain float         (ptq stage)
     int8_ptq               per-tensor PTQ      (ptq stage)
     int8_ptq_per-channel   per-channel PTQ     (ptq stage)
-    fp32_ptq               plain float         (ptq stage)
     int8_qat               per-tensor QAT      (qat stage)
     int8_qat_per-channel   per-channel QAT     (qat_per-channel stage)
 
@@ -87,7 +87,7 @@ def _build_train_dataset(variant_name: str, datasets_dir: Path):
     """Build the PhenoBench train split used to draw representative samples."""
     from phenobench import PhenoBench
 
-    from agri_vision_edge.data.tiling import FilterConfig, TiledPhenoBench
+    from agri_vision_edge.data.tiling import TiledPhenoBench
 
     _, tiled = _parse_variant(variant_name)
     raw_dir = datasets_dir / f"phenobench_raw_{'tiled' if tiled else 'full'}"
@@ -102,17 +102,14 @@ def _build_train_dataset(variant_name: str, datasets_dir: Path):
             target_types=["semantics", "plant_instances"],
             ignore_partial=True,
         )
+        # Match the export notebooks (03/04): 3x3 tiles with 0.5 overlap so the
+        # representative-dataset indices in rep_dataset.json line up with the
+        # same 512px tiles the model was trained/exported on.
         return TiledPhenoBench(
             base,
-            rows=2,
-            cols=2,
-            overlap=0.0,
-            filter_config=FilterConfig(
-                min_instance_pixels=32,
-                min_bbox_width=4,
-                min_bbox_height=4,
-                min_bbox_area=32,
-            ),
+            rows=3,
+            cols=3,
+            overlap=0.5,
         )
 
     return PhenoBench(

@@ -222,7 +222,6 @@ def _(config):
 
     from agri_vision_edge.data.tiling import (
         TiledPhenoBench,
-        FilterConfig,
         compute_tiles,
         crop_array,
     )
@@ -274,7 +273,6 @@ def _(config):
     return (
         DATASET_DEFINITION,
         DEST_ROOT,
-        FilterConfig,
         IMAGE_SIZE,
         Image,
         Path,
@@ -396,7 +394,7 @@ def _(
 
 
 @app.cell
-def _(FilterConfig, PhenoBench, SOURCE_ROOT, TiledPhenoBench, config, mo):
+def _(PhenoBench, SOURCE_ROOT, TiledPhenoBench, config, mo):
     mo.stop(
         config["bundle_type"] == "Source Dataset",
         mo.md(
@@ -426,28 +424,23 @@ def _(FilterConfig, PhenoBench, SOURCE_ROOT, TiledPhenoBench, config, mo):
     )
 
     if config["tiling"]:
-        filter_config = FilterConfig(
-            min_instance_pixels=32,
-            min_bbox_width=4,
-            min_bbox_height=4,
-            min_bbox_area=32,
-            min_visible_fraction=0.7,
-        )
-
+        # Match the export notebooks (03/04): 3x3 tiles with 0.5 overlap.
+        # Partial (do-not-care) plants -- including tile-border fragments --
+        # are tagged via partial_threshold instead of being size-filtered out.
         train_dataset = TiledPhenoBench(
             train_dataset,
-            rows=2,
-            cols=2,
-            overlap=0.0,
-            filter_config=filter_config,
+            rows=3,
+            cols=3,
+            overlap=0.5,
+            partial_threshold=0.5,
         )
 
         val_dataset = TiledPhenoBench(
             val_dataset,
-            rows=2,
-            cols=2,
-            overlap=0.0,
-            filter_config=filter_config,
+            rows=3,
+            cols=3,
+            overlap=0.5,
+            partial_threshold=0.5,
         )
 
     print("Train samples:", len(train_dataset))

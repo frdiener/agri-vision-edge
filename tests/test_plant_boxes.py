@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 
 from agri_vision_edge.data.plant_boxes import plant_boxes_from_masks
-from agri_vision_edge.data.tiling import FilterConfig, generate_plant_bboxes
+from agri_vision_edge.data.tiling import generate_plant_bboxes
 
 
 def _blank(size=20):
@@ -85,8 +85,9 @@ def test_no_visibility_mask_only_border_flagged():
 
 
 def test_tiled_generate_uses_upstream_visibility():
-    # generate_plant_bboxes should prefer the upstream plant_visibility mask
-    # over tile-cut visible_fraction for the is_partial decision.
+    # Without instance_areas there is no tile-cut fraction, so the effective
+    # visibility (and the is_partial decision) comes from the upstream
+    # plant_visibility mask alone.
     semantics = _blank()
     instances = _blank()
     visibility = _blank()
@@ -102,7 +103,6 @@ def test_tiled_generate_uses_upstream_visibility():
     boxes = generate_plant_bboxes(
         semantics,
         instances,
-        FilterConfig(),
         partial_threshold=0.5,
         plant_visibility=visibility,
     )

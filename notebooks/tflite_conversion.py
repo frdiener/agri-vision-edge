@@ -166,7 +166,7 @@ def imports():
 
     setup_tensorflow_models()
 
-    from agri_vision_edge.data.tiling import TiledPhenoBench, FilterConfig
+    from agri_vision_edge.data.tiling import TiledPhenoBench
     from agri_vision_edge.data.rep_dataset import (
         representative_dataset,
         normalized_representative_dataset,
@@ -192,7 +192,6 @@ def imports():
     import tensorflow_model_optimization as tfmot
 
     return (
-        FilterConfig,
         Path,
         PhenoBench,
         SSDModule,
@@ -218,7 +217,6 @@ def imports():
 @app.cell(hide_code=True)
 def dataset___conversion_helpers(
     DATASETS_DIR,
-    FilterConfig,
     Path,
     PhenoBench,
     TFLITE_MODELS_DIR,
@@ -320,17 +318,13 @@ def dataset___conversion_helpers(
             ignore_partial=True,
         )
 
+        # Match the export notebooks (03/04): 3x3 tiles with 0.5 overlap so the
+        # rep_dataset.json indices map to the same 512px tiles.
         train_dataset = TiledPhenoBench(
             train_dataset,
-            rows=2,
-            cols=2,
-            overlap=0.0,
-            filter_config=FilterConfig(
-                min_instance_pixels=32,
-                min_bbox_width=4,
-                min_bbox_height=4,
-                min_bbox_area=32,
-            ),
+            rows=3,
+            cols=3,
+            overlap=0.5,
         )
     else:
         train_dataset = PhenoBench(
