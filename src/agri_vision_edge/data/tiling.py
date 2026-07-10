@@ -10,6 +10,14 @@ The primary filtering criterion is
 instance visibility (pixel count),
 which naturally removes tiny tile-border
 fragments without relying on bbox shape.
+
+Partial (do-not-care) tagging follows the
+upstream PhenoBench ``visibility <= 0.5``
+rule applied to each box's effective
+visibility -- the fraction of the whole
+plant visible within the tile, combining
+original-frame occlusion with the tile cut
+(see ``generate_plant_bboxes``).
 """
 
 from __future__ import annotations
@@ -158,6 +166,30 @@ class FilterConfig:
 # --------------------------------------------------
 
 
+def _combine_visibility(
+    upstream_visibility: float | None,
+    visible_fraction: float | None,
+) -> float | None:
+    """
+    Fraction of the WHOLE plant visible within a tile.
+
+    ``upstream_visibility`` (fraction visible in the original frame) and
+    ``visible_fraction`` (fraction of the frame-visible plant surviving the tile
+    cut) are independent reductions, so the overall visible fraction is their
+    product. Either may be ``None`` when its source is unavailable, in which case
+    the other is returned alone; when both are ``None`` the caller cannot decide
+    partiality and gets ``None``.
+    """
+
+    if upstream_visibility is None:
+        return visible_fraction
+
+    if visible_fraction is None:
+        return upstream_visibility
+
+    return upstream_visibility * visible_fraction
+
+
 def generate_plant_bboxes(
     semantics: np.ndarray,
     plant_instances: np.ndarray,
@@ -180,15 +212,29 @@ def generate_plant_bboxes(
     If ``partial_threshold`` is set, each box additionally gets an
     ``is_partial`` flag (do-not-care). Unlike ``filter_config.min_visible_fraction``
     (which *drops* boxes), this only *tags* them, so downstream evaluation can
-    treat partials as do-not-care rather than removing them. The partiality
-    source depends on what is available:
+    treat partials as do-not-care rather than removing them.
 
-    * When ``plant_visibility`` (a cropped mask aligned with ``semantics``) is
-      given, partiality follows the **upstream PhenoBench criterion**: the box's
-      per-instance visibility (``max(plant_visibility[mask]) / 255``) ``<=
-      partial_threshold``. The visibility is also stored on the box.
-    * Otherwise it falls back to the tile-cut ``visible_fraction <=
-      partial_threshold`` (only available when ``instance_areas`` is provided).
+    Partiality applies the **upstream PhenoBench criterion** (``<=
+    partial_threshold``) to the box's *effective visibility* -- the fraction of
+    the **whole plant** that is visible within this tile. Two independent
+    reductions combine (by product) into that fraction so tile-slice borders are
+    handled exactly like the upstream visibility rule:
+
+    * ``upstream_visibility`` -- the fraction of the plant that was visible in
+      the **original frame** (occlusion / frame border), read per instance from
+      the cropped ``plant_visibility`` mask as ``max(plant_visibility[mask]) /
+      255``. Available when ``plant_visibility`` is given.
+    * ``visible_fraction`` -- the fraction of the frame-visible plant that
+      survives the **tile cut** (``visible_pixels / original_pixels``).
+      Available when ``instance_areas`` is given.
+
+    The effective visibility is ``upstream_visibility * visible_fraction`` when
+    both are known, or whichever single source is available otherwise; a box is
+    flagged ``is_partial`` when it is ``<= partial_threshold``. This means a
+    plant that was fully visible in the frame but is sliced away by a tile
+    border (leaving ``<= partial_threshold`` of its pixels) is flagged partial,
+    consistently with an originally-partial plant. The effective visibility is
+    also stored on the box as ``visibility``.
     """
 
     boxes = []
@@ -301,10 +347,10 @@ def generate_plant_bboxes(
                     visible_fraction
                 )
 
-            # Upstream visibility (do-not-care criterion): the per-instance
-            # visibility value read from the cropped plant_visibility mask,
-            # normalized to [0, 1]. Takes precedence over visible_fraction for
-            # the is_partial decision when available.
+            # Upstream visibility: the per-instance visibility value read from
+            # the cropped plant_visibility mask, normalized to [0, 1]. This is
+            # the fraction of the plant that was visible in the ORIGINAL frame
+            # (occlusion / frame border), before any tile cut.
             upstream_visibility = None
 
             if plant_visibility is not None:
@@ -312,19 +358,29 @@ def generate_plant_bboxes(
                     float(plant_visibility[mask].max())
                     / _VISIBILITY_SCALE
                 )
-                bbox["visibility"] = upstream_visibility
 
-            if partial_threshold is not None:
-                partiality = (
-                    upstream_visibility
-                    if upstream_visibility is not None
-                    else visible_fraction
+            # Effective visibility (do-not-care criterion): the fraction of the
+            # WHOLE plant visible within this tile. Frame occlusion
+            # (upstream_visibility) and the tile cut (visible_fraction) are
+            # independent reductions, so they combine by product. Applying the
+            # upstream ``<= partial_threshold`` rule to it flags both
+            # originally-partial plants and plants sliced away by a tile border,
+            # keeping tile borders consistent with the upstream 0.5 criterion.
+            effective_visibility = _combine_visibility(
+                upstream_visibility,
+                visible_fraction,
+            )
+
+            if effective_visibility is not None:
+                bbox["visibility"] = float(effective_visibility)
+
+            if (
+                partial_threshold is not None
+                and effective_visibility is not None
+            ):
+                bbox["is_partial"] = bool(
+                    effective_visibility <= partial_threshold
                 )
-
-                if partiality is not None:
-                    bbox["is_partial"] = bool(
-                        partiality <= partial_threshold
-                    )
 
             boxes.append(bbox)
 
@@ -478,8 +534,9 @@ class TiledPhenoBench:
             else FilterConfig()
         )
 
-        # When set, boxes whose visible_fraction <= this are tagged is_partial
-        # (do-not-care) instead of being dropped.
+        # When set, boxes whose effective visibility (upstream frame visibility
+        # combined with the tile-cut fraction) is <= this are tagged is_partial
+        # (do-not-care) instead of being dropped. See generate_plant_bboxes.
         self.partial_threshold = partial_threshold
 
         self.tiles_per_image = (
