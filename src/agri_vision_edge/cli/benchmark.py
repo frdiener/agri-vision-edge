@@ -14,6 +14,7 @@ Supports:
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from agri_vision_edge.evaluation.artifacts import (
@@ -99,6 +100,20 @@ def benchmark_model(
     print(f"exported {len(result.predictions)} prediction(s)")
 
 
+def env_var(value: str) -> tuple[str, str]:
+    try:
+        key, val = value.split("=", 1)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected KEY=VALUE, got {value!r}"
+        ) from exc
+
+    if not key:
+        raise argparse.ArgumentTypeError("environment-variable name cannot be empty")
+
+    return key, val
+
+
 def main(argv=None):
     """
     CLI entrypoint.
@@ -146,7 +161,20 @@ def main(argv=None):
         ),
     )
 
+    parser.add_argument(
+        "-e",
+        "--env",
+        metavar="KEY=VALUE",
+        action="append",
+        type=env_var,
+        default=[],
+        help="Set an environment variable; may be passed multiple times.",
+    )
+
     args = parser.parse_args(argv)
+
+    env = dict(args.env)
+    os.environ.update(env)
 
     # The Teflon/NPU delegate targets INT8; routing an fp32 graph through it
     # silently degrades results. 'none' (or empty) keeps the model on CPU.
@@ -171,6 +199,8 @@ def main(argv=None):
     print(f"Found {len(model_paths)} model(s)")
 
     print(f"Found {len(image_records)} annotated image(s)")
+
+    print(f"Environment: {env}")
 
     success = 0
     failed = 0
