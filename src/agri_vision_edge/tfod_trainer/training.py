@@ -78,6 +78,59 @@ def create_train_dataset(
     ).repeat()
 
 
+def ensure_optimizer_state_created(runtime, detection_model):
+    """Create optimizer/EMA slot variables without taking a training step.
+
+    Keras optimizers generally create momentum/variance slots lazily on their
+    first ``apply_gradients`` call.  A checkpoint written before that point can
+    restore model weights but cannot rewind optimizer state, which turns a
+    later plateau restart into a model-only rewind with stale momentum.
+
+    This must run after graph modifications, because BN folding or QAT may
+    replace the model's trainable variables.  ``_create_all_weights`` is the
+    TensorFlow 2.12/legacy-optimizer path used by TFOD and also lets optimizer
+    wrappers such as MovingAverage create their shadow/slot variables.  The
+    public ``build`` path covers newer Keras optimizers.
+    """
+    variables = list(detection_model.trainable_variables)
+    if not variables:
+        raise RuntimeError(
+            "Cannot initialize optimizer state: the detection model has no "
+            "trainable variables. Ensure the model is built first."
+        )
+
+    optimizer = runtime.optimizer
+
+    create_all_weights = getattr(optimizer, "_create_all_weights", None)
+    if callable(create_all_weights):
+        create_all_weights(variables)
+    else:
+        build = getattr(optimizer, "build", None)
+        if callable(build):
+            build(variables)
+        else:
+            create_slots = getattr(optimizer, "_create_slots", None)
+            if not callable(create_slots):
+                raise RuntimeError(
+                    "Cannot initialize optimizer state for "
+                    f"{type(optimizer).__name__}: no supported build/slot "
+                    "creation API was found."
+                )
+            create_slots(variables)
+
+    optimizer_variables = getattr(optimizer, "variables", None)
+    if callable(optimizer_variables):
+        optimizer_variables = optimizer_variables()
+    elif optimizer_variables is None:
+        optimizer_variables = getattr(optimizer, "weights", ())
+
+    print(
+        "Initialized optimizer checkpoint state: "
+        f"{len(tuple(optimizer_variables))} optimizer/EMA variable(s) for "
+        f"{len(variables)} trainable model variable(s)."
+    )
+
+
 def run_evaluation(detection_model, runtime):
     """
     Run one evaluation pass, transparently swapping EMA weights in/out.
@@ -123,6 +176,7 @@ def save_best_checkpoint(
     state.best_metric = metric_value
 
     checkpoint_path = runtime.manager.save()
+    state.best_checkpoint_path = checkpoint_path
 
     write_json(
         trainer_cfg.best_metric_path,
@@ -235,17 +289,25 @@ def maybe_reduce_lr_on_plateau(
             >= trainer_cfg.control.lr_plateau_exhausted_patience
         )
 
-    # Warm restart: rewind to the best weights/optimizer state before dropping
-    # the LR. Restoring the checkpoint also rewinds global_step, so save and
-    # re-assign it to keep the training horizon intact.
-    if trainer_cfg.control.lr_plateau_restore_best and runtime.manager.latest_checkpoint:
-        best_path = runtime.manager.latest_checkpoint
+    # Warm restart: rewind to the exact best weights and optimizer/EMA state
+    # before dropping the LR. Restoring also rewinds global_step, so preserve the current training
+    # horizon explicitly.
+    best_path = getattr(state, "best_checkpoint_path", None)
+    if trainer_cfg.control.lr_plateau_restore_best and best_path:
         saved_step = int(runtime.global_step.numpy())
-        runtime.ckpt.restore(best_path).expect_partial()
+
+        restore_status = runtime.ckpt.restore(best_path)
+        restore_status.assert_existing_objects_matched()
+
         runtime.global_step.assign(saved_step)
         print(
             f"LR plateau: restored best checkpoint ({best_path}) for warm "
-            f"restart."
+            f"restart; preserved global_step={saved_step}."
+        )
+    elif trainer_cfg.control.lr_plateau_restore_best:
+        print(
+            "LR plateau: warm restart requested, but no best checkpoint has "
+            "been recorded; reducing the LR without restoring."
         )
 
     # Assign AFTER the restore, so a checkpoint-restored LR can't clobber it.
@@ -316,6 +378,11 @@ def train(
         trainer_cfg,
         train_ds,
     )
+
+    # Materialize optimizer slots and (when enabled) EMA shadow variables before
+    # any baseline checkpoint is written. Otherwise an initial checkpoint can
+    # only rewind model weights while leaving later optimizer momentum intact.
+    ensure_optimizer_state_created(runtime, detection_model)
 
     # When we are going to seed the best-metric tracker with a scored baseline
     # eval below, skip this purely-informational (unscored) eval to avoid
