@@ -46,6 +46,14 @@ class TrainingControlConfig:
     # trainer then falls back to num_steps).
     max_epochs: int | None = None
 
+    # Optional warmup length expressed in epochs. When set (and the epoch
+    # geometry is known), it OVERRIDES the pipeline's warmup_steps:
+    # warmup_steps = round(warmup_epochs * steps_per_epoch). This drives both the
+    # cosine warmup and the plateau schedule's warmup ramp (which reads
+    # warmup_steps back from the rendered pipeline). None (the default) leaves
+    # warmup_steps as configured. Ignored when train_samples is unavailable.
+    warmup_epochs: float | None = None
+
     checkpoint_max_to_keep: int = 3
 
     metric_name: str = "DetectionBoxes_Precision/mAP"
@@ -87,6 +95,18 @@ class TrainingControlConfig:
     lr_plateau_patience: int = 15
     lr_plateau_cooldown: int = 5
     lr_plateau_min_lr: float = 1e-6
+
+    # Optional single-source overrides for the base and warmup learning rates.
+    # When set they overwrite the pipeline's cosine `learning_rate_base` /
+    # `warmup_learning_rate` before rendering, so both the cosine schedule and
+    # the plateau schedule (which reads these back from the rendered pipeline via
+    # `extract_lr_params`) pick them up -- letting the LR be configured here
+    # alongside the other schedule knobs instead of on `FineTuneConfig`. None
+    # (the default) leaves the finetune config's values untouched. Named for the
+    # plateau schedule (its usual caller) but they overwrite the pipeline keys
+    # unconditionally.
+    lr_plateau_base_lr: float | None = None
+    lr_plateau_warmup_lr: float | None = None
 
     # Minimum metric gain that counts as an improvement for the plateau stall
     # counter (absolute, in metric units). Decoupled from checkpointing: the best
