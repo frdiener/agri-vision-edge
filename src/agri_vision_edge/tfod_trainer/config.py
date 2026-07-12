@@ -24,6 +24,28 @@ class TrainingControlConfig:
 
     log_every: int = 100
 
+    # Epoch-based evaluation cadence. One "epoch" is a full pass over the
+    # training set: steps_per_epoch = ceil(train_samples / batch_size), where
+    # train_samples is read from the bundle's dataset_metadata.json and
+    # batch_size from the pipeline's train_config. Evaluation, best-checkpointing
+    # and the early-stopping / plateau bookkeeping then fire every
+    # `eval_every_epochs` epochs instead of every `log_every` steps, so eval load
+    # scales with the dataset -- a 3x3-tiled set carries ~9x the samples, hence
+    # ~9x the steps per epoch and far fewer (but not cheaper-per-eval) evals for
+    # the same num_steps, which is what makes the tiled runs fit the Kaggle time
+    # budget. The run always evaluates once more on the final step so the last
+    # (possibly partial) epoch is scored. Falls back to the legacy `log_every`
+    # step cadence when train_samples is unavailable (older bundles).
+    eval_every_epochs: float = 1.0
+
+    # Optional training length expressed in epochs. When set, it OVERRIDES the
+    # pipeline's num_steps entirely: the horizon becomes exactly
+    # max_epochs * steps_per_epoch (a whole-epoch boundary), so num_steps can be
+    # left at its large default and ignored. None (the default) leaves num_steps
+    # in charge of the horizon. Ignored when train_samples is unavailable (the
+    # trainer then falls back to num_steps).
+    max_epochs: int | None = None
+
     checkpoint_max_to_keep: int = 3
 
     metric_name: str = "DetectionBoxes_Precision/mAP"

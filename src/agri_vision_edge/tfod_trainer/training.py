@@ -355,7 +355,18 @@ def train(
     detection_model,
     runtime,
     trainer_cfg,
+    steps_per_epoch=None,
 ):
+    """
+    Run the custom training loop.
+
+    ``steps_per_epoch`` (``ceil(train_samples / batch_size)``, supplied by
+    ``run_finetune`` from the bundle metadata) turns evaluation, checkpointing
+    and the early-stopping / plateau bookkeeping onto an epoch cadence
+    (``control.eval_every_epochs``) and enables the optional ``control.max_epochs``
+    cap. When it is ``None`` (sample count unavailable) the loop falls back to the
+    legacy step cadence (``control.log_every``).
+    """
     state = TrainerState()
 
     train_ds = create_train_dataset(
@@ -421,6 +432,8 @@ def train(
         metrics = run_evaluation(detection_model, runtime)
 
         record = {"step": current_step}
+        if steps_per_epoch and steps_per_epoch > 0:
+            record["epoch"] = current_step / steps_per_epoch
         record.update(metrics_to_float(metrics))
         state.metrics_history.append(record)
 
@@ -455,10 +468,43 @@ def train(
 
     iterator = iter(train_ds)
 
-    train_steps = (
-        runtime.configs["train_config"]
-        .num_steps
+    control = trainer_cfg.control
+
+    num_steps = int(
+        runtime.configs["train_config"].num_steps
     )
+
+    # Resolve the evaluation cadence and training horizon. With a known
+    # steps_per_epoch we run on an epoch cadence (eval every `eval_every_epochs`
+    # epochs) and honour the optional `max_epochs` cap; otherwise we fall back to
+    # the legacy step cadence (`log_every`).
+    if steps_per_epoch and steps_per_epoch > 0:
+        eval_interval = max(
+            1, round(control.eval_every_epochs * steps_per_epoch)
+        )
+        # `max_epochs`, when set, OVERRIDES the pipeline's num_steps entirely:
+        # the horizon becomes exactly that many epochs, so num_steps can stay at
+        # its large default and be ignored. Without it, num_steps is the horizon.
+        if control.max_epochs is not None:
+            train_steps = control.max_epochs * steps_per_epoch
+        else:
+            train_steps = num_steps
+        geometry = (
+            f"Epoch geometry: steps_per_epoch={steps_per_epoch}; evaluating "
+            f"every {control.eval_every_epochs} epoch(s) (= {eval_interval} "
+            f"steps); training to step {train_steps} "
+            f"(~{train_steps / steps_per_epoch:.2f} epochs)"
+        )
+        if control.max_epochs is not None:
+            geometry += f"; horizon set by max_epochs={control.max_epochs}"
+        print(geometry + ".")
+    else:
+        eval_interval = control.log_every
+        train_steps = num_steps
+        print(
+            "Epoch geometry unavailable (no train_samples in bundle metadata); "
+            f"falling back to eval every {eval_interval} steps."
+        )
 
     print("Making trainstep_fn...")
     train_step_fn = make_train_step(runtime, detection_model)
@@ -484,11 +530,10 @@ def train(
         # step so the LR variable tracks the ramp before plateau reductions.
         apply_lr_warmup(runtime, current_step)
 
-        if (
-            current_step
-            % trainer_cfg.control.log_every
-            != 0
-        ):
+        # Evaluate on the (epoch or step) cadence, and always on the final step
+        # so the last -- possibly partial -- epoch is scored and checkpointed.
+        is_final_step = current_step >= train_steps
+        if current_step % eval_interval != 0 and not is_final_step:
             continue
 
         # Catch a diverged BatchNorm (NaN/Inf moving stats) as soon as it
@@ -547,8 +592,11 @@ def train(
                     f"/{trainer_cfg.control.lr_plateau_exhausted_patience}"
                 )
 
+        step_label = f"Step {current_step}"
+        if steps_per_epoch and steps_per_epoch > 0:
+            step_label += f" (epoch {current_step / steps_per_epoch:.2f})"
         print(
-            f"Step {current_step}: "
+            step_label + ": "
             + " | ".join(metric_parts + sched_parts)
         )
 
@@ -561,6 +609,8 @@ def train(
         # train_metrics shadow the eval losses under the same keys, matching
         # what agri_vision_edge.evaluation.curves expects.
         record = {"step": current_step}
+        if steps_per_epoch and steps_per_epoch > 0:
+            record["epoch"] = current_step / steps_per_epoch
         record.update(metrics_to_float(metrics))
         record.update(train_metrics)
         state.metrics_history.append(record)

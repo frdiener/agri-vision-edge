@@ -141,10 +141,16 @@ class FineTuneConfig:
     # Scaled proportionally to reduced LR.
     warmup_learning_rate: float = 0.001
 
-    # Both upstreams use 50k.
-    #
-    # Reduced for fine-tuning workloads.
-    num_steps: int = 20_000
+    # Hard upper bound on training steps (both upstreams use 50k). Defaults to a
+    # large value so it can be left untouched in the notebooks and the run length
+    # governed instead by ``control.max_epochs`` (which overrides this entirely
+    # when set) plus the early-stopping / plateau schedule. Caveat: this same
+    # value is rendered as the cosine LR schedule's ``total_steps`` (see
+    # ``tfod.config``), so with ``lr_plateau=False`` a huge ``num_steps`` flattens
+    # the cosine decay -- set it explicitly for plain-cosine finetunes, or use
+    # ``lr_plateau=True`` (which replaces the cosine schedule with the mutable,
+    # plateau-driven LR and makes ``total_steps`` irrelevant).
+    num_steps: int = 1_000_000
 
     # Upstreams:
     # - SSD MobileNet V2 300x300: 2000

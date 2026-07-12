@@ -19,13 +19,14 @@ QAT is the same call with ``qat=True`` (and optionally ``qat_per_channel``) set.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
+from math import ceil
 from pathlib import Path
 
 from agri_vision_edge.experiment import AugmentationConfig, FineTuneConfig
 
 from .config import TrainerConfig, TrainingControlConfig
-
 
 # Legacy flat keys that used to live directly on ``FinetuneRunConfig`` (or, for
 # early stopping, on the nested ``FineTuneConfig``). ``from_mapping`` folds them
@@ -121,6 +122,10 @@ class FinetuneRunConfig:
     @property
     def val_record(self) -> Path:
         return self.dataset_bundle_path / "val.record"
+
+    @property
+    def dataset_metadata(self) -> Path:
+        return self.dataset_bundle_path / "dataset_metadata.json"
 
     @property
     def pipeline_config_path(self) -> Path:
@@ -254,6 +259,49 @@ def write_pipeline(cfg: FinetuneRunConfig) -> Path:
     return cfg.pipeline_config_path
 
 
+def read_train_samples(cfg: FinetuneRunConfig) -> int | None:
+    """
+    Read ``train_samples`` from the bundle's ``dataset_metadata.json``.
+
+    Returns the training-set size the trainer needs to translate the
+    epoch-based cadence (``eval_every_epochs`` / ``max_epochs``) into steps, or
+    ``None`` when the metadata file is missing or has no ``train_samples`` key
+    (older bundles), in which case the trainer falls back to its step-based
+    ``log_every`` cadence.
+    """
+    meta_path = cfg.dataset_metadata
+    if not meta_path.exists():
+        return None
+    try:
+        data = json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    value = data.get("train_samples")
+    return int(value) if value else None
+
+
+def compute_steps_per_epoch(cfg: FinetuneRunConfig) -> int | None:
+    """
+    Derive ``steps_per_epoch = ceil(train_samples / batch_size)``.
+
+    ``batch_size`` is the finetune config's batch size (rendered verbatim into
+    the pipeline's ``train_config``; each training step consumes exactly one
+    batch) and ``train_samples`` comes from the bundle metadata. Both are known
+    before the pipeline is rendered, so this can run pre-render -- which is what
+    lets ``run_finetune`` fold a ``max_epochs`` horizon into ``num_steps`` before
+    the cosine schedule's ``total_steps`` is baked in. Uses ``ceil`` so a
+    training set that is not a whole multiple of the batch size still counts its
+    trailing partial batch as the epoch's final step, keeping epoch boundaries
+    aligned to integer step counts. Returns ``None`` when the sample count is
+    unavailable.
+    """
+    train_samples = read_train_samples(cfg)
+    batch_size = int(cfg.finetune.batch_size)
+    if not train_samples or batch_size <= 0:
+        return None
+    return ceil(train_samples / batch_size)
+
+
 def run_finetune(cfg) -> RunResult:
     """
     Render the pipeline, build the model + runtime, and train.
@@ -275,6 +323,19 @@ def run_finetune(cfg) -> RunResult:
     if not isinstance(cfg, FinetuneRunConfig):
         cfg = FinetuneRunConfig.from_mapping(cfg)
 
+    # Resolve the epoch geometry BEFORE rendering, so a `max_epochs` horizon can
+    # be folded into num_steps -- which is also the cosine schedule's
+    # total_steps -- keeping the LR decay aligned with the actual run length.
+    steps_per_epoch = compute_steps_per_epoch(cfg)
+
+    if cfg.control.max_epochs is not None and steps_per_epoch:
+        cfg.finetune.num_steps = cfg.control.max_epochs * steps_per_epoch
+        print(
+            f"Setting max step to {cfg.finetune.num_steps} "
+            f"(max_epochs={cfg.control.max_epochs} * "
+            f"steps_per_epoch={steps_per_epoch})."
+        )
+
     write_pipeline(cfg)
     cfg.train_dir.mkdir(parents=True, exist_ok=True)
 
@@ -291,7 +352,12 @@ def run_finetune(cfg) -> RunResult:
         eval_ignore_partials=cfg.control.eval_ignore_partials,
     )
 
-    train(detection_model, runtime, trainer_cfg)
+    train(
+        detection_model,
+        runtime,
+        trainer_cfg,
+        steps_per_epoch=steps_per_epoch,
+    )
 
     return RunResult(
         pipeline_config=cfg.pipeline_config_path,
