@@ -24,6 +24,14 @@ class TrainingControlConfig:
 
     log_every: int = 100
 
+    # Optional override for the training batch size. When set, it overwrites the
+    # pipeline's train_config batch_size before rendering, letting the batch size
+    # be configured here alongside the other schedule knobs. Because it feeds
+    # steps_per_epoch (= ceil(train_samples / batch_size)), it is resolved before
+    # the epoch-derived horizons (max_epochs / warmup_epochs). None (the default)
+    # leaves FineTuneConfig.batch_size untouched.
+    batch_size: int | None = None
+
     # Epoch-based evaluation cadence. One "epoch" is a full pass over the
     # training set: steps_per_epoch = ceil(train_samples / batch_size), where
     # train_samples is read from the bundle's dataset_metadata.json and

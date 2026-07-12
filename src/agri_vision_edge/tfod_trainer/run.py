@@ -302,22 +302,32 @@ def compute_steps_per_epoch(cfg: FinetuneRunConfig) -> int | None:
     return ceil(train_samples / batch_size)
 
 
-def apply_config_overrides(cfg: FinetuneRunConfig, steps_per_epoch: int | None) -> None:
+def apply_config_overrides(cfg: FinetuneRunConfig) -> int | None:
     """
-    Fold the epoch- and LR-oriented ``control`` overrides into ``cfg.finetune``
-    before the pipeline is rendered, so a single place (``control``) can drive
-    keys that otherwise live on the pipeline config:
+    Fold the ``control`` overrides into ``cfg.finetune`` before the pipeline is
+    rendered, so a single place (``control``) can drive keys that otherwise live
+    on the pipeline config, and return the resulting ``steps_per_epoch``:
 
+    - ``batch_size``          -> ``batch_size``
     - ``max_epochs``          -> ``num_steps`` (also the cosine ``total_steps``)
     - ``warmup_epochs``       -> ``warmup_steps`` (cosine + plateau warmup ramp)
     - ``lr_plateau_base_lr``  -> ``learning_rate_base``
     - ``lr_plateau_warmup_lr``-> ``warmup_learning_rate``
 
-    The epoch-derived overrides need a known ``steps_per_epoch`` (skipped when it
-    is ``None``); the LR overrides are applied unconditionally. Each applied
-    override is logged. Mutates ``cfg.finetune`` in place.
+    Order matters: ``batch_size`` is resolved first because it feeds
+    ``steps_per_epoch`` (= ceil(train_samples / batch_size)), which in turn
+    drives the epoch-derived horizons (``max_epochs`` / ``warmup_epochs``). The
+    epoch-derived overrides need a known ``steps_per_epoch`` (skipped when it is
+    ``None``); the ``batch_size`` / LR overrides are applied unconditionally when
+    set. Each applied override is logged. Mutates ``cfg.finetune`` in place.
     """
     control = cfg.control
+
+    if control.batch_size is not None:
+        cfg.finetune.batch_size = control.batch_size
+        print(f"Setting batch_size to {cfg.finetune.batch_size}.")
+
+    steps_per_epoch = compute_steps_per_epoch(cfg)
 
     if steps_per_epoch:
         if control.max_epochs is not None:
@@ -349,6 +359,8 @@ def apply_config_overrides(cfg: FinetuneRunConfig, steps_per_epoch: int | None) 
             f"{cfg.finetune.warmup_learning_rate}."
         )
 
+    return steps_per_epoch
+
 
 def run_finetune(cfg) -> RunResult:
     """
@@ -371,13 +383,12 @@ def run_finetune(cfg) -> RunResult:
     if not isinstance(cfg, FinetuneRunConfig):
         cfg = FinetuneRunConfig.from_mapping(cfg)
 
-    # Resolve the epoch geometry BEFORE rendering, so the epoch-based control
-    # overrides (max_epochs -> num_steps, warmup_epochs -> warmup_steps) are
-    # folded into the pipeline keys -- num_steps also being the cosine schedule's
-    # total_steps -- keeping the LR decay aligned with the actual run length.
-    steps_per_epoch = compute_steps_per_epoch(cfg)
-
-    apply_config_overrides(cfg, steps_per_epoch)
+    # Resolve all control overrides (folding them into cfg.finetune) BEFORE
+    # rendering, so batch_size / max_epochs -> num_steps / warmup_epochs ->
+    # warmup_steps land in the pipeline keys -- num_steps also being the cosine
+    # schedule's total_steps -- keeping the LR decay aligned with the actual run
+    # length. Returns the epoch geometry the trainer needs.
+    steps_per_epoch = apply_config_overrides(cfg)
 
     write_pipeline(cfg)
     cfg.train_dir.mkdir(parents=True, exist_ok=True)
