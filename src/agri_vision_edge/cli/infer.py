@@ -26,10 +26,20 @@ from agri_vision_edge.runtime.inference.tflite import DEFAULT_TEFLON_LIB
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# Detection category_id is 1-based (COCO convention; see TFLiteRuntime's
-# class_index_offset and the YOLO runtime's `cls + 1`).
-LABELS = {1: "crop", 2: "weed"}
-COLORS = {1: (0, 255, 0), 2: (0, 0, 255)}  # BGR: crop green, weed red
+# BGR palette cycled by category_id for box drawing (crop green, weed red first).
+COLORS = [
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 128, 0),
+    (0, 200, 255),
+    (255, 0, 255),
+]
+
+
+def color_for(category_id: int) -> tuple[int, int, int]:
+    """Deterministic BGR color for a 1-based category id."""
+
+    return COLORS[(category_id - 1) % len(COLORS)]
 
 
 def build_detector(model_path, *, delegate, threshold, iou, size):
@@ -52,7 +62,7 @@ def build_detector(model_path, *, delegate, threshold, iou, size):
     return runtime
 
 
-def draw_detections(image_bgr, detections, output_path):
+def draw_detections(image_bgr, detections, output_path, labels):
     """Render detections (already score-filtered) onto a copy and save it."""
 
     h, w = image_bgr.shape[:2]
@@ -65,8 +75,8 @@ def draw_detections(image_bgr, detections, output_path):
         x2 = max(0, min(w - 1, int(xmax * w)))
         y2 = max(0, min(h - 1, int(ymax * h)))
 
-        color = COLORS.get(det.category_id, (255, 255, 255))
-        name = LABELS.get(det.category_id, f"class-{det.category_id}")
+        color = color_for(det.category_id)
+        name = labels.get(det.category_id, f"class-{det.category_id}")
 
         cv2.rectangle(image_bgr, (x1, y1), (x2, y2), color, 2)
 
@@ -125,8 +135,11 @@ def main(argv=None):
         "-t",
         "--threshold",
         type=float,
-        default=0.3,
-        help="Score threshold for kept detections (default: %(default)s)",
+        default=None,
+        help=(
+            "Score threshold for kept detections "
+            "(default: the model's embedded score_threshold)"
+        ),
     )
 
     parser.add_argument(
@@ -142,8 +155,11 @@ def main(argv=None):
     parser.add_argument(
         "--iou",
         type=float,
-        default=0.5,
-        help="IoU threshold for YOLO NMS (ignored for SSD) (default: %(default)s)",
+        default=None,
+        help=(
+            "IoU threshold for YOLO NMS (ignored for SSD) "
+            "(default: the model's embedded iou_threshold)"
+        ),
     )
 
     parser.add_argument(
@@ -193,6 +209,10 @@ def main(argv=None):
 
     print(f"[infer] input size: {detector.input_size}")
 
+    # Class names come from the model's embedded metadata; models without it
+    # (e.g. the separately-exported YOLO artifacts) fall back to "class-<id>".
+    labels = getattr(detector, "labels", {})
+
     for image_path in image_paths:
         print(f"\n=== {image_path.name} ===")
 
@@ -209,6 +229,7 @@ def main(argv=None):
                 image_bgr,
                 detections,
                 output_dir / image_path.name,
+                labels,
             )
 
         except Exception as e:

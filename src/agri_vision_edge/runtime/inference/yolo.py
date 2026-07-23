@@ -36,10 +36,17 @@ from .base import (
     BaseRuntime,
     Detection,
 )
+from .model_metadata import ModelMetadata
 from .tflite import (
     DEFAULT_TEFLON_LIB,
     load_delegates,
 )
+
+# Fallbacks when a model carries no embedded post-processing metadata (the
+# YOLOv7-tiny exports come from a sibling repo and are not annotated by this
+# project's converter).
+_DEFAULT_IOU_THRESHOLD = 0.65
+_DEFAULT_MAX_DETECTIONS = 100
 
 # Stock yolov7-tiny anchors (cfg/training/yolov7-tiny.yaml — the phenobench-tiny
 # notebook trains the unmodified cfg), keyed by output stride. Verified to decode
@@ -67,11 +74,17 @@ class YoloTFLiteRuntime(BaseRuntime):
         model_path,
         *,
         delegate_path: str | None = DEFAULT_TEFLON_LIB,
-        score_threshold: float = 0.0,
-        iou_threshold: float = 0.65,
-        max_detections: int = 100,
+        score_threshold: float | None = None,
+        iou_threshold: float | None = None,
+        max_detections: int | None = None,
         size: int | None = None,
     ):
+
+        # Labels and post-processing defaults come from the embedded metadata
+        # when present; explicit constructor arguments always take precedence.
+        self.metadata = ModelMetadata.load(model_path)
+
+        self.labels = self.metadata.labels
 
         self.interpreter = Interpreter(
             model_path=str(model_path),
@@ -84,11 +97,23 @@ class YoloTFLiteRuntime(BaseRuntime):
 
         self.output_details = self.interpreter.get_output_details()
 
-        self.score_threshold = score_threshold
+        self.score_threshold = (
+            score_threshold
+            if score_threshold is not None
+            else (self.metadata.score_threshold or 0.0)
+        )
 
-        self.iou_threshold = iou_threshold
+        self.iou_threshold = (
+            iou_threshold
+            if iou_threshold is not None
+            else (self.metadata.iou_threshold or _DEFAULT_IOU_THRESHOLD)
+        )
 
-        self.max_detections = max_detections
+        self.max_detections = (
+            max_detections
+            if max_detections is not None
+            else (self.metadata.max_detections or _DEFAULT_MAX_DETECTIONS)
+        )
 
         self._model_size = int(self.input_details[0]["shape"][1])
 

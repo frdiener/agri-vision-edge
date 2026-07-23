@@ -32,11 +32,17 @@ def build_runtime(
     model_path: str | Path,
     *,
     delegate_path: str | None = DEFAULT_TEFLON_LIB,
-    score_threshold: float = 0.0,
-    iou_threshold: float = 0.65,
+    score_threshold: float | None = None,
+    iou_threshold: float | None = None,
     size: int | None = None,
 ) -> BaseRuntime:
-    """Build the detector runtime matching the model's output layout."""
+    """
+    Build the detector runtime matching the model's output layout.
+
+    ``score_threshold`` / ``iou_threshold`` left as ``None`` are resolved from
+    the model's embedded metadata by the runtime (falling back to built-in
+    defaults); pass explicit values to override.
+    """
 
     peek = Interpreter(model_path=str(model_path))
     peek.allocate_tensors()

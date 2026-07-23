@@ -7,12 +7,11 @@ Supports:
 - optional delegates
 - quantized models
 - float-output models
-- metadata sidecars
+- configuration read from the model's embedded metadata
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import cv2
@@ -34,6 +33,7 @@ from .base import (
     BaseRuntime,
     Detection,
 )
+from .model_metadata import ModelMetadata
 
 DEFAULT_TEFLON_LIB = "/usr/lib/libteflon.so"
 
@@ -80,14 +80,27 @@ class TFLiteRuntime(BaseRuntime):
         model_path: str | Path,
         *,
         delegate_path: str | None = DEFAULT_TEFLON_LIB,
-        score_threshold: float = 0.0,
+        score_threshold: float | None = None,
     ):
 
         self.model_path = Path(model_path)
 
-        self.score_threshold = score_threshold
+        # Labels, input normalization and post-processing defaults all come from
+        # the model's embedded metadata (see model_metadata.ModelMetadata).
+        self.metadata = ModelMetadata.load(self.model_path)
 
-        self.metadata = self._load_metadata()
+        self.labels = self.metadata.labels
+
+        # An explicit score_threshold always wins; otherwise use the model's own
+        # embedded default, falling back to 0.0 (keep every detection).
+        if score_threshold is None:
+            score_threshold = (
+                self.metadata.score_threshold
+                if self.metadata.score_threshold is not None
+                else 0.0
+            )
+
+        self.score_threshold = score_threshold
 
         delegates = self._load_delegates(delegate_path)
 
@@ -125,94 +138,16 @@ class TFLiteRuntime(BaseRuntime):
 
         self._input_size = int(self.input_details[0]["shape"][1])
 
-        self._norm_mean, self._norm_std = self._load_input_normalization()
+        # Input normalization (applied as (pixels - mean) / std for float models)
+        # comes from the embedded metadata, defaulting to the SSD MobileNetV2
+        # [0, 255] -> [-1, 1] mapping (mean = std = 127.5).
+        self._norm_mean = np.array(self.metadata.norm_mean, dtype=np.float32)
+        self._norm_std = np.array(self.metadata.norm_std, dtype=np.float32)
 
     @property
     def input_size(self) -> int:
 
         return self._input_size
-
-    #
-    # Metadata
-    #
-
-    def _load_metadata(self):
-
-        metadata_path = self.model_path.with_suffix(".runtime.json")
-
-        if not metadata_path.exists():
-            print("[runtime] metadata sidecar not found")
-
-            return {}
-
-        with open(metadata_path) as f:
-            metadata = json.load(f)
-
-        print(f"[runtime] loaded metadata: {metadata_path.name}")
-
-        return metadata
-
-    def _load_input_normalization(self):
-        """
-        Resolve the input normalization ``(mean, std)`` applied as
-        ``(pixels - mean) / std`` before inference.
-
-        Priority:
-
-        1. ``preprocessing`` block in the ``.runtime.json`` sidecar
-           (dependency-free, works on-device).
-        2. ``NormalizationOptions`` embedded in the TFLite metadata, read via
-           ``tflite_support`` when that package is importable (the prep/eval env).
-        3. Default ``mean=std=127.5`` — the SSD MobileNetV2 ``[0, 255] -> [-1, 1]``
-           mapping every model in this project uses.
-
-        Returned as float32 arrays so they broadcast over an ``HxWx3`` image.
-        """
-
-        mean, std = [127.5], [127.5]
-        source = "default"
-
-        preprocessing = self.metadata.get("preprocessing") or {}
-
-        if "mean" in preprocessing and "std" in preprocessing:
-            mean = preprocessing["mean"]
-            std = preprocessing["std"]
-            source = "sidecar"
-
-        else:
-            try:
-                from tflite_support import metadata as _metadata
-
-                displayer = _metadata.MetadataDisplayer.with_model_file(
-                    str(self.model_path)
-                )
-
-                meta = json.loads(displayer.get_metadata_json())
-
-                units = meta["subgraph_metadata"][0]["input_tensor_metadata"][0][
-                    "process_units"
-                ]
-
-                for unit in units:
-                    if unit.get("options_type") == "NormalizationOptions":
-                        options = unit["options"]
-                        mean = options["mean"]
-                        std = options["std"]
-                        source = "embedded metadata"
-                        break
-
-            except Exception as exc:
-                print(
-                    f"[runtime] no embedded normalization metadata "
-                    f"({type(exc).__name__}); using default"
-                )
-
-        print(f"[runtime] input normalization ({source}): mean={mean} std={std}")
-
-        return (
-            np.array(mean, dtype=np.float32),
-            np.array(std, dtype=np.float32),
-        )
 
     #
     # Delegates
@@ -271,8 +206,8 @@ class TFLiteRuntime(BaseRuntime):
         # A float input has no quantization params to encode the expected domain,
         # so the normalization must be applied explicitly. The graph expects
         # already-normalized input (e.g. [-1, 1] = (px - 127.5) / 127.5); feeding
-        # raw [0, 255] silently wrecks detections. mean/std come from the model
-        # metadata (see _load_input_normalization).
+        # raw [0, 255] silently wrecks detections. mean/std come from the model's
+        # embedded metadata (see ModelMetadata / self.metadata.norm_*).
         #
 
         else:
@@ -327,10 +262,11 @@ class TFLiteRuntime(BaseRuntime):
 
         raw_classes = self.interpreter.get_tensor(self.output_details[3]["index"])
 
-        dequantize_outputs = self.metadata.get("runtime", {}).get(
-            "dequantize_outputs",
-            False,
-        )
+        # Auto-detect quantized outputs from the score tensor's dtype rather than
+        # relying on external metadata. The SSD models export float outputs
+        # (inference_output_type = tf.float32), but a genuinely INT8-output graph
+        # is handled correctly without configuration.
+        dequantize_outputs = self.output_details[0]["dtype"] in (np.int8, np.uint8)
 
         #
         # Quantized outputs
@@ -392,11 +328,10 @@ class TFLiteRuntime(BaseRuntime):
         #
         # COCO compatibility
         #
-
-        class_offset = self.metadata.get("runtime", {}).get(
-            "class_index_offset",
-            1,
-        )
+        # The SSD category tensor is 0-based; shifting by 1 yields the 1-based
+        # category ids of the COCO/label-map convention (and of the labels dict
+        # in ModelMetadata: line 0 -> category_id 1).
+        class_offset = 1
 
         detections = []
 

@@ -70,11 +70,13 @@ def benchmark_model(
     print(f"\n=== Benchmarking: {model_path.name} ===")
 
     # The factory selects SSD (post-NMS) vs YOLOv7-tiny (raw grids) by output
-    # shape; score_threshold stays 0.0 so COCO eval sees every detection (the
-    # YOLO runtime floors candidates internally to keep NMS tractable).
+    # shape; score_threshold is pinned to 0.0 (overriding any embedded metadata
+    # default) so COCO eval sees every detection — the YOLO runtime floors
+    # candidates internally to keep NMS tractable.
     runtime = build_runtime(
         model_path=model_path,
         delegate_path=delegate,
+        score_threshold=0.0,
         iou_threshold=iou,
     )
 
