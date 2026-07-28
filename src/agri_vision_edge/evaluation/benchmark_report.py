@@ -13,13 +13,18 @@ Layout consumed::
 
 The run name encodes the configuration and is decoded by :func:`parse_run_name`::
 
-    <arch>_<classes>_<dataset>_<size>_<precision>_<quant>[_<granularity>]_<nms>_<split>
-    ssd-mn2-fpnlite_mc_phenobench-tiled_320_int8_ptq_per-tensor_fastnms_val
+    <tiling>_<arch>_<classes>_<dataset>_<size>_<precision>_<quant>[_<granularity>]_<nms>_<split>
+    untiled_ssd-mn2-fpnlite_mc_phenobench-tiled_320_int8_ptq_per-tensor_fastnms_val
 
-``<granularity>`` (``per-tensor`` / ``per-channel``) is present on int8 runs and
-omitted on fp32. Everything is discovered dynamically: new platforms (i.MX 8M
-Plus, i.MX 93) and quantization schemes (``qatN``) appear automatically once
-their artifacts exist.
+``<tiling>`` (``tiled`` / ``untiled``) is the prefix ``benchmark_all.sh`` puts on
+each result directory and names the *input regime the model was evaluated on* --
+every model is swept over both. It is orthogonal to the ``<dataset>`` token
+(``phenobench`` / ``phenobench-tiled``), which names the data the model was
+*trained* on; the cross of the two is the interesting axis. ``<granularity>``
+(``per-tensor`` / ``per-channel``) is present on int8 runs and omitted on fp32.
+Everything else is discovered dynamically: new platforms (i.MX 8M Plus, i.MX 93)
+and quantization schemes (``qatN``) appear automatically once their artifacts
+exist.
 Plot helpers return ``None`` when a comparison has too few groups to be
 meaningful, so callers can skip them without special-casing.
 """
@@ -50,6 +55,10 @@ _CLASSES = {"sc", "mc"}
 #: into the ``dataset`` token (both per-tensor and per-channel exports name it
 #: explicitly now, mirroring the conversion artifact filenames).
 _GRANULARITIES = {"per-tensor", "per-channel"}
+#: Evaluation-input regimes, carried as the leading token of a benchmark result
+#: directory. Stripped before the architecture is read, otherwise it would be
+#: swallowed by the ``arch`` prefix and split every model in two.
+_EVAL_TILINGS = {"tiled", "untiled"}
 
 ARCH_LABELS = {
     "ssd-mn2": "SSD MobileNetV2",
@@ -60,6 +69,10 @@ CLASS_LABELS = {
     "mc": "Multi-class (crop+weed)",
 }
 PRECISION_LABELS = {"fp32": "FP32", "fp16": "FP16", "int8": "INT8"}
+EVAL_TILING_LABELS = {
+    "tiled": "Tiled input",
+    "untiled": "Full-frame input",
+}
 
 #: Top-level entries under ``benchmark_results`` that are not measurement platforms.
 NON_PLATFORM_DIRS = frozenset({"attic"})
@@ -106,16 +119,27 @@ def parse_run_name(name: str) -> dict | None:
     """
     Decompose a run directory name into configuration fields.
 
+    Also accepts bare variant names (``artifacts/tf`` folders), which carry no
+    evaluation-tiling prefix; ``eval_tiling`` is then ``None``.
+
     Args:
         name:
             Run directory name, e.g.
-            ``ssd-mn2-fpnlite_mc_phenobench-tiled_320_int8_ptq_fastnms_val``.
+            ``untiled_ssd-mn2-fpnlite_mc_phenobench-tiled_320_int8_ptq_fastnms_val``.
 
     Returns:
         Dict of configuration fields plus display labels, or ``None`` if the
         name does not carry a recognizable ``sc``/``mc`` class token.
     """
     tokens = name.split("_")
+
+    # The evaluation-input regime prefixes the run directory, i.e. it sits left
+    # of the architecture; strip it first so `arch` stays the plain model name
+    # and keeps matching ARCH_LABELS / the coverage variant keys.
+    eval_tiling = None
+    if tokens and tokens[0] in _EVAL_TILINGS:
+        eval_tiling = tokens[0]
+        tokens = tokens[1:]
 
     cls_idx = next(
         (i for i, t in enumerate(tokens) if t in _CLASSES),
@@ -127,6 +151,7 @@ def parse_run_name(name: str) -> dict | None:
 
     info: dict = {
         "run": name,
+        "eval_tiling": eval_tiling,
         "arch": "_".join(tokens[:cls_idx]) or "unknown",
         "classes": tokens[cls_idx],
     }
@@ -154,12 +179,20 @@ def parse_run_name(name: str) -> dict | None:
         "per-tensor": "Per-tensor",
         "per-channel": "Per-channel",
     }.get(info.get("granularity"), "")
+    info["eval_tiling_label"] = EVAL_TILING_LABELS.get(eval_tiling, "")
 
-    # Compact label used on chart axes.
+    # Compact label used on chart axes. It has to name the training dataset and
+    # the evaluation regime: the same architecture is trained on both the tiled
+    # and the untiled dataset and each model is then benchmarked on both inputs,
+    # so a label of arch + classes alone would collapse four distinct runs into
+    # one group and silently average them.
     info["config"] = (
         f"{info['arch_label'].replace('SSD MobileNetV2', 'MNv2')}"
         f" | {info['classes'].upper()}"
+        f" | {info['dataset']}"
     )
+    if eval_tiling:
+        info["config"] += f" | eval:{eval_tiling}"
 
     return info
 
@@ -702,7 +735,14 @@ def quantization_delta_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    keys = ["platform", "arch_label", "class_label"]
+    # Group on the full run identity. Anything left out of the keys collapses
+    # several runs into one group, and since the row is built from `iloc[0]`
+    # those extra runs would be dropped rather than reported.
+    keys = [
+        k
+        for k in ("platform", "arch_label", "class_label", "dataset", "eval_tiling")
+        if k in df.columns and df[k].notna().any()
+    ]
     rows = []
     for _, group in df.groupby(keys):
         fp = group[group["precision"] == "fp32"]
@@ -733,6 +773,11 @@ def master_table(df: pd.DataFrame) -> pd.DataFrame:
         ("platform", "Platform"),
         ("arch_label", "Architecture"),
         ("classes", "Classes"),
+        # Trained-on dataset and evaluated-on input regime are independent now
+        # (every model is swept over both regimes), so both have to be shown or
+        # otherwise identical-looking rows differ by an invisible field.
+        ("dataset", "Trained on"),
+        ("eval_tiling", "Eval input"),
         ("precision", "Precision"),
         ("quant", "Quant"),
         ("granularity", "Granularity"),
