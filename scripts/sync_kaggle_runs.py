@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 
 """
-Pull a config's finetune + QAT Kaggle kernel outputs and merge their manifests.
+Pull a config's finetune + PTQ + QAT Kaggle kernel outputs and merge their manifests.
 
 Each config is trained as independent Kaggle notebooks that each publish only
 their own slice of the experiment:
 
-    finetune         ->  manifest.json                   + ptq/
-    qat              ->  manifest.qat.json               + qat/
+    finetune         ->  manifest.json                   + finetune/
+    ptq              ->  manifest.ptq.json               + ptq/
+    qat_per-tensor   ->  manifest.qat_per-tensor.json    + qat_per-tensor/
     qat_per-channel  ->  manifest.qat_per-channel.json   + qat_per-channel/
 
-``qat`` is the per-tensor int8 QAT run (i.MX8M Plus); ``qat_per-channel`` is the
-per-channel variant (i.MX93 Ethos-U) -- a separate kernel/folder so it never
-clobbers the per-tensor one. Both resume from the shared finetune ``ptq/`` base.
+``finetune`` publishes the fp32 base model under ``finetune/``. ``ptq`` is a
+separate QAT-parity float run (its checkpoint is calibrated to int8 by the
+converter). ``qat_per-tensor`` is the per-tensor int8 QAT run (i.MX8M Plus) and
+``qat_per-channel`` the per-channel variant (i.MX93 Ethos-U) -- each a separate
+kernel/folder so it never clobbers the others. ``ptq`` and both QAT runs resume
+from the shared finetune ``finetune/`` export.
 
 This script downloads each kernel's output into one local config directory (the
 finetune's ``manifest.json`` and the ``manifest.<stage>.json`` fragments don't
-collide, and ``ptq/`` / ``<stage>/`` land side by side), then folds every
+collide, and ``finetune/`` / ``<stage>/`` land side by side), then folds every
 fragment into the finetune's full ``manifest.json`` -- the same
 stage/artifact/result merge as ``ExperimentManifest.merge``, but idempotent
 (re-merging an already-merged stage overwrites instead of raising), so it is safe
@@ -24,15 +28,15 @@ to re-run.
 
 Kaggle slug convention (override per stage with --slug if a kernel was titled
 differently): ``<owner>/<config '_'->'-' lowercased>-<stage>``, e.g.
-``freimutdiener/ssd-mn2-fpnlite-sc-phenobench-320-qat``.
+``freimutdiener/ssd-mn2-fpnlite-sc-phenobench-320-qat-per-tensor``.
 
-Usage (pulls finetune + qat + qat_per-channel by default):
+Usage (pulls finetune + ptq + qat_per-tensor + qat_per-channel by default):
     scripts/sync_kaggle_runs.py                               # all eight SSD configs
     scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320
     scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320 --dest artifacts/tf/ssd-mn2_sc_phenobench_320
-    scripts/sync_kaggle_runs.py <config> --no-download        # re-merge what's on disk
-    scripts/sync_kaggle_runs.py <config> --stages finetune,qat   # subset
-    scripts/sync_kaggle_runs.py --no-download                 # re-merge all eight on disk
+    scripts/sync_kaggle_runs.py <config> --no-download          # re-merge what's on disk
+    scripts/sync_kaggle_runs.py <config> --stages finetune,ptq  # subset
+    scripts/sync_kaggle_runs.py --no-download                   # re-merge all eight on disk
 """
 
 from __future__ import annotations
@@ -51,11 +55,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from agri_vision_edge.experiment import ExperimentManifest  # noqa: E402
 
 DEFAULT_OWNER = "freimutdiener"
-# finetune publishes the fp32 base + ptq/ export; qat / qat_per-channel are the
-# per-tensor (i.MX8M Plus) and per-channel (i.MX93 Ethos-U) int8 runs. Pulling
-# all three by default collects the whole config in one go; a stage whose kernel
-# is not published yet is just skipped with a warning.
-DEFAULT_STAGES = ["finetune", "qat", "qat_per-channel"]
+# finetune publishes the fp32 base under finetune/; ptq is the QAT-parity float
+# run; qat_per-tensor / qat_per-channel are the per-tensor (i.MX8M Plus) and
+# per-channel (i.MX93 Ethos-U) int8 runs. Pulling all four by default collects
+# the whole config in one go; a stage whose kernel is not published yet is just
+# skipped with a warning.
+DEFAULT_STAGES = ["finetune", "ptq", "qat_per-tensor", "qat_per-channel"]
 ARTIFACTS_TF = Path(__file__).resolve().parent.parent / "artifacts" / "tf"
 
 # The eight SSD configs — {plain SSD, FPNLite} × {sc, mc} × {untiled, tiled} —
@@ -78,25 +83,38 @@ def stage_manifest_name(stage: str) -> str:
 
 
 # Kaggle caps a notebook's title (hence its slug body) at 50 characters. When the
-# full ``...-qat-per-channel`` body would exceed that, the kernel is titled with
-# the abbreviated ``...-qat-pc`` suffix instead (the per-tensor ``qat`` body is
-# always short enough). The internal stage name, fragment manifest, and artifact
-# folder stay ``qat_per-channel`` regardless -- only the Kaggle slug abbreviates.
+# full ``...-qat-per-tensor`` / ``...-qat-per-channel`` body would exceed that,
+# the kernel is titled with the abbreviated ``...-qat-pt`` / ``...-qat-pc``
+# suffix instead. The internal stage name, fragment manifest, and artifact folder
+# stay ``qat_per-tensor`` / ``qat_per-channel`` regardless -- only the Kaggle slug
+# abbreviates.
 KAGGLE_SLUG_MAX = 50
+
+# Long QAT stage suffix -> abbreviation used only when the slug body would exceed
+# ``KAGGLE_SLUG_MAX`` (the config prefix is otherwise short enough to keep the
+# full, self-describing stage name).
+_SLUG_ABBREVIATIONS = {
+    "-qat-per-tensor": "-qat-pt",
+    "-qat-per-channel": "-qat-pc",
+}
 
 
 def kernel_slug(owner: str, config: str, stage: str) -> str:
     """``<owner>/<config-and-stage as a kaggle slug>``.
 
     Kaggle slugs are lowercase with hyphens only, so the whole ``config-stage``
-    body is hyphenated -- including the per-channel stage ``qat_per-channel``
-    -> ``...-qat-per-channel``. If that body would exceed Kaggle's 50-char title
-    cap, the ``-per-channel`` suffix is abbreviated to ``-pc`` to match how the
-    kernel had to be titled (e.g. the FPNLite tiled per-channel configs).
+    body is hyphenated -- including the QAT stages ``qat_per-tensor`` /
+    ``qat_per-channel`` -> ``...-qat-per-tensor`` / ``...-qat-per-channel``. If
+    that body would exceed Kaggle's 50-char title cap, the long suffix is
+    abbreviated (``-qat-pt`` / ``-qat-pc``) to match how the kernel had to be
+    titled (e.g. the FPNLite tiled configs).
     """
     body = f"{config}-{stage}".replace("_", "-").lower()
-    if len(body) > KAGGLE_SLUG_MAX and body.endswith("-qat-per-channel"):
-        body = body[: -len("-per-channel")] + "-pc"
+    if len(body) > KAGGLE_SLUG_MAX:
+        for suffix, abbr in _SLUG_ABBREVIATIONS.items():
+            if body.endswith(suffix):
+                body = body[: -len(suffix)] + abbr
+                break
     return f"{owner}/{body}"
 
 
@@ -155,7 +173,7 @@ def download_kernel(slug: str, dest: Path, *, force: bool, quiet: bool) -> bool:
 
 def merge_fragments(dest: Path, stages: list[str]) -> ExperimentManifest:
     """
-    Fold every present qat fragment into the finetune ``manifest.json``.
+    Fold every present ptq/qat fragment into the finetune ``manifest.json``.
 
     Mirrors ``ExperimentManifest.merge`` (stages + artifact files + results) but
     is idempotent: an already-merged stage is overwritten rather than raising,
@@ -258,7 +276,7 @@ def parse_slug(value: str) -> tuple[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Sync + merge a config's finetune/QAT Kaggle outputs.",
+        description="Sync + merge a config's finetune/PTQ/QAT Kaggle outputs.",
     )
     parser.add_argument(
         "configs",
@@ -279,7 +297,10 @@ def main(argv: list[str] | None = None) -> int:
         "--stages",
         type=lambda s: [x.strip() for x in s.split(",") if x.strip()],
         default=DEFAULT_STAGES,
-        help="comma-separated stages (default: finetune,qat,qat_per-channel)",
+        help=(
+            "comma-separated stages "
+            "(default: finetune,ptq,qat_per-tensor,qat_per-channel)"
+        ),
     )
     parser.add_argument(
         "--slug",
