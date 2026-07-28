@@ -3,9 +3,9 @@ Batch-convert trained TF model variants to deployable TFLite models.
 
 For each variant under ``artifacts/tf/`` (or a single named variant), build the
 standard int8/fp32 TFLite models -- one per training stage that is present
-(``ptq`` -> int8/int8 per-channel/fp32, ``qat`` -> int8, ``qat_per-channel`` ->
-int8 per-channel) -- with the default IoU threshold and fast NMS, embedding
-ObjectDetector metadata. Conversion only; no evaluation.
+(``ptq`` -> int8/int8 per-channel/fp32, ``qat_per-tensor`` -> int8,
+``qat_per-channel`` -> int8 per-channel) -- with the default IoU threshold and
+fast NMS, embedding ObjectDetector metadata. Conversion only; no evaluation.
 """
 
 from __future__ import annotations

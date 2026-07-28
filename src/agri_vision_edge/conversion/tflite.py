@@ -7,17 +7,17 @@ it rebuilds the deployable TFLite models (default IoU threshold, fast NMS) and
 embeds ObjectDetector metadata. Conversion + metadata only -- no evaluation.
 
 For each variant the standard targets below are produced *as long as the backing
-stage is present* (``ptq/``, ``qat/`` or ``qat_per-channel/``):
+stage is present* (``ptq/``, ``qat_per-tensor/`` or ``qat_per-channel/``):
 
     fp32_ptq               plain float         (ptq stage)
-    int8_ptq               per-tensor PTQ      (ptq stage)
+    int8_ptq_per-tensor    per-tensor PTQ      (ptq stage)
     int8_ptq_per-channel   per-channel PTQ     (ptq stage)
-    int8_qat               per-tensor QAT      (qat stage)
+    int8_qat_per-tensor    per-tensor QAT      (qat_per-tensor stage)
     int8_qat_per-channel   per-channel QAT     (qat_per-channel stage)
 
 PTQ per-channel reuses the per-tensor ``ptq/`` checkpoint (granularity is a
-converter flag); QAT per-channel is its own checkpoint trained with per-channel
-fake-quant, hence the separate ``qat_per-channel/`` stage directory.
+converter flag); QAT trains a distinct checkpoint per granularity, so each has
+its own stage directory (``qat_per-tensor/`` and ``qat_per-channel/``).
 """
 
 from __future__ import annotations
@@ -42,18 +42,25 @@ class ConversionTarget:
     @property
     def stage_subdir(self) -> str:
         """Variant subdirectory holding the source checkpoint for this target."""
-        # PTQ per-channel reuses the per-tensor ptq/ checkpoint; only QAT has a
-        # distinct per-channel checkpoint directory.
-        suffix = (
-            "_per-channel" if self.per_channel and self.quantization != "ptq" else ""
-        )
-        return self.quantization + suffix
+        # PTQ shares one checkpoint (the per-tensor ``ptq/`` dir) regardless of
+        # granularity -- granularity is just a converter flag. QAT trains a
+        # distinct checkpoint per granularity, so each granularity has its own
+        # stage directory (``qat_per-tensor/`` and ``qat_per-channel/``).
+        if self.quantization == "ptq":
+            return "ptq"
+        granularity = "per-channel" if self.per_channel else "per-tensor"
+        return f"{self.quantization}_{granularity}"
 
     @property
     def suffix(self) -> str:
         """Filename suffix appended to the variant stem (always fast NMS)."""
-        per_channel = "_per-channel" if self.per_channel else ""
-        return f"{self.precision}_{self.quantization}{per_channel}_fastnms"
+        # int8 models carry their weight granularity explicitly (per-tensor vs
+        # per-channel); fp32 has no quantization granularity, so it stays bare.
+        if self.precision == "int8":
+            granularity = "_per-channel" if self.per_channel else "_per-tensor"
+        else:
+            granularity = ""
+        return f"{self.precision}_{self.quantization}{granularity}_fastnms"
 
     @property
     def label(self) -> str:
