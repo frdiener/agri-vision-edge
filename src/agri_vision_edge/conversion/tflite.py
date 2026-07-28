@@ -40,15 +40,27 @@ class ConversionTarget:
     per_channel: bool
 
     @property
-    def stage_subdir(self) -> str:
-        """Variant subdirectory holding the source checkpoint for this target."""
-        # PTQ shares one checkpoint regardless of granularity -- there it is
-        # just a converter flag. QAT keeps a stage per granularity, so each
-        # target is converted from its own run.
+    def stage_candidates(self) -> tuple[str, ...]:
+        """
+        Variant subdirectories that can source this target, most preferred first.
+
+        PTQ shares one checkpoint regardless of granularity -- there it is just
+        a converter flag.
+
+        QAT does too: the training graph does not depend on granularity (relu6
+        outputs are pinned either way), which is chosen when the export graph is
+        rebuilt. Training a run per granularity was tried and measured to gain
+        nothing, so ``qat_per-tensor/`` is the canonical run and
+        ``qat_per-channel/`` is used only when it is the sole QAT stage present.
+        """
         if self.quantization == "ptq":
-            return "ptq"
+            return ("ptq",)
+
         granularity = "per-channel" if self.per_channel else "per-tensor"
-        return f"{self.quantization}_{granularity}"
+        return (
+            f"{self.quantization}_per-tensor",
+            f"{self.quantization}_{granularity}",
+        )
 
     @property
     def suffix(self) -> str:
@@ -253,8 +265,12 @@ def _convert_one(
     out_path: Path,
     iou_threshold: float,
     native_resize: bool = True,
+    stage_dir: Path | None = None,
 ) -> None:
     """Rebuild + convert a single target and embed its metadata.
+
+    ``stage_dir`` is the resolved source checkpoint directory (see
+    ``ConversionTarget.stage_candidates``), defaulting to the preferred one.
 
     ``native_resize`` (default True) builds FPN models with the NPU-delegatable
     ``RESIZE_NEAREST_NEIGHBOR`` upsample instead of the ``PACK``-based reshape
@@ -280,7 +296,8 @@ def _convert_one(
         quantize_detection_model,
     )
 
-    stage_dir = variant_dir / target.stage_subdir
+    if stage_dir is None:
+        stage_dir = variant_dir / target.stage_candidates[0]
     pipeline_config = load_pipeline_config(stage_dir / "pipeline.config")
 
     nms = pipeline_config.model.ssd.post_processing.batch_non_max_suppression
@@ -397,10 +414,20 @@ def convert_variant(
     written: list[Path] = []
 
     for target in targets:
-        stage_dir = variant_dir / target.stage_subdir
+        stage_dir = next(
+            (
+                variant_dir / name
+                for name in target.stage_candidates
+                if (variant_dir / name / "checkpoint").is_dir()
+            ),
+            None,
+        )
 
-        if not (stage_dir / "checkpoint").is_dir():
-            log(f"  skip {target.label}: no '{target.stage_subdir}/' stage")
+        if stage_dir is None:
+            log(
+                f"  skip {target.label}: none of "
+                f"{'/'.join(target.stage_candidates)} present"
+            )
             continue
 
         out_path = out_dir / f"{variant_dir.name}_{target.suffix}.tflite"
@@ -409,7 +436,7 @@ def convert_variant(
             log(f"  skip {target.label}: exists ({out_path.name})")
             continue
 
-        log(f"  convert {target.label} -> {out_path.name}")
+        log(f"  convert {target.label} ({stage_dir.name}) -> {out_path.name}")
         _convert_one(
             variant_dir,
             target,
@@ -417,6 +444,7 @@ def convert_variant(
             out_path,
             iou_threshold,
             native_resize=native_resize,
+            stage_dir=stage_dir,
         )
         written.append(out_path)
 

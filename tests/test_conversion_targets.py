@@ -14,24 +14,26 @@ def test_ptq_targets_share_one_checkpoint():
     # Granularity is only a converter flag for PTQ.
     for per_channel in (False, True):
         target = ConversionTarget("int8", "ptq", per_channel=per_channel)
-        assert target.stage_subdir == "ptq"
+        assert target.stage_candidates == ("ptq",)
 
 
-def test_qat_targets_use_their_own_granularity_stage():
-    assert (
-        ConversionTarget("int8", "qat", per_channel=False).stage_subdir
-        == "qat_per-tensor"
-    )
-    assert (
-        ConversionTarget("int8", "qat", per_channel=True).stage_subdir
-        == "qat_per-channel"
-    )
+def test_qat_targets_prefer_the_shared_run():
+    # Granularity does not change the QAT training graph, so both targets are
+    # exported from the same run.
+    for per_channel in (False, True):
+        target = ConversionTarget("int8", "qat", per_channel=per_channel)
+        assert target.stage_candidates[0] == "qat_per-tensor"
+
+
+def test_qat_per_channel_falls_back_to_its_own_stage():
+    target = ConversionTarget("int8", "qat", per_channel=True)
+    assert target.stage_candidates[-1] == "qat_per-channel"
 
 
 def test_every_standard_target_names_a_stage():
     for target in STANDARD_TARGETS:
-        assert isinstance(target.stage_subdir, str)
-        assert target.stage_subdir
+        assert target.stage_candidates
+        assert all(isinstance(name, str) for name in target.stage_candidates)
 
 
 def test_int8_targets_carry_their_granularity_in_the_filename():

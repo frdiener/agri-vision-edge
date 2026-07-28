@@ -101,9 +101,31 @@ quantization and per-channel weights cannot be combined here, which is why the
 weight-only export is not a workaround for a missing feature but the
 representation this converter actually supports.
 
-Per-axis WEIGHT fake-quant, on the other hand, converts fine in that export --
-see ``DepthwisePerAxisQuantizer`` for the one case that does not, and why it is
-worth fixing.
+Per-axis WEIGHT fake-quant converts fine in that export (see
+``PerChannelWeightQuantizer``), and TRAINING with it -- so that QAT simulates the
+per-channel weight grid the target actually deploys, instead of the coarser
+per-tensor one -- was tried and MEASURED TO BE WORTH NOTHING:
+
+    per-tensor checkpoint, exported per-channel            AP 0.4526
+    per-channel checkpoint trained with per-axis weight FQ AP 0.4523
+
+Both runs peaked at the same step (13464), so that is close to a paired
+comparison rather than two independent draws. Note the QAT-graph metric moved
+the other way (0.48271 vs 0.48128 mAP): per-channel fake-quant is a marginally
+easier training problem, but the advantage does not survive to the exported int8
+model.
+
+Read together with the earlier -0.022 from exporting a per-tensor-trained
+checkpoint through per-axis fake-quant, the picture is that at 8 bits the
+per-channel grid is fine enough that per-tensor-trained weights already export
+near-optimally: that -0.022 was pure train/deploy mismatch, not headroom, and
+training it away merely returns to the same place. The whole per-channel gain
+comes from the export granularity, not from training against it.
+
+So ``per_axis_weights`` stays opt-in (``fully_quantized``). Enabling it would
+also make ``per_channel`` change the training graph, which costs a QAT run per
+granularity -- for nothing. It is kept because a coarser grid (4-bit, say) is
+where it would start to matter.
 
 Linear box-predictor convolutions are also kept output-free. Their outputs feed
 reshape/concat paths across feature-map levels, where independently fixed
@@ -238,16 +260,9 @@ class BaseQuantConfig(tfmot.quantization.keras.QuantizeConfig):
                 narrow_range=True,
             )
 
-        quantizer = (
-            DepthwisePerAxisQuantizer
-            if isinstance(layer, tf.keras.layers.DepthwiseConv2D)
-            else tfmot.quantization.keras.quantizers.LastValueQuantizer
-        )
-        return quantizer(
+        return PerChannelWeightQuantizer(
             num_bits=8,
-            per_axis=True,
-            symmetric=True,
-            narrow_range=True,
+            depthwise=isinstance(layer, tf.keras.layers.DepthwiseConv2D),
         )
 
     def _kernel(self, layer):
@@ -397,55 +412,68 @@ class FixedRelu6Quantizer(FixedRangeQuantizer):
 
 
 @register_keras_serializable()
-class DepthwisePerAxisQuantizer(
-    tfmot.quantization.keras.quantizers.LastValueQuantizer
-):
+class PerChannelWeightQuantizer(tfmot.quantization.keras.quantizers.Quantizer):
     """
-    Per-axis weight fake-quant for a DepthwiseConv2D kernel.
+    Symmetric per-output-channel weight fake-quant, in the layout TFLite uses.
 
-    ``per_axis`` quantizers quantize along the LAST axis. For a Conv2D kernel
-    ``[kh, kw, in, out]`` that is the output channel, which is what TFLite
-    quantizes too. A DepthwiseConv2D kernel is ``[kh, kw, in, multiplier]``, and
-    TFLite quantizes it along the flattened ``in * multiplier`` -- so pointing a
-    stock per-axis quantizer at one silently produces a SINGLE scale (multiplier
-    is 1 here), i.e. a per-tensor grid that then disagrees with the per-channel
-    weights written into the flatbuffer.
+    Deployment quantizes weights per channel, so training should simulate that
+    grid rather than the coarser per-tensor one. Under a shared scale a channel
+    whose range is small gets very few levels, and the network learns not to
+    rely on it -- even though deployment would have given it full resolution.
+    MobileNetV2's depthwise kernels, whose per-channel ranges vary the most, are
+    where that costs the most.
 
-    Flattening the two trailing axes before quantizing puts the channels last,
-    which makes the stock implementation correct; the kernel is reshaped back
-    afterwards. Reusing ``LastValueQuantizer`` this way keeps its range-update
-    and symmetric/narrow-range handling rather than reimplementing it.
+    The channel axis differs per layer, and getting it wrong is SILENT:
 
-    BROKEN FOR EXPORT. The reshapes around the weight constant defeat the
-    converter: a graph using this exports EMPTY (0 conv ops), while the same
-    export with per-axis fake-quant on Conv2D only converts normally. Do not
-    enable it for depthwise layers until it is reimplemented without reshaping
-    the kernel.
+        Conv2D           [kh, kw, in, out]   -> one scale per ``out``
+        DepthwiseConv2D  [kh, kw, in, mult]  -> one per ``in * mult``
 
-    Worth fixing, because per-tensor weight fake-quant currently simulates a
-    COARSER grid than the per-channel one deployment uses, and MobileNetV2's
-    depthwise kernels -- whose per-channel ranges vary the most -- are exactly
-    where that mismatch costs the most. Note the export does not need to consume
-    this fake-quant at all: in the weight-only export the converter derives the
-    per-channel weight scales from the float values itself (proven by the
-    per-tensor control emitting 214 per-channel tensors). The quantizer only has
-    to be numerically right during TRAINING, so a straight-through estimator
-    with a broadcast per-channel scale -- no reshape, no FakeQuant op -- would
-    do, and would fold away at export.
+    Stock per-axis quantizers reduce over the leading axes and keep the last, so
+    on a depthwise kernel (``mult`` is 1 here) they yield a SINGLE scale --
+    per-tensor wearing a per-channel label. Hence the explicit ``depthwise``
+    switch: it selects the reduction axes, and nothing else differs.
+
+    Implemented as a straight-through estimator rather than with
+    ``fake_quant_with_min_max_vars_per_channel``, because that op only quantizes
+    the last axis, and reshaping the kernel to suit it makes the exported graph
+    come out EMPTY. Nothing is lost by avoiding it: the weight-only export never
+    reads this fake-quant -- the converter derives the per-channel scales from
+    the float weights itself -- so it only has to be numerically right during
+    TRAINING, and folds to a constant at export.
+
+    Stateless, like the activation pins: a weight tensor's range is a function
+    of the weights, so there is nothing to carry between steps.
     """
 
-    @staticmethod
-    def _flat_shape(shape):
-        return tf.TensorShape([shape[0], shape[1], int(shape[2]) * int(shape[3])])
+    def __init__(self, num_bits: int = 8, depthwise: bool = False):
+        self.num_bits = num_bits
+        self.depthwise = depthwise
+
+    @property
+    def _reduce_axes(self) -> list[int]:
+        # Everything except the channel axis (or axes, for depthwise).
+        return [0, 1] if self.depthwise else [0, 1, 2]
 
     def build(self, tensor_shape, name, layer):
-        return super().build(self._flat_shape(tensor_shape), name, layer)
+        return {}
 
     def __call__(self, inputs, training, weights, **kwargs):
-        shape = inputs.shape
-        flat = tf.reshape(inputs, self._flat_shape(shape))
-        quantized = super().__call__(flat, training, weights, **kwargs)
-        return tf.reshape(quantized, shape)
+        # Narrow range, as TFLite uses for int8 weights: [-127, 127].
+        limit = float(2 ** (self.num_bits - 1) - 1)
+
+        abs_max = tf.reduce_max(
+            tf.abs(inputs), axis=self._reduce_axes, keepdims=True
+        )
+        # An all-zero channel would divide by zero; its scale is arbitrary.
+        scale = tf.maximum(abs_max, 1e-8) / limit
+
+        quantized = tf.clip_by_value(tf.round(inputs / scale), -limit, limit) * scale
+
+        # Straight-through: quantize forwards, pass gradients back unchanged.
+        return inputs + tf.stop_gradient(quantized - inputs)
+
+    def get_config(self):
+        return {"num_bits": self.num_bits, "depthwise": self.depthwise}
 
 
 @register_keras_serializable()
@@ -528,7 +556,7 @@ _QUANT_SCOPE = {
     "AddOutputConfig": AddOutputConfig,
     "FixedRangeQuantizer": FixedRangeQuantizer,
     "FixedRelu6Quantizer": FixedRelu6Quantizer,
-    "DepthwisePerAxisQuantizer": DepthwisePerAxisQuantizer,
+    "PerChannelWeightQuantizer": PerChannelWeightQuantizer,
 }
 
 
@@ -585,9 +613,9 @@ def _quantize_full(
     weight-only; intrinsic-relu6 detection takes precedence for tower convs that
     happen to feed a relu6.
     """
-    # Fully-QDQ (per-channel): every tensor carries a fake-quant, so the export
-    # needs no calibration and the trained ranges are what deploy. The
-    # per-channel weight grid then has to come from the graph itself.
+    # Simulating the per-channel weight grid during training was measured to be
+    # worth nothing (see the module docstring), and it costs a QAT run per
+    # granularity, so it is opt-in and off for the calibrated export.
     per_axis_weights = fully_quantized
     weight_only_cfg = FreeOutputConvQuantConfig(per_axis_weights=per_axis_weights)
 
