@@ -60,6 +60,7 @@ def benchmark_model(
     model_path: Path,
     image_records,
     output_root: Path,
+    output_prefix: str,
     delegate: str | None,
     iou: float,
 ):
@@ -85,7 +86,7 @@ def benchmark_model(
         image_records,
     )
 
-    output_dir = output_root / model_path.stem
+    output_dir = output_root / f"{output_prefix}{model_path.stem}"
 
     save_benchmark_artifacts(
         output_dir=output_dir,
@@ -142,6 +143,15 @@ def main(argv=None):
     parser.add_argument(
         "--output-dir",
         default="benchmark_results",
+    )
+
+    parser.add_argument(
+        "--output-prefix",
+        default="",
+        help=(
+            "Prefix added to each model result directory name "
+            "inside --output-dir"
+        ),
     )
 
     parser.add_argument(
@@ -213,6 +223,7 @@ def main(argv=None):
                 model_path=model_path,
                 image_records=image_records,
                 output_root=output_root,
+                output_prefix=args.output_prefix,
                 delegate=delegate,
                 iou=args.iou,
             )
@@ -227,7 +238,7 @@ def main(argv=None):
             print(f"        {type(e).__name__}: {e}")
 
             save_failure_artifact(
-                output_dir=output_root / model_path.stem,
+                output_dir=output_root / f"{args.output_prefix}{model_path.stem}",
                 exception=e,
             )
 
