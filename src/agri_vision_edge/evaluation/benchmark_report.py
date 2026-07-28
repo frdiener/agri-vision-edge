@@ -1335,7 +1335,9 @@ def sanity_checks(df: pd.DataFrame) -> pd.DataFrame:
                 f"max sample {float(ratio):.0f}x the median; use median/p95",
             )
 
-        if r.get("faithful_stale"):
+        # A run without official metrics has NaN here, and NaN is truthy --
+        # only an explicit True means the metrics exist and are stale.
+        if r.get("faithful_stale") is True:
             add(
                 "error",
                 "faithful-stale",
