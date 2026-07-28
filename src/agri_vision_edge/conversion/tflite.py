@@ -86,45 +86,140 @@ def _parse_variant(name: str) -> tuple[str, bool]:
 
 
 def _dataset_dir(variant_name: str, datasets_dir: Path) -> Path:
+    """
+    Locate the exported dataset bundle a variant was trained from.
+
+    The models are trained on the ``_no-partials`` bundles (partials dropped in
+    train, do-not-care in eval); the unsuffixed directories are earlier exports
+    kept around. They are not interchangeable -- their ``rep_dataset.json``
+    indices were drawn against different sample counts -- so prefer the
+    no-partials bundle and only fall back to the legacy name when it is absent.
+    """
     classes, tiled = _parse_variant(variant_name)
-    return datasets_dir / f"phenobench_{classes}{'_tiled' if tiled else ''}"
+    stem = f"phenobench_{classes}{'_tiled' if tiled else ''}"
+
+    for name in (f"{stem}_no-partials", stem):
+        candidate = datasets_dir / name
+        if candidate.is_dir():
+            return candidate
+
+    raise FileNotFoundError(
+        f"No exported dataset bundle for {variant_name}: looked for "
+        f"{stem}_no-partials and {stem} under {datasets_dir}"
+    )
+
+
+def _export_metadata(dataset_dir: Path) -> dict:
+    """The exported bundle's ``dataset_metadata.json`` (empty when absent)."""
+    path = dataset_dir / "dataset_metadata.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def _masks_dataset(raw_dir: Path):
+    """PhenoBench split with the masks the tile boxes are derived from."""
+    from phenobench import PhenoBench
+
+    return PhenoBench(
+        root=str(raw_dir),
+        split="train",
+        target_types=["semantics", "plant_instances"],
+        ignore_partial=True,
+    )
 
 
 def _build_train_dataset(variant_name: str, datasets_dir: Path):
-    """Build the PhenoBench train split used to draw representative samples."""
+    """
+    Rebuild the train split the representative-dataset indices were drawn from.
+
+    ``rep_dataset.json`` stores *positions*, so this has to reproduce the
+    exported bundle's ordering exactly -- a dataset built with different tiling
+    still indexes fine and still yields plausible field images, it just
+    calibrates on the wrong ones.
+
+    Tiled bundles are cut from the FULL frames, so the tiling is applied to
+    ``phenobench_raw_full`` with the geometry the export recorded. (Applying it
+    to ``phenobench_raw_tiled`` instead re-cuts tiles that are already tiles:
+    512px training tiles became 256px sub-tiles and every index shifted.)
+    Bundles exported before the geometry was recorded are matched by the
+    materialized ``phenobench_raw_tiled`` as-is; either way
+    :func:`_check_calibration_dataset` verifies the result against the export's
+    own sample count.
+    """
     from phenobench import PhenoBench
 
     from agri_vision_edge.data.tiling import TiledPhenoBench
 
     _, tiled = _parse_variant(variant_name)
-    raw_dir = datasets_dir / f"phenobench_raw_{'tiled' if tiled else 'full'}"
 
-    if not raw_dir.exists():
-        raise FileNotFoundError(f"Raw PhenoBench dataset not found: {raw_dir}")
-
-    if tiled:
-        base = PhenoBench(
+    if not tiled:
+        raw_dir = datasets_dir / "phenobench_raw_full"
+        if not raw_dir.exists():
+            raise FileNotFoundError(f"Raw PhenoBench dataset not found: {raw_dir}")
+        return PhenoBench(
             root=str(raw_dir),
             split="train",
-            target_types=["semantics", "plant_instances"],
-            ignore_partial=True,
-        )
-        # Match the export notebooks (03/04): 3x3 tiles with 0.5 overlap so the
-        # representative-dataset indices in rep_dataset.json line up with the
-        # same 512px tiles the model was trained/exported on.
-        return TiledPhenoBench(
-            base,
-            rows=3,
-            cols=3,
-            overlap=0.5,
+            target_types=["plant_bboxes"],
+            ignore_partial=False,
         )
 
-    return PhenoBench(
-        root=str(raw_dir),
-        split="train",
-        target_types=["plant_bboxes"],
-        ignore_partial=False,
+    tiling = _export_metadata(_dataset_dir(variant_name, datasets_dir)).get("tiling")
+
+    if tiling:
+        raw_dir = datasets_dir / "phenobench_raw_full"
+        if not raw_dir.exists():
+            raise FileNotFoundError(f"Raw PhenoBench dataset not found: {raw_dir}")
+        return TiledPhenoBench(
+            _masks_dataset(raw_dir),
+            rows=int(tiling["rows"]),
+            cols=int(tiling["cols"]),
+            overlap=float(tiling.get("overlap", 0.0)),
+        )
+
+    # Legacy bundle: no recorded geometry, but the materialized tiled dataset is
+    # that geometry. Wrapped in a 1x1 grid purely to derive boxes from the
+    # instance masks -- unlike the full dataset it ships no `plant_bboxes/`.
+    raw_dir = datasets_dir / "phenobench_raw_tiled"
+    if not raw_dir.exists():
+        raise FileNotFoundError(f"Raw PhenoBench dataset not found: {raw_dir}")
+    return TiledPhenoBench(
+        _masks_dataset(raw_dir),
+        rows=1,
+        cols=1,
+        overlap=0.0,
     )
+
+
+def _check_calibration_dataset(dataset, dataset_dir: Path, indices: list) -> None:
+    """
+    Verify the calibration dataset is the one ``rep_dataset.json`` indexes.
+
+    The indices are positions, not identifiers: a calibration dataset built with
+    different geometry than the exported training set still indexes fine, still
+    yields plausible field images, and silently calibrates on the wrong ones.
+    The export records its own sample count, so compare against that -- it is
+    the only cheap check that catches a renumbering.
+    """
+    expected = _export_metadata(dataset_dir).get("train_samples")
+    if expected is None:
+        return
+
+    if len(dataset) != expected:
+        raise ValueError(
+            f"Calibration dataset has {len(dataset)} samples but "
+            f"{dataset_dir.name} was exported with {expected}. The "
+            "rep_dataset.json indices address the exported ordering, so "
+            "calibration would silently run on the wrong images. Re-export the "
+            "dataset bundle, or check the tiling recorded in its "
+            "dataset_metadata.json."
+        )
+
+    if indices and max(indices) >= len(dataset):
+        raise ValueError(
+            f"rep_dataset.json indexes up to {max(indices)} but the "
+            f"calibration dataset has only {len(dataset)} samples."
+        )
 
 
 def _representative_dataset_fn(
@@ -136,6 +231,7 @@ def _representative_dataset_fn(
     dataset_dir = _dataset_dir(variant_name, datasets_dir)
     indices = json.loads((dataset_dir / "rep_dataset.json").read_text())
     train_dataset = _build_train_dataset(variant_name, datasets_dir)
+    _check_calibration_dataset(train_dataset, dataset_dir, indices)
 
     # SSDModule.inference_fn expects already-normalized [-1, 1] input, so the
     # raw [0, 255] samples must be normalized for calibration -- feeding [0, 255]
