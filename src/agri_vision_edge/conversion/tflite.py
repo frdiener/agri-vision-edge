@@ -42,10 +42,9 @@ class ConversionTarget:
     @property
     def stage_subdir(self) -> str:
         """Variant subdirectory holding the source checkpoint for this target."""
-        # PTQ shares one checkpoint (the per-tensor ``ptq/`` dir) regardless of
-        # granularity -- granularity is just a converter flag. QAT trains a
-        # distinct checkpoint per granularity, so each granularity has its own
-        # stage directory (``qat_per-tensor/`` and ``qat_per-channel/``).
+        # PTQ shares one checkpoint regardless of granularity -- there it is
+        # just a converter flag. QAT keeps a stage per granularity, so each
+        # target is converted from its own run.
         if self.quantization == "ptq":
             return "ptq"
         granularity = "per-channel" if self.per_channel else "per-tensor"
@@ -295,14 +294,21 @@ def _convert_one(
         detection_model = model_builder.build(pipeline_config.model, is_training=False)
     ensure_model_is_built_for_qat(detection_model, pipeline_config)
 
-    # Rebuild the exact QAT graph the checkpoint was trained with so the weights
+    # Rebuild the QAT graph the checkpoint was trained with so the weights
     # restore cleanly. quantize_detection_model is self-contained: it folds +
     # quantizes the backbone (FPN: as its own graph; plain SSD: inlined into one
-    # full-model combined graph) and the head in one path. per_channel must match
-    # the trained checkpoint.
+    # full-model combined graph) and the head in one path.
+    #
+    # `for_export` asks for the export rewrite of that graph: for a per-channel
+    # target the stateless [0, 6] relu6 pins are dropped, which is what lets the
+    # converter emit per-channel weights. Same variables either way, so the
+    # checkpoint restores unchanged.
     if target.quantization != "ptq":
         quantize_detection_model(
-            detection_model, resolution, per_channel=target.per_channel
+            detection_model,
+            resolution,
+            per_channel=target.per_channel,
+            for_export=True,
         )
 
     detection_module = SSDModule(

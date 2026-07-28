@@ -67,9 +67,10 @@ def export_run(
       * ``qat`` defaults to ``cfg.qat``: False yields a clean fp32 detection
         checkpoint (ready to seed a follow-up QAT run); True reproduces the full
         int8 graph (fold BN + fake-quant backbone + head).
-      * ``qat_per_channel`` defaults to ``cfg.qat_per_channel`` -- it selects the
-        full-scheme pin placement, so it MUST match the trained checkpoint or the
-        variables won't line up and ``assert_existing_objects_matched`` fails.
+      * ``qat_per_channel`` defaults to ``cfg.qat_per_channel``. It no longer
+        changes the training graph -- pin placement is chosen when the export
+        graph is rebuilt for conversion -- so both settings produce the same
+        variables and restore either checkpoint.
 
     Pass either explicitly to override.
     """
