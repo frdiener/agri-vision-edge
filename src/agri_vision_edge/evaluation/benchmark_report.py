@@ -13,11 +13,13 @@ Layout consumed::
 
 The run name encodes the configuration and is decoded by :func:`parse_run_name`::
 
-    <arch>_<classes>_<dataset>_<size>_<precision>_<quant>_<nms>_<split>
-    ssd-mn2-fpnlite_mc_phenobench-tiled_320_int8_ptq_fastnms_val
+    <arch>_<classes>_<dataset>_<size>_<precision>_<quant>[_<granularity>]_<nms>_<split>
+    ssd-mn2-fpnlite_mc_phenobench-tiled_320_int8_ptq_per-tensor_fastnms_val
 
-Everything is discovered dynamically: new platforms (i.MX 8M Plus, i.MX 93) and
-quantization schemes (``qatN``) appear automatically once their artifacts exist.
+``<granularity>`` (``per-tensor`` / ``per-channel``) is present on int8 runs and
+omitted on fp32. Everything is discovered dynamically: new platforms (i.MX 8M
+Plus, i.MX 93) and quantization schemes (``qatN``) appear automatically once
+their artifacts exist.
 Plot helpers return ``None`` when a comparison has too few groups to be
 meaningful, so callers can skip them without special-casing.
 """
@@ -44,6 +46,10 @@ from .curves import _prepare_axis
 _PRECISIONS = {"fp32", "fp16", "int8", "int16", "dynamic"}
 _SPLITS = {"val", "test", "train", "eval"}
 _CLASSES = {"sc", "mc"}
+#: int8 weight granularities. Carried as a first-class field so it never leaks
+#: into the ``dataset`` token (both per-tensor and per-channel exports name it
+#: explicitly now, mirroring the conversion artifact filenames).
+_GRANULARITIES = {"per-tensor", "per-channel"}
 
 ARCH_LABELS = {
     "ssd-mn2": "SSD MobileNetV2",
@@ -85,6 +91,8 @@ def _classify_token(token: str) -> str | None:
         return "precision"
     if re.fullmatch(r"qat\d*|ptq", token):
         return "quant"
+    if token in _GRANULARITIES:
+        return "granularity"
     if token in _SPLITS:
         return "split"
     if "nms" in token:
@@ -142,6 +150,10 @@ def parse_run_name(name: str) -> dict | None:
         info.get("precision", "?").upper(),
     )
     info["quant_label"] = info.get("quant", "?").upper()
+    info["granularity_label"] = {
+        "per-tensor": "Per-tensor",
+        "per-channel": "Per-channel",
+    }.get(info.get("granularity"), "")
 
     # Compact label used on chart axes.
     info["config"] = (
@@ -357,8 +369,17 @@ def _short(series: pd.Series) -> pd.Series:
 
 
 def plot_quantization_effect(df: pd.DataFrame):
-    """FP32 vs INT8 on overall AP and weed AP (PTQ runs)."""
+    """FP32 vs INT8 on overall AP and weed AP (PTQ runs).
+
+    INT8 is represented by the per-tensor export (the default deployment
+    granularity) so each config contributes one FP32/INT8 pair; per-channel PTQ
+    is compared separately elsewhere.
+    """
     df = df[df.get("quant") == "ptq"].copy() if "quant" in df else df.copy()
+    if "granularity" in df.columns:
+        df = df[
+            (df["precision"] == "fp32") | (df["granularity"] == "per-tensor")
+        ].copy()
     if df.empty or df["precision"].nunique() < 2:
         return None
 
@@ -670,8 +691,14 @@ def plot_accuracy_latency(df: pd.DataFrame):
 
 
 def quantization_delta_table(df: pd.DataFrame) -> pd.DataFrame:
-    """FP32 vs INT8 AP with relative change, one row per config (PTQ runs)."""
+    """FP32 vs INT8 AP with relative change, one row per config (PTQ runs).
+
+    INT8 is the per-tensor export (the default deployment granularity), so each
+    config yields a single FP32/INT8 delta row.
+    """
     df = df[df.get("quant") == "ptq"] if "quant" in df else df
+    if "granularity" in df.columns:
+        df = df[(df["precision"] == "fp32") | (df["granularity"] == "per-tensor")]
     if df.empty:
         return pd.DataFrame()
 
@@ -708,6 +735,7 @@ def master_table(df: pd.DataFrame) -> pd.DataFrame:
         ("classes", "Classes"),
         ("precision", "Precision"),
         ("quant", "Quant"),
+        ("granularity", "Granularity"),
         ("AP", "AP"),
         ("AP50", "AP50"),
         ("AP75", "AP75"),
