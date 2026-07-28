@@ -32,8 +32,17 @@ Notes
   is internally consistent but is NOT the official full-frame leaderboard
   number (that requires stitching tile predictions back to 1024 frames first).
   A warning is emitted when the image size is not 1024.
-* Category ids are written straight through (``1`` crop, ``2`` weed), matching
-  the semantic labels the upstream ground-truth uses.
+* Prediction labels are remapped from our COCO ``category_id`` to the upstream
+  semantic ids (``1`` crop, ``2`` weed) *by category name*. The multi-class
+  bundle happens to agree numerically, but the single-class (weed-only) bundle
+  numbers its sole ``weed`` category ``1`` -- writing that through unchanged
+  labels every weed as a crop and yields garbage.
+* The upstream ground truth always carries both classes, so ``mAP`` is averaged
+  over crop *and* weed even for a weed-only model, whose crop AP is
+  structurally 0. For single-class models the comparable number is the weed
+  entry of ``mAP_cls``, not ``mAP``; the emitted metrics therefore name the
+  classes (``class_names``) and record which of them the model can predict
+  (``predicted_classes``).
 """
 
 from __future__ import annotations
@@ -46,6 +55,11 @@ from pathlib import Path
 
 # Mask sub-directories the upstream evaluator reads per split.
 _GT_SUBDIRS = ("plant_instances", "semantics", "plant_visibility")
+
+#: Semantic label ids used by the upstream PhenoBench ground truth, in the class
+#: order its ``mAP_cls`` list follows.
+UPSTREAM_LABELS = {"crop": 1, "weed": 2}
+UPSTREAM_CLASS_NAMES = ["crop", "weed"]
 
 
 def _require_upstream():
@@ -68,13 +82,15 @@ def _require_upstream():
     return evaluate_plant_detection
 
 
-def _load_image_index(annotations_path: Path) -> dict[int, dict]:
+def _load_coco(annotations_path: Path) -> dict:
+    with open(annotations_path) as f:
+        return json.load(f)
+
+
+def _image_index(coco: dict) -> dict[int, dict]:
     """
     Map ``image_id -> {file_name, width, height}`` from a COCO annotations file.
     """
-
-    with open(annotations_path) as f:
-        coco = json.load(f)
 
     return {
         int(image["id"]): {
@@ -86,16 +102,47 @@ def _load_image_index(annotations_path: Path) -> dict[int, dict]:
     }
 
 
+def upstream_label_map(coco: dict) -> dict[int, int]:
+    """
+    Map our COCO ``category_id`` to the upstream semantic label, by name.
+
+    Our bundles number their categories per class regime -- multi-class is
+    ``1 crop / 2 weed`` (which matches upstream), but single-class is ``1 weed``
+    (which does not). Matching on the name keeps both regimes correct; anything
+    outside the upstream vocabulary is a hard error, since silently writing an
+    unknown id through is exactly the failure mode this map exists to prevent.
+    """
+
+    label_map: dict[int, int] = {}
+
+    for category in coco.get("categories", []):
+        name = str(category["name"]).strip().lower()
+
+        if name not in UPSTREAM_LABELS:
+            raise ValueError(
+                f"Category {name!r} has no upstream PhenoBench counterpart "
+                f"(known: {sorted(UPSTREAM_LABELS)}). Faithful evaluation "
+                "compares against the official crop/weed ground truth."
+            )
+
+        label_map[int(category["id"])] = UPSTREAM_LABELS[name]
+
+    return label_map
+
+
 def coco_predictions_to_yolo_lines(
     predictions: list[dict],
     image_info: dict,
+    label_map: dict[int, int] | None = None,
 ) -> list[str]:
     """
     Convert one image's COCO predictions to upstream YOLO lines.
 
     Each line is ``label cx cy w h score`` with the box normalized to ``[0, 1]``
-    by the image size (upstream rescales by the fixed ``1024`` canvas). ``label``
-    is the COCO ``category_id`` written through unchanged.
+    by the image size (upstream rescales by the fixed ``1024`` canvas).
+    ``label`` is the COCO ``category_id`` translated through ``label_map`` into
+    the upstream semantic id; without a map it is written through unchanged
+    (correct only when our ids already match upstream's).
     """
 
     width = image_info["width"]
@@ -111,7 +158,8 @@ def coco_predictions_to_yolo_lines(
         nw = w / width
         nh = h / height
 
-        label = int(pred["category_id"])
+        category_id = int(pred["category_id"])
+        label = label_map.get(category_id, category_id) if label_map else category_id
         score = float(pred.get("score", 1.0))
 
         lines.append(f"{label} {cx} {cy} {nw} {nh} {score}")
@@ -210,6 +258,7 @@ def _stage(
     phenobench_dir: Path,
     split: str,
     workdir: Path,
+    label_map: dict[int, int] | None = None,
 ) -> tuple[Path, Path, Path]:
     """
     Build the temporary GT tree + YOLO prediction tree the evaluator expects.
@@ -257,6 +306,7 @@ def _stage(
         lines = coco_predictions_to_yolo_lines(
             preds_by_image.get(image_id, []),
             info,
+            label_map,
         )
         (pred_dir / "plant_bboxes" / f"{stem}.txt").write_text(
             "\n".join(lines)
@@ -295,7 +345,13 @@ def evaluate_faithful(
     -------
     dict
         The upstream ``eval_results`` (``mAP`` / ``mAP_50`` / ``mAP_75`` and
-        per-class ``mAP_cls``), as torchmetrics percentages.
+        per-class ``mAP_cls``), as torchmetrics percentages, annotated with
+        ``class_names`` (the class order of ``mAP_cls``) and
+        ``predicted_classes`` (the classes this model can actually emit). For a
+        weed-only model the latter is ``["weed"]`` and ``mAP`` is *not* the
+        comparable number -- upstream averages it over both ground-truth
+        classes, so the never-predicted crop class drags it to roughly half the
+        weed AP.
     """
 
     evaluate_plant_detection = _require_upstream()
@@ -304,7 +360,15 @@ def evaluate_faithful(
     predictions_path = Path(predictions_path)
     phenobench_dir = Path(phenobench_dir)
 
-    image_index = _load_image_index(annotations_path)
+    coco = _load_coco(annotations_path)
+    image_index = _image_index(coco)
+    label_map = upstream_label_map(coco)
+    predicted_classes = [
+        name
+        for name in UPSTREAM_CLASS_NAMES
+        if UPSTREAM_LABELS[name] in set(label_map.values())
+    ]
+
     width, height = _detect_image_size(image_index)
 
     if (width, height) != (1024, 1024):
@@ -327,21 +391,35 @@ def evaluate_faithful(
                 phenobench_dir,
                 split,
                 workdir,
+                label_map,
             )
 
-            return evaluate_plant_detection(
-                {
-                    "phenobench_dir": staged_root,
-                    "prediction_dir": pred_dir,
-                    "export": export_dir,
-                    "split": split,
-                }
+            results = dict(
+                evaluate_plant_detection(
+                    {
+                        "phenobench_dir": staged_root,
+                        "prediction_dir": pred_dir,
+                        "export": export_dir,
+                        "split": split,
+                    }
+                )
             )
     finally:
         restore()
+
+    # `mAP_cls` is a bare list; without the class order it cannot be read back
+    # unambiguously, and without `predicted_classes` a weed-only model's halved
+    # `mAP` looks like a genuine (catastrophic) result.
+    results["class_names"] = list(UPSTREAM_CLASS_NAMES)
+    results["predicted_classes"] = predicted_classes
+
+    return results
 
 
 __all__ = [
     "coco_predictions_to_yolo_lines",
     "evaluate_faithful",
+    "upstream_label_map",
+    "UPSTREAM_CLASS_NAMES",
+    "UPSTREAM_LABELS",
 ]
