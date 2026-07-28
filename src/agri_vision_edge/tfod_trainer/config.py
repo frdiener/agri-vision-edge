@@ -138,7 +138,7 @@ class TrainingControlConfig:
     # floored-stall events, each ~`lr_plateau_patience` (+cooldown) evals apart,
     # so this fires well before the generous global patience meant to span the
     # LR annealing.
-    lr_plateau_exhausted_patience: int = 2
+    lr_plateau_exhausted_patience: int = 0
 
     # Enable quantization-aware training. False = plain finetune (-> PTQ at
     # conversion). True = the full int8 scheme: BatchNorms folded into the convs,
