@@ -46,13 +46,31 @@ def save_benchmark_artifacts(
         "latency.json",
     )
 
+    # `delegate` is only what was requested. A delegate that is missing or
+    # fails to load falls back to CPU silently, so record what the runtime
+    # actually used as well -- otherwise a CPU run is indistinguishable from an
+    # accelerated one in the results, and every latency comparison built on
+    # them is wrong.
+    active_delegate = getattr(runtime, "active_delegate", None)
+
     save_json(
         {
             "model":
                 model_name,
 
+            # Kept under the original key for backwards compatibility with
+            # already-collected results.
             "delegate":
                 delegate,
+
+            "delegate_requested":
+                delegate,
+
+            "delegate_active":
+                active_delegate,
+
+            "backend":
+                "delegate" if active_delegate else "cpu",
 
             "input_details":
                 runtime.input_details,

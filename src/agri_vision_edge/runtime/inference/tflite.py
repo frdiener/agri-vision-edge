@@ -38,36 +38,54 @@ from .model_metadata import ModelMetadata
 DEFAULT_TEFLON_LIB = "/usr/lib/libteflon.so"
 
 
-def load_delegates(delegate_path):
+def load_delegates_with_status(delegate_path) -> tuple[list, str | None]:
     """
-    Load the optional TFLite delegate.
+    Load the optional TFLite delegate, reporting whether it actually loaded.
 
-    Returns a list suitable for ``Interpreter(experimental_delegates=...)`` —
-    empty (CPU) when ``delegate_path`` is ``None``, missing, or fails to load.
-    Shared by every runtime so delegate handling stays uniform.
+    Returns ``(delegates, active_path)`` where ``delegates`` is suitable for
+    ``Interpreter(experimental_delegates=...)`` and ``active_path`` is the
+    delegate that is really in use, or ``None`` for plain CPU execution.
+
+    The fallback to CPU is deliberate -- a missing or unloadable delegate must
+    not abort a sweep -- but it is silent in the results unless the *effective*
+    delegate is recorded: a run that asked for the NPU and quietly got the CPU
+    otherwise looks exactly like a successful NPU run in the artifacts.
     """
 
     if delegate_path is None:
-        return []
+        return [], None
 
     delegate_path = Path(delegate_path)
 
     if not delegate_path.exists():
         print(f"[runtime] delegate not found: {delegate_path}")
 
-        return []
+        return [], None
 
     try:
         delegate = load_delegate(str(delegate_path))
 
         print(f"[runtime] loaded delegate: {delegate_path}")
 
-        return [delegate]
+        return [delegate], str(delegate_path)
 
     except Exception as e:
         print(f"[runtime] failed to load delegate: {e}")
 
-        return []
+        return [], None
+
+
+def load_delegates(delegate_path):
+    """
+    Load the optional TFLite delegate (delegate list only).
+
+    Thin wrapper over :func:`load_delegates_with_status` for callers that do not
+    care which delegate ended up being used.
+    """
+
+    delegates, _ = load_delegates_with_status(delegate_path)
+
+    return delegates
 
 
 class TFLiteRuntime(BaseRuntime):
@@ -102,7 +120,14 @@ class TFLiteRuntime(BaseRuntime):
 
         self.score_threshold = score_threshold
 
-        delegates = self._load_delegates(delegate_path)
+        # `active_delegate` is the delegate actually in use (None = CPU), which
+        # is what the benchmark artifacts have to record: `delegate_path` is
+        # only what was *asked for*.
+        delegates, self.active_delegate = self._load_delegates(delegate_path)
+
+        self.requested_delegate = (
+            str(delegate_path) if delegate_path is not None else None
+        )
 
         self.interpreter = Interpreter(
             model_path=str(self.model_path),
@@ -158,7 +183,7 @@ class TFLiteRuntime(BaseRuntime):
         delegate_path,
     ):
 
-        return load_delegates(delegate_path)
+        return load_delegates_with_status(delegate_path)
 
     #
     # Preprocessing

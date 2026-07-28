@@ -39,7 +39,7 @@ from .base import (
 from .model_metadata import ModelMetadata
 from .tflite import (
     DEFAULT_TEFLON_LIB,
-    load_delegates,
+    load_delegates_with_status,
 )
 
 # Fallbacks when a model carries no embedded post-processing metadata (the
@@ -86,9 +86,18 @@ class YoloTFLiteRuntime(BaseRuntime):
 
         self.labels = self.metadata.labels
 
+        # Keep both the requested and the effective delegate: a missing or
+        # unloadable delegate falls back to CPU, and the benchmark artifacts
+        # have to say so rather than claim the accelerator.
+        _delegates, self.active_delegate = load_delegates_with_status(delegate_path)
+
+        self.requested_delegate = (
+            str(delegate_path) if delegate_path is not None else None
+        )
+
         self.interpreter = Interpreter(
             model_path=str(model_path),
-            experimental_delegates=load_delegates(delegate_path),
+            experimental_delegates=_delegates,
         )
 
         self.interpreter.allocate_tensors()
