@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Evaluate every benchmarked model in a results directory, inferring the matching
-# test-bundle annotations (sc/mc, tiled/non-tiled) from each entry's directory
-# name (which is the model stem).
+# test-bundle annotations (sc/mc, tiled/untiled) from each entry's directory
+# name. Tiling is encoded by the tiled_ / untiled_ result-directory prefix.
 #
 # Usage:
 #   scripts/evaluate_all.sh [--faithful] [target-dir]
@@ -15,8 +15,8 @@
 # Pass --faithful to ALSO run the official PhenoBench evaluator
 # (`ave evaluate --faithful`, writing metrics_faithful.json) alongside the
 # lightweight pycocotools metrics. It points --phenobench-dir at the raw dataset
-# that matches each model: datasets/phenobench_raw_full for untiled models,
-# datasets/phenobench_raw_tiled for *phenobench-tiled* models (override with the
+# that matches each run: datasets/phenobench_raw_full for untiled_ runs,
+# datasets/phenobench_raw_tiled for tiled_ runs (override with the
 # PHENOBENCH_RAW_FULL / PHENOBENCH_RAW_TILED env vars). Needs the 'faithful-eval'
 # extra (torch/torchvision/torchmetrics); failures are reported per model and the
 # sweep continues.
@@ -81,13 +81,17 @@ for model_dir in "${target_dir}"/*/; do
         continue
     fi
 
-    # tiled vs non-tiled
-    if [[ "${name}" == *phenobench-tiled* ]]; then
+    # tiled vs untiled, encoded by the benchmark result-directory prefix
+    if [[ "${name}" == tiled_* ]]; then
         annotations="${bundle_dir}/annotations_${cls}_tiled.json"
         raw_dir="${raw_tiled_dir}"
-    else
+    elif [[ "${name}" == untiled_* ]]; then
         annotations="${bundle_dir}/annotations_${cls}.json"
         raw_dir="${raw_full_dir}"
+    else
+        echo "[skip] ${name}: cannot infer tiled/untiled prefix" >&2
+        skipped=$((skipped + 1))
+        continue
     fi
 
     echo "[eval] ${name}  (annotations=$(basename "${annotations}"))"

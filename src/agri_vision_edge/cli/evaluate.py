@@ -24,6 +24,35 @@ from agri_vision_edge.evaluation.coco import (
 from agri_vision_edge.evaluation.partials import DEFAULT_PARTIAL_THRESHOLD
 
 
+def _infer_annotations_path(
+    annotations_root: Path,
+    run_name: str,
+) -> Path | None:
+    """
+    Infer the matching test-bundle annotations for a benchmark run directory.
+
+    Directory-mode benchmark sweeps may contain both ``tiled_`` and
+    ``untiled_`` runs. In that case, pass the test-bundle directory as the
+    annotations argument and infer the concrete annotations JSON from each run
+    directory's prefix plus its ``sc`` / ``mc`` class token.
+    """
+
+    if "_mc_" in run_name:
+        cls = "mc"
+    elif "_sc_" in run_name:
+        cls = "sc"
+    else:
+        return None
+
+    if run_name.startswith("tiled_"):
+        return annotations_root / f"annotations_{cls}_tiled.json"
+
+    if run_name.startswith("untiled_"):
+        return annotations_root / f"annotations_{cls}.json"
+
+    return None
+
+
 def _run_faithful(args):
     """
     Run the official PhenoBench evaluator on a single predictions file.
@@ -65,7 +94,10 @@ def main(argv=None):
 
     parser.add_argument(
         "annotations",
-        help=("COCO annotations JSON"),
+        help=(
+            "COCO annotations JSON, or a test-bundle directory when evaluating "
+            "a benchmark_results directory containing tiled_/untiled_ runs"
+        ),
     )
 
     parser.add_argument(
@@ -178,9 +210,35 @@ def main(argv=None):
     skipped = 0
 
     for model_dir in model_dirs:
+        run_annotations_path = annotations_path
+
+        if annotations_path.is_dir():
+            inferred_annotations_path = _infer_annotations_path(
+                annotations_path,
+                model_dir.name,
+            )
+
+            if inferred_annotations_path is None:
+                print(
+                    f"[skip] {model_dir.name} "
+                    "(cannot infer tiled_/untiled_ annotations)"
+                )
+                skipped += 1
+                continue
+
+            if not inferred_annotations_path.exists():
+                print(
+                    f"[skip] {model_dir.name} "
+                    f"(missing annotations: {inferred_annotations_path})"
+                )
+                skipped += 1
+                continue
+
+            run_annotations_path = inferred_annotations_path
+
         ok = evaluate_model_dir(
             model_dir,
-            annotations_path,
+            run_annotations_path,
             ignore_partials=args.ignore_partials,
             partial_threshold=args.partial_threshold,
         )
