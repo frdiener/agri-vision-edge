@@ -209,6 +209,126 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
+def _latency_fields(latency: dict) -> dict:
+    """
+    Latency summary for one run, preferring order statistics over the mean.
+
+    The benchmark already discards warm-up iterations, but a run still picks up
+    the odd scheduling outlier (seen: a single 367 ms sample against a 15 ms
+    median) which drags the mean and blows up the min/max range. The median and
+    p95 describe the achievable rate far better, so throughput is derived from
+    the median; the mean is kept for continuity.
+    """
+
+    samples = sorted(latency.get("latencies_ms") or [])
+
+    fields = {
+        key: latency.get(key)
+        for key in (
+            "mean_latency_ms",
+            "median_latency_ms",
+            "min_latency_ms",
+            "max_latency_ms",
+        )
+    }
+    fields["n_latency"] = len(samples)
+
+    if samples:
+        fields["p95_latency_ms"] = float(np.percentile(samples, 95))
+        # How far the mean is inflated by outliers -- a cheap tell that a run's
+        # timing was disturbed (see the sanity checks).
+        median = fields.get("median_latency_ms") or float(np.median(samples))
+        if median:
+            fields["latency_outlier_ratio"] = float(max(samples)) / float(median)
+            fields["fps"] = 1000.0 / float(median)
+
+    return fields
+
+
+def _runtime_fields(runtime: dict) -> dict:
+    """
+    Execution backend for one run.
+
+    ``delegate`` is only the delegate that was *requested*; a missing or
+    unloadable one falls back to CPU. Newer artifacts record what was really
+    used, older ones do not, so an unknown backend is reported as such instead
+    of being optimistically read as accelerated.
+    """
+
+    requested = runtime.get("delegate_requested", runtime.get("delegate"))
+
+    if "backend" in runtime:
+        backend = runtime["backend"]
+    elif requested is None:
+        backend = "cpu"
+    else:
+        backend = "unknown"
+
+    return {
+        "delegate": requested,
+        "delegate_active": runtime.get("delegate_active"),
+        "backend": backend,
+        "input_dtype": (
+            (runtime.get("input_details") or [{}])[0].get("dtype", "").split("'")[-2]
+            if runtime.get("input_details")
+            else None
+        ),
+    }
+
+
+def _faithful_fields(faithful: dict | None, *, classes: str | None) -> dict:
+    """
+    Official PhenoBench (``metrics_faithful.json``) metrics for one run.
+
+    Upstream reports percentages; they are rescaled to the 0-1 range so they sit
+    in the same units as the pycocotools columns. ``mAP_cls`` is positional and
+    only interpretable with the class order, which newer artifacts carry as
+    ``class_names`` -- for older ones the upstream ``[crop, weed]`` order is
+    assumed.
+
+    Single-class runs need two caveats, both flagged rather than silently
+    averaged away:
+
+    * ``faithful_mAP`` averages over crop and weed, so a weed-only model is
+      penalised for a class it cannot predict -- ``faithful_weed_AP`` is the
+      comparable number.
+    * results produced before the label remap scored weed predictions against
+      crop ground truth and are simply invalid (``faithful_stale``).
+    """
+
+    if not faithful:
+        return {"faithful": False}
+
+    names = faithful.get("class_names") or ["crop", "weed"]
+    per_class = faithful.get("mAP_cls") or []
+
+    fields: dict = {
+        "faithful": True,
+        "faithful_mAP": _pct(faithful.get("mAP")),
+        "faithful_mAP50": _pct(faithful.get("mAP_50")),
+        "faithful_mAP75": _pct(faithful.get("mAP_75")),
+    }
+
+    for name, value in zip(names, per_class, strict=False):
+        fields[f"faithful_{name}_AP"] = _pct(value)
+
+    predicted = faithful.get("predicted_classes")
+
+    # Artifacts without `class_names` predate the label remap; for single-class
+    # runs that remap is exactly what was broken, so those numbers are unusable.
+    fields["faithful_stale"] = "class_names" not in faithful and classes == "sc"
+    fields["faithful_partial_classes"] = bool(
+        predicted is not None and len(predicted) < len(names)
+    ) or (predicted is None and classes == "sc")
+
+    return fields
+
+
+def _pct(value) -> float | None:
+    """Upstream percentage -> 0-1 fraction, matching the pycocotools columns."""
+    return None if value is None else float(value) / 100.0
+
+
 def load_benchmark_results(
     root: str | Path = "benchmark_results",
     exclude_dirs: Iterable[str] = NON_PLATFORM_DIRS,
@@ -224,8 +344,10 @@ def load_benchmark_results(
 
     Returns:
         ``(df, skipped)`` where ``df`` has one row per successful run with
-        configuration fields, COCO metrics (overall + per-class) and latency,
-        and ``skipped`` lists ``platform/run`` entries that were not loadable.
+        configuration fields, pycocotools metrics (overall + per-class), the
+        official PhenoBench metrics when ``metrics_faithful.json`` is present,
+        latency order statistics and the execution backend; ``skipped`` lists
+        ``platform/run`` entries that were not loadable.
     """
     root = Path(root)
     exclude = set(exclude_dirs)
@@ -266,20 +388,14 @@ def load_benchmark_results(
                 row[f"{cls}_AP50"] = cls_metrics.get("AP50")
                 row[f"{cls}_AP75"] = cls_metrics.get("AP75")
 
-            latency = _read_json(run_dir / "latency.json") or {}
-            for key in (
-                "mean_latency_ms",
-                "median_latency_ms",
-                "min_latency_ms",
-                "max_latency_ms",
-            ):
-                row[key] = latency.get(key)
-            row["n_latency"] = len(latency.get("latencies_ms") or [])
-            if row.get("mean_latency_ms"):
-                row["fps"] = 1000.0 / row["mean_latency_ms"]
-
-            runtime = _read_json(run_dir / "runtime.json") or {}
-            row["delegate"] = runtime.get("delegate")
+            row.update(_latency_fields(_read_json(run_dir / "latency.json") or {}))
+            row.update(_runtime_fields(_read_json(run_dir / "runtime.json") or {}))
+            row.update(
+                _faithful_fields(
+                    _read_json(run_dir / "metrics_faithful.json"),
+                    classes=row.get("classes"),
+                )
+            )
 
             rows.append(row)
 
@@ -447,6 +563,82 @@ def plot_quantization_effect(df: pd.DataFrame):
         ax.legend(title="precision")
 
     fig.suptitle("FP32 -> INT8 quantization effect", y=1.0)
+    fig.tight_layout()
+    return fig
+
+
+#: Colours for the five deployable exports, float first then INT8 coarse->fine.
+SCHEME_COLORS = {
+    "fp32_ptq": "#4C72B0",
+    "int8_ptq_per-tensor": "#DD8452",
+    "int8_ptq_per-channel": "#E8B778",
+    "int8_qat_per-tensor": "#55A868",
+    "int8_qat_per-channel": "#8FC7A0",
+}
+
+
+def plot_scheme_effect(
+    df: pd.DataFrame,
+    *,
+    eval_tiling: str | None = "untiled",
+    metric: str = "AP",
+    platform: str | None = None,
+):
+    """
+    All five quantization schemes side by side, one bar group per variant.
+
+    This is the figure for the PTQ-vs-QAT question, and unlike the aggregated
+    FP32-vs-INT8 view it shows each export on its own: a single broken scheme
+    stays visible instead of being averaged into an "INT8" bar.
+    """
+    if df.empty or metric not in df.columns:
+        return None
+
+    sel = df.copy()
+    if eval_tiling is not None and "eval_tiling" in sel.columns:
+        sel = sel[sel["eval_tiling"] == eval_tiling]
+    if platform is not None:
+        sel = sel[sel["platform"] == platform]
+    if sel.empty:
+        return None
+
+    sel = add_scheme(sel)
+    schemes = [s for s in SCHEME_ORDER if s in set(sel["scheme"])]
+    if len(schemes) < 2:
+        return None
+
+    sel["group"] = (
+        _short(sel["arch_label"])
+        + " | "
+        + sel["classes"].str.upper()
+        + " | "
+        + sel["dataset"]
+    )
+    groups = sorted(sel["group"].unique())
+
+    values = {
+        s: [
+            sel[(sel["group"] == g) & (sel["scheme"] == s)][metric].mean()
+            for g in groups
+        ]
+        for s in schemes
+    }
+
+    fig, ax = plt.subplots(figsize=(max(9, 1.5 * len(groups)), 4.6))
+    _grouped_bars(
+        ax,
+        groups,
+        schemes,
+        values,
+        [SCHEME_COLORS.get(s, "#999999") for s in schemes],
+        ylabel=metric,
+        title=(
+            f"{metric} by quantization scheme"
+            + (f" ({eval_tiling} input)" if eval_tiling else "")
+        ),
+        rotation=20,
+    )
+    ax.legend(title="scheme", ncol=2)
     fig.tight_layout()
     return fig
 
@@ -719,6 +911,485 @@ def plot_accuracy_latency(df: pd.DataFrame):
 
 
 # =========================================================
+# Thesis tables
+# =========================================================
+
+#: Published PhenoBench plant-detection baselines (test split), as printed in
+#: the dataset paper. Percentages, so they share the units of the *faithful*
+#: (upstream torchmetrics) columns -- never mix them with the pycocotools ones.
+PHENOBENCH_BASELINES = (
+    {
+        "Approach": "Faster R-CNN",
+        "mAP": 40.43,
+        "mAP50": 65.07,
+        "mAP75": 40.19,
+        "Crop AP": 63.23,
+        "Weed AP": 17.62,
+        "Source": "upstream",
+    },
+    {
+        "Approach": "Mask R-CNN",
+        "mAP": 38.68,
+        "mAP50": 63.72,
+        "mAP75": 38.07,
+        "Crop AP": 60.32,
+        "Weed AP": 17.05,
+        "Source": "upstream",
+    },
+    {
+        "Approach": "YOLOv7",
+        "mAP": 60.48,
+        "mAP50": 82.47,
+        "mAP75": 62.30,
+        "Crop AP": 83.06,
+        "Weed AP": 37.91,
+        "Source": "upstream",
+    },
+)
+
+
+def upstream_comparison_table(
+    df: pd.DataFrame,
+    *,
+    platform: str | None = None,
+    include_baselines: bool = True,
+) -> pd.DataFrame:
+    """
+    Our detectors next to the published PhenoBench baselines.
+
+    Only runs that are actually comparable to the upstream leaderboard are
+    eligible, which is a narrow slice:
+
+    * **multi-class** -- upstream averages mAP over crop and weed, so a
+      weed-only model is scored against a class it cannot predict;
+    * **untiled training data and untiled evaluation** -- the upstream number is
+      a full-frame 1024x1024 one, and our tile-wise faithful evaluation is
+      explicitly not that;
+    * **official metrics only** -- the ``faithful_*`` columns, in upstream
+      percentage units. Runs whose faithful metrics predate the label remap are
+      dropped rather than shown as-is.
+
+    Note that the upstream figures are on the *test* split while ours are on
+    val, so this is an orientation, not a like-for-like ranking.
+    """
+    if df.empty or "faithful_mAP" not in df.columns:
+        return pd.DataFrame()
+
+    sel = df[
+        (df["classes"] == "mc")
+        & (df["dataset"] == "phenobench")
+        & (df.get("eval_tiling") == "untiled")
+        & df["faithful_mAP"].notna()
+        & ~df.get("faithful_stale", False).fillna(False)
+    ].copy()
+
+    if platform is not None:
+        sel = sel[sel["platform"] == platform]
+
+    if sel.empty:
+        return pd.DataFrame()
+
+    sel = add_scheme(sel)
+    rows = [
+        {
+            "Approach": f"{r['arch_label']} ({r['scheme']})",
+            "mAP": round(100 * r["faithful_mAP"], 2),
+            "mAP50": round(100 * r["faithful_mAP50"], 2),
+            "mAP75": round(100 * r["faithful_mAP75"], 2),
+            "Crop AP": _round_pct(r.get("faithful_crop_AP")),
+            "Weed AP": _round_pct(r.get("faithful_weed_AP")),
+            "Source": r["platform"],
+        }
+        for _, r in sel.sort_values(["arch", "scheme"]).iterrows()
+    ]
+
+    if include_baselines:
+        rows = [*PHENOBENCH_BASELINES, *rows]
+
+    return pd.DataFrame(rows)
+
+
+def _round_pct(value, digits: int = 2):
+    return None if value is None or pd.isna(value) else round(100 * value, digits)
+
+
+#: Metric columns shared by the per-scheme thesis tables.
+_SCHEME_METRICS = (
+    ("AP", "mAP"),
+    ("AP50", "mAP50"),
+    ("AP75", "mAP75"),
+    ("crop_AP", "Crop AP"),
+    ("weed_AP", "Weed AP"),
+)
+
+#: Order the quantization schemes appear in, coarse to fine.
+SCHEME_ORDER = (
+    "fp32_ptq",
+    "int8_ptq_per-tensor",
+    "int8_ptq_per-channel",
+    "int8_qat_per-tensor",
+    "int8_qat_per-channel",
+)
+
+
+def scheme_comparison_table(
+    df: pd.DataFrame,
+    *,
+    platform: str | None = None,
+    eval_tiling: str | None = None,
+    metrics: Iterable[tuple[str, str]] = _SCHEME_METRICS,
+) -> pd.DataFrame:
+    """
+    PTQ vs. QAT per model variant: one row per (variant, scheme).
+
+    This is the table the quantization chapter is built on, so it also carries
+    ``dAP vs fp32`` -- the whole point is how far each INT8 export falls behind
+    (or ahead of) its own float baseline, which raw AP columns make the reader
+    compute by hand.
+
+    Rows are pycocotools metrics (our internally consistent numbers), not the
+    upstream ones; mixing the two in a single table would be meaningless.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    sel = df.copy()
+    if platform is not None:
+        sel = sel[sel["platform"] == platform]
+    if eval_tiling is not None:
+        sel = sel[sel["eval_tiling"] == eval_tiling]
+    if sel.empty:
+        return pd.DataFrame()
+
+    sel = add_scheme(sel)
+
+    variant_keys = ["platform", "arch_label", "classes", "dataset", "eval_tiling"]
+    variant_keys = [k for k in variant_keys if k in sel.columns]
+
+    rows = []
+    for _, group in sel.groupby(variant_keys, dropna=False):
+        baseline = group[group["precision"] == "fp32"]
+        baseline_ap = (
+            float(baseline["AP"].iloc[0])
+            if not baseline.empty and pd.notna(baseline["AP"].iloc[0])
+            else None
+        )
+
+        ordered = group.sort_values(
+            "scheme",
+            key=lambda s: s.map(
+                {name: i for i, name in enumerate(SCHEME_ORDER)}
+            ).fillna(len(SCHEME_ORDER)),
+        )
+
+        for _, r in ordered.iterrows():
+            row = {k: r[k] for k in variant_keys}
+            row["Scheme"] = r["scheme"]
+            for col, label in metrics:
+                row[label] = (
+                    None
+                    if col not in r or pd.isna(r[col])
+                    else round(float(r[col]), 4)
+                )
+            row["dAP vs fp32"] = (
+                None
+                if baseline_ap in (None, 0) or pd.isna(r.get("AP"))
+                else round(100 * (float(r["AP"]) - baseline_ap) / baseline_ap, 1)
+            )
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def platform_metrics_table(
+    df: pd.DataFrame,
+    platform: str,
+    *,
+    eval_tiling: str | None = None,
+) -> pd.DataFrame:
+    """
+    Full COCO metrics for every run on one device (one table per device).
+    """
+    sel = df[df["platform"] == platform] if not df.empty else df
+    if eval_tiling is not None and not sel.empty:
+        sel = sel[sel["eval_tiling"] == eval_tiling]
+    if sel.empty:
+        return pd.DataFrame()
+
+    sel = add_scheme(sel)
+    cols = [
+        ("arch_label", "Architecture"),
+        ("classes", "Classes"),
+        ("dataset", "Trained on"),
+        ("eval_tiling", "Eval input"),
+        ("scheme", "Scheme"),
+        ("backend", "Backend"),
+        ("AP", "mAP"),
+        ("AP50", "mAP50"),
+        ("AP75", "mAP75"),
+        ("crop_AP", "Crop AP"),
+        ("weed_AP", "Weed AP"),
+        ("APS", "APS"),
+        ("median_latency_ms", "Lat med (ms)"),
+        ("p95_latency_ms", "Lat p95 (ms)"),
+        ("fps", "FPS"),
+    ]
+    cols = [(c, n) for c, n in cols if c in sel.columns]
+    out = sel[[c for c, _ in cols]].copy()
+    out.columns = [n for _, n in cols]
+
+    round_map = {
+        n: 4 for c, n in cols if c in ("AP", "AP50", "AP75", "crop_AP", "weed_AP", "APS")
+    }
+    round_map.update({"Lat med (ms)": 2, "Lat p95 (ms)": 2, "FPS": 1})
+    return out.round(round_map).reset_index(drop=True)
+
+
+def latency_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Median / p95 latency and throughput per platform, backend and scheme.
+
+    Reported on the median rather than the mean: the sweeps pick up occasional
+    scheduling outliers an order of magnitude above the typical sample, which
+    the mean happily absorbs (see ``latency_outlier_ratio``).
+    """
+    if df.empty or "median_latency_ms" not in df.columns:
+        return pd.DataFrame()
+
+    sel = add_scheme(df[df["median_latency_ms"].notna()].copy())
+    if sel.empty:
+        return pd.DataFrame()
+
+    keys = [
+        k
+        for k in ("platform", "backend", "arch_label", "scheme")
+        if k in sel.columns
+    ]
+
+    grouped = sel.groupby(keys, dropna=False).agg(
+        runs=("median_latency_ms", "size"),
+        lat_median_ms=("median_latency_ms", "median"),
+        lat_p95_ms=("p95_latency_ms", "median"),
+        fps=("fps", "median"),
+    )
+
+    return (
+        grouped.round({"lat_median_ms": 2, "lat_p95_ms": 2, "fps": 1})
+        .reset_index()
+        .rename(
+            columns={
+                "platform": "Platform",
+                "backend": "Backend",
+                "arch_label": "Architecture",
+                "scheme": "Scheme",
+                "runs": "Runs",
+                "lat_median_ms": "Lat med (ms)",
+                "lat_p95_ms": "Lat p95 (ms)",
+                "fps": "FPS",
+            }
+        )
+    )
+
+
+# =========================================================
+# Sanity checks
+# =========================================================
+
+#: A quantized export scoring this much below its own FP32 baseline is treated
+#: as a broken export rather than a quantization cost.
+QUANT_COLLAPSE_FRACTION = 0.5
+
+#: Relative AP gap (per-channel vs per-tensor) worth reporting: per-channel is
+#: the finer scheme and should never be materially *worse*.
+GRANULARITY_INVERSION_FRACTION = 0.1
+
+
+def sanity_checks(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flag results that are more likely bugs than findings.
+
+    Averages and bar charts hide broken runs very effectively, so every table in
+    the notebook is preceded by this: it returns one row per detected issue with
+    a severity, the run it concerns and what was observed. An empty frame means
+    nothing suspicious was found -- not that everything is correct.
+
+    Checks:
+
+    * ``quant-collapse`` -- an INT8 export scoring far below its own FP32
+      baseline.
+    * ``granularity-inversion`` -- per-channel scoring materially below
+      per-tensor for the same quantization scheme, which is backwards: the
+      finer granularity is strictly more expressive.
+    * ``backend-unknown`` / ``delegate-fallback`` -- a run whose effective
+      execution backend is not recorded, or which asked for a delegate and
+      silently ran on the CPU. Both invalidate latency comparisons.
+    * ``fp32-on-delegate`` -- a float graph pushed through an INT8 accelerator.
+    * ``latency-outliers`` -- max sample far above the median, i.e. a disturbed
+      timing run (harmless for the median, fatal for the mean).
+    * ``faithful-stale`` -- official metrics produced before the upstream label
+      remap.
+    * ``faithful-divergence`` -- official and pycocotools metrics disagreeing
+      beyond what the two implementations explain.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    sel = add_scheme(df)
+    issues: list[dict] = []
+
+    def add(severity, check, run, platform, detail):
+        issues.append(
+            {
+                "severity": severity,
+                "check": check,
+                "platform": platform,
+                "run": run,
+                "detail": detail,
+            }
+        )
+
+    variant_keys = [
+        k
+        for k in ("platform", "arch", "classes", "dataset", "eval_tiling")
+        if k in sel.columns
+    ]
+
+    for _, group in sel.groupby(variant_keys, dropna=False):
+        fp32 = group[group["precision"] == "fp32"]
+        base = (
+            float(fp32["AP"].iloc[0])
+            if not fp32.empty and pd.notna(fp32["AP"].iloc[0])
+            else None
+        )
+
+        if base:
+            for _, r in group[group["precision"] == "int8"].iterrows():
+                if pd.isna(r["AP"]):
+                    continue
+                if float(r["AP"]) < QUANT_COLLAPSE_FRACTION * base:
+                    add(
+                        "error",
+                        "quant-collapse",
+                        r["run"],
+                        r["platform"],
+                        f"AP {r['AP']:.3f} vs fp32 {base:.3f} "
+                        f"({100 * (r['AP'] - base) / base:+.0f}%)",
+                    )
+
+        # per-channel should never be materially worse than per-tensor
+        for quant, quant_group in group.groupby("quant", dropna=False):
+            pt = quant_group[quant_group.get("granularity") == "per-tensor"]
+            pc = quant_group[quant_group.get("granularity") == "per-channel"]
+            if pt.empty or pc.empty:
+                continue
+            pt_ap, pc_ap = pt["AP"].iloc[0], pc["AP"].iloc[0]
+            if pd.isna(pt_ap) or pd.isna(pc_ap) or not pt_ap:
+                continue
+            if pc_ap < (1 - GRANULARITY_INVERSION_FRACTION) * pt_ap:
+                add(
+                    "error",
+                    "granularity-inversion",
+                    pc["run"].iloc[0],
+                    pc["platform"].iloc[0],
+                    f"{quant} per-channel AP {pc_ap:.3f} < per-tensor "
+                    f"{pt_ap:.3f} ({100 * (pc_ap - pt_ap) / pt_ap:+.0f}%)",
+                )
+
+    for _, r in sel.iterrows():
+        backend = r.get("backend")
+
+        if backend == "unknown":
+            add(
+                "warning",
+                "backend-unknown",
+                r["run"],
+                r["platform"],
+                f"requested {r.get('delegate')!r}; artifact predates effective-"
+                "delegate recording, so CPU vs NPU is unknown",
+            )
+        elif backend == "cpu" and r.get("delegate"):
+            add(
+                "error",
+                "delegate-fallback",
+                r["run"],
+                r["platform"],
+                f"requested {r.get('delegate')!r} but ran on CPU",
+            )
+
+        if r.get("precision") == "fp32" and backend == "delegate":
+            add(
+                "warning",
+                "fp32-on-delegate",
+                r["run"],
+                r["platform"],
+                "float graph routed through an INT8 accelerator",
+            )
+
+        ratio = r.get("latency_outlier_ratio")
+        if pd.notna(ratio) and ratio and float(ratio) > 5:
+            add(
+                "info",
+                "latency-outliers",
+                r["run"],
+                r["platform"],
+                f"max sample {float(ratio):.0f}x the median; use median/p95",
+            )
+
+        if r.get("faithful_stale"):
+            add(
+                "error",
+                "faithful-stale",
+                r["run"],
+                r["platform"],
+                "official metrics predate the crop/weed label remap; re-run "
+                "`ave evaluate --faithful`",
+            )
+        elif (
+            pd.notna(r.get("faithful_mAP"))
+            and pd.notna(r.get("AP"))
+            and not r.get("faithful_partial_classes")
+            and abs(float(r["faithful_mAP"]) - float(r["AP"])) > 0.05
+        ):
+            add(
+                "warning",
+                "faithful-divergence",
+                r["run"],
+                r["platform"],
+                f"official mAP {r['faithful_mAP']:.3f} vs pycocotools AP "
+                f"{r['AP']:.3f}",
+            )
+
+    if not issues:
+        return pd.DataFrame(
+            columns=["severity", "check", "platform", "run", "detail"]
+        )
+
+    order = {"error": 0, "warning": 1, "info": 2}
+    return (
+        pd.DataFrame(issues)
+        .sort_values(
+            ["severity", "check", "run"],
+            key=lambda s: s.map(order) if s.name == "severity" else s,
+        )
+        .reset_index(drop=True)
+    )
+
+
+def sanity_summary(issues: pd.DataFrame) -> pd.DataFrame:
+    """Issue counts per check and severity."""
+    if issues.empty:
+        return pd.DataFrame()
+    return (
+        issues.groupby(["severity", "check"])
+        .size()
+        .rename("runs")
+        .reset_index()
+        .sort_values("runs", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+# =========================================================
 # Tables
 # =========================================================
 
@@ -807,20 +1478,56 @@ def master_table(df: pd.DataFrame) -> pd.DataFrame:
 # Coverage / completeness
 # =========================================================
 
-#: The (precision, quant) pairs that make up a *full run* for one model variant:
-#: an FP32 + INT8 PTQ baseline, plus an INT8 export per QAT scheme. Editable in
-#: the notebook to match the planned matrix (QAT is INT8-only by construction).
-DEFAULT_FULL_RUN_COMBOS = (
-    ("fp32", "ptq"),
-    ("int8", "ptq"),
-    ("int8", "qat0"),
-    ("int8", "qat1"),
-    ("int8", "qat2"),
-    ("int8", "qat3"),
+#: The deployable exports that make up a *full run* for one model variant, as
+#: ``(precision, quant, granularity)`` -- the FP32 baseline plus one INT8 export
+#: per quantization scheme and weight granularity, mirroring the conversion
+#: targets in :mod:`agri_vision_edge.conversion.tflite`. FP32 has no
+#: granularity; QAT is INT8-only by construction.
+DEFAULT_SCHEMES = (
+    ("fp32", "ptq", None),
+    ("int8", "ptq", "per-tensor"),
+    ("int8", "ptq", "per-channel"),
+    ("int8", "qat", "per-tensor"),
+    ("int8", "qat", "per-channel"),
 )
 
-#: Platforms a full run targets: the laptop plus the two embedded NPUs.
-DEFAULT_EXPECTED_PLATFORMS = ("theta", "imx8mp", "imx93")
+#: Every model is benchmarked on both input regimes, so both belong in the
+#: expected matrix.
+DEFAULT_EVAL_TILINGS = ("untiled", "tiled")
+
+#: Platforms a full run targets: the dev host plus the two embedded NPU boards.
+DEFAULT_EXPECTED_PLATFORMS = ("gaia", "imx8mp", "imx93")
+
+
+def scheme_name(precision, quant, granularity=None) -> str:
+    """
+    Canonical short name of one export, e.g. ``int8_qat_per-channel``.
+
+    Matches the artifact filename suffix so a scheme in a table can be traced
+    back to the exact ``.tflite`` it came from.
+    """
+    parts = [str(precision), str(quant)]
+    if granularity and str(granularity) != "nan":
+        parts.append(str(granularity))
+    return "_".join(parts)
+
+
+def add_scheme(df: pd.DataFrame) -> pd.DataFrame:
+    """Return ``df`` with a ``scheme`` column (see :func:`scheme_name`)."""
+    if df.empty:
+        return df
+    out = df.copy()
+    out["scheme"] = [
+        scheme_name(p, q, g)
+        for p, q, g in zip(
+            out.get("precision", ""),
+            out.get("quant", ""),
+            out.get("granularity", pd.Series([None] * len(out), index=out.index)),
+            strict=False,
+        )
+    ]
+    return out
+
 
 #: Fields that identify a model variant independent of precision/quant/platform.
 _VARIANT_KEYS = ("arch", "classes", "dataset", "size")
@@ -860,18 +1567,33 @@ def discover_model_variants(
 def build_coverage(
     runs_df: pd.DataFrame,
     variants_df: pd.DataFrame,
-    combos: Iterable[tuple[str, str]] = DEFAULT_FULL_RUN_COMBOS,
+    schemes: Iterable[tuple[str, str, str | None]] = DEFAULT_SCHEMES,
     platforms: Iterable[str] = DEFAULT_EXPECTED_PLATFORMS,
+    eval_tilings: Iterable[str] = DEFAULT_EVAL_TILINGS,
 ) -> pd.DataFrame:
     """
-    Cross variants × (precision, quant) combos × platforms into a long
-    coverage frame, flagging which expected runs are already benchmarked.
+    Cross variants × schemes × eval regimes × platforms into a long coverage
+    frame, flagging which expected runs are already benchmarked.
+
+    A cell is one benchmarked artifact, so the key has to carry everything that
+    distinguishes one: the variant, the export scheme *including its weight
+    granularity*, and the input regime it was evaluated on. Leaving the
+    granularity out (as an earlier version did) makes the per-tensor and
+    per-channel exports indistinguishable and reports a matrix that is both
+    incomplete and satisfied by half the runs.
 
     Platforms already present in ``runs_df`` are always included, so unexpected
     platforms still surface. Matching ignores NMS / split.
     """
     if variants_df.empty:
         return pd.DataFrame()
+
+    def _granularity(value):
+        # fp32 has no granularity; normalise NaN/"" to None so the expected
+        # matrix and the loaded runs use the same key.
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return None
+        return value or None
 
     present_keys = set()
     if not runs_df.empty:
@@ -880,8 +1602,10 @@ def build_coverage(
                 (
                     r["platform"],
                     *(r.get(k) for k in _VARIANT_KEYS),
+                    r.get("eval_tiling"),
                     r.get("precision"),
                     r.get("quant"),
+                    _granularity(r.get("granularity")),
                 )
             )
 
@@ -894,19 +1618,29 @@ def build_coverage(
     rows = []
     for platform in platform_list:
         for _, v in variants_df.iterrows():
-            for precision, quant in combos:
-                key = (platform, *(v[k] for k in _VARIANT_KEYS), precision, quant)
-                rows.append(
-                    {
-                        "platform": platform,
-                        "variant": v["variant"],
-                        "config": v["config"],
-                        "precision": precision,
-                        "quant": quant,
-                        "scheme": f"{precision}/{quant}",
-                        "present": key in present_keys,
-                    }
-                )
+            for eval_tiling in eval_tilings:
+                for precision, quant, granularity in schemes:
+                    key = (
+                        platform,
+                        *(v[k] for k in _VARIANT_KEYS),
+                        eval_tiling,
+                        precision,
+                        quant,
+                        _granularity(granularity),
+                    )
+                    rows.append(
+                        {
+                            "platform": platform,
+                            "variant": v["variant"],
+                            "config": v["config"],
+                            "eval_tiling": eval_tiling,
+                            "precision": precision,
+                            "quant": quant,
+                            "granularity": granularity,
+                            "scheme": scheme_name(precision, quant, granularity),
+                            "present": key in present_keys,
+                        }
+                    )
     return pd.DataFrame(rows)
 
 
@@ -920,7 +1654,7 @@ def coverage_matrix(coverage_long: pd.DataFrame) -> pd.DataFrame:
     grid = coverage_long.assign(
         mark=lambda d: d["present"].map({True: "x", False: "-"})
     ).pivot_table(
-        index="variant",
+        index=["variant", "eval_tiling"],
         columns=["platform", "scheme"],
         values="mark",
         aggfunc="first",
@@ -946,7 +1680,7 @@ def plot_coverage(coverage_long: pd.DataFrame):
     from matplotlib.colors import ListedColormap
 
     grid = coverage_long.pivot_table(
-        index="variant",
+        index=["variant", "eval_tiling"],
         columns=["platform", "scheme"],
         values="present",
         aggfunc="first",
