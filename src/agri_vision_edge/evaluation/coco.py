@@ -6,6 +6,10 @@ from pathlib import Path
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
+from .integrity import (
+    CorruptPredictionsError,
+    check_predictions,
+)
 from .partials import (
     DEFAULT_PARTIAL_THRESHOLD,
     filter_predictions_against_partials,
@@ -107,6 +111,7 @@ def evaluate_predictions(
     predictions_path: str | Path,
     ignore_partials: bool = False,
     partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
+    allow_corrupt: bool = False,
 ) -> dict:
     """
     Evaluate a COCO predictions file.
@@ -139,6 +144,15 @@ def evaluate_predictions(
         metrics["per_class"] = {}
 
         return metrics
+
+    # Non-finite boxes make pycocotools match every detection at every IoU
+    # threshold, which yields a high AP (with AP == AP50) instead of an error.
+    # Refuse before that number can be written to metrics.json.
+    check_predictions(
+        predictions,
+        source=predictions_path,
+        strict=not allow_corrupt,
+    )
 
     with open(annotations_path) as f:
         gt_dataset = json.load(f)
@@ -213,6 +227,7 @@ def evaluate_model_dir(
     annotations_path: Path,
     ignore_partials: bool = False,
     partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
+    allow_corrupt: bool = False,
 ):
     """
     Evaluate one benchmark directory.
@@ -244,12 +259,28 @@ def evaluate_model_dir(
 
     print(f"\n=== Evaluating: {model_dir.name} ===")
 
-    metrics = evaluate_predictions(
-        annotations_path,
-        predictions_path,
-        ignore_partials=ignore_partials,
-        partial_threshold=partial_threshold,
-    )
+    try:
+        metrics = evaluate_predictions(
+            annotations_path,
+            predictions_path,
+            ignore_partials=ignore_partials,
+            partial_threshold=partial_threshold,
+            allow_corrupt=allow_corrupt,
+        )
+    except CorruptPredictionsError as exc:
+        # Skip loudly rather than abort the sweep -- but do NOT write metrics,
+        # and drop any stale metrics.json so a corrupt run cannot keep passing
+        # itself off as evaluated in the results tree.
+        print(f"[skip] {model_dir.name}: {exc}")
+
+        metrics_path.unlink(missing_ok=True)
+
+        save_metrics(
+            {"status": "corrupt_predictions", "message": str(exc)},
+            model_dir / "metrics_invalid.json",
+        )
+
+        return False
 
     save_metrics(
         metrics,
