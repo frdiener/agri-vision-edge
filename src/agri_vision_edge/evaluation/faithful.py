@@ -32,6 +32,11 @@ Notes
   is internally consistent but is NOT the official full-frame leaderboard
   number (that requires stitching tile predictions back to 1024 frames first).
   A warning is emitted when the image size is not 1024.
+* Tiled ground truth must have been cut with the **same grid** as the exported
+  annotations. Different grids share the tile size and the ``_tile<N>`` names,
+  so a mismatch resolves every mask and scores against the wrong crops instead
+  of failing; :func:`check_tiling_consistency` compares the annotations' tile
+  count against the grid the tree recorded in ``tiling_config.json``.
 * Prediction labels are remapped from our COCO ``category_id`` to the upstream
   semantic ids (``1`` crop, ``2`` weed) *by category name*. The multi-class
   bundle happens to agree numerically, but the single-class (weed-only) bundle
@@ -49,17 +54,30 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
 
+from .integrity import check_predictions
+
 # Mask sub-directories the upstream evaluator reads per split.
 _GT_SUBDIRS = ("plant_instances", "semantics", "plant_visibility")
+
+#: Trailing ``_tile<N>`` marker that ``TiledPhenoBench`` / the materialized
+#: tiled tree append to every tile's file name.
+_TILE_SUFFIX = re.compile(r"_tile(\d+)$")
 
 #: Semantic label ids used by the upstream PhenoBench ground truth, in the class
 #: order its ``mAP_cls`` list follows.
 UPSTREAM_LABELS = {"crop": 1, "weed": 2}
 UPSTREAM_CLASS_NAMES = ["crop", "weed"]
+
+#: PhenoBench semantic ids for *partial* plants. The upstream evaluator's
+#: ``cvt_gt_to_bbox_map`` reads instance labels straight out of ``semantics``
+#: and never calls its own ``convert_partial_semantics`` helper, so these leak
+#: into the ground truth as two extra "classes" that no model can predict.
+UPSTREAM_PARTIAL_LABELS = {3: "partial-crop", 4: "partial-weed"}
 
 
 def _require_upstream():
@@ -165,6 +183,170 @@ def coco_predictions_to_yolo_lines(
         lines.append(f"{label} {cx} {cy} {nw} {nh} {score}")
 
     return lines
+
+
+def annotation_tile_indices(image_index: dict[int, dict]) -> set[int] | None:
+    """
+    The ``_tile<N>`` indices used by the annotations, or ``None`` if untiled.
+
+    Returns ``None`` as soon as any file name lacks the marker -- a mixed set is
+    not a tiled bundle.
+    """
+
+    indices: set[int] = set()
+
+    for info in image_index.values():
+        match = _TILE_SUFFIX.search(Path(info["file_name"]).stem)
+
+        if match is None:
+            return None
+
+        indices.add(int(match.group(1)))
+
+    return indices
+
+
+def check_tiling_consistency(
+    image_index: dict[int, dict],
+    phenobench_dir: Path,
+) -> None:
+    """
+    Refuse a ground-truth tree cut with a different grid than the annotations.
+
+    This is the one mismatch staging cannot catch. Grids share the tile *size*
+    (2x2 and 3x3-with-half-overlap both yield 512 px tiles on a 1024 frame) and
+    the name space (``_tile0..``), so 2x2 annotations pointed at a 3x3 tree
+    resolve every mask and score against the **wrong crops** -- silently, with
+    plausible-looking numbers. Only the tile *count* separates them, so compare
+    that against the grid the tree recorded in ``tiling_config.json``.
+
+    No-ops for trees without a recorded geometry (legacy) -- there is nothing to
+    compare against, and the missing-mask error in :func:`_stage` still catches
+    the case where the names do not exist at all.
+    """
+
+    # Imported here, not at module scope: `agri_vision_edge.data` pulls in
+    # TensorFlow, and this module is meant to stay importable without it.
+    from ..data.raw_tiling import read_tiling_config
+
+    config = read_tiling_config(phenobench_dir)
+
+    if config is None:
+        return
+
+    indices = annotation_tile_indices(image_index)
+
+    if indices is None:
+        raise ValueError(
+            f"{phenobench_dir} is a tiled ground-truth tree "
+            f"({config.rows}x{config.cols}, overlap {config.overlap}) but the "
+            "annotations are full-frame (no '_tile<N>' names). Point "
+            "--phenobench-dir at the untiled raw dataset instead."
+        )
+
+    expected = config.tiles_per_image
+    found = max(indices) + 1
+
+    if found != expected:
+        raise ValueError(
+            f"Tiling mismatch: the annotations use {found} tiles per frame "
+            f"(indices up to _tile{max(indices)}) but {phenobench_dir} was cut "
+            f"{config.rows}x{config.cols} with overlap {config.overlap} "
+            f"= {expected} tiles per frame. Both grids produce the same tile "
+            "size and the same '_tile<N>' names, so evaluating across them "
+            "would silently score against the wrong crops. Re-materialize the "
+            "tiled dataset with the geometry recorded in the exported bundle's "
+            "dataset_metadata.json (see scripts/materialize_raw_tiled.py)."
+        )
+
+
+def annotate_class_metrics(
+    results: dict,
+    predicted_classes: list[str],
+    images_without_predictions: int,
+) -> dict:
+    """
+    Make upstream's ``mAP`` / ``mAP_cls`` readable, and flag when it is diluted.
+
+    Upstream builds its metric with ``MeanAveragePrecision(class_metrics=True)``
+    and reports ``mAP`` as the **unweighted mean over whichever classes appear**
+    in the union of ground truth and predictions. Two upstream quirks make that
+    set vary between runs of the *same* model family:
+
+    1. ``cvt_gt_to_bbox_map`` labels each instance with its raw ``semantics``
+       value and never applies ``convert_partial_semantics``, so PhenoBench's
+       partial ids ``3`` / ``4`` survive as extra classes.
+    2. ``filter_partials_boxes`` nests its ground-truth removal loop *inside*
+       the per-prediction loop, so an image with **zero** predictions keeps all
+       of its partial ground truth -- and with it those extra classes.
+
+    Together they mean a model that misses whole images is penalised twice: once
+    for the misses, and again because each extra class contributes ``0`` to the
+    average. Measured on the i.MX8MP sweep, the number of extra classes tracked
+    the count of prediction-less images exactly (0 -> 2 classes, a handful -> 3,
+    hundreds -> 4).
+
+    ``mAP_cls`` is ordered by ascending label id and crop (``1``) / weed (``2``)
+    are always present in the PhenoBench ground truth, so entries ``0`` and
+    ``1`` are always crop and weed and anything beyond them is a partial class.
+    This adds:
+
+    * ``ap_per_class`` -- ``{"crop": ..., "weed": ...}``.
+    * ``ap_partial_classes`` -- the phantom entries, if any.
+    * ``mAP_plants`` -- the comparable aggregate: the mean over the classes this
+      model can actually emit (crop + weed for multi-class, weed alone for a
+      weed-only model). This is what lines up with the pycocotools ``AP``.
+    * ``upstream_class_count`` / ``images_without_predictions`` -- the evidence
+      for how much ``mAP`` was diluted.
+    """
+
+    per_class = list(results.get("mAP_cls") or [])
+
+    plant_scores = per_class[: len(UPSTREAM_CLASS_NAMES)]
+
+    ap_per_class = dict(
+        zip(UPSTREAM_CLASS_NAMES, plant_scores, strict=False)
+    )
+
+    partial_scores = per_class[len(UPSTREAM_CLASS_NAMES):]
+
+    comparable = [
+        ap_per_class[name]
+        for name in predicted_classes
+        if name in ap_per_class
+    ]
+
+    results["ap_per_class"] = ap_per_class
+    results["ap_partial_classes"] = partial_scores
+    results["mAP_plants"] = (
+        round(sum(comparable) / len(comparable), 2) if comparable else None
+    )
+    results["upstream_class_count"] = len(per_class)
+    results["images_without_predictions"] = images_without_predictions
+
+    # `class_names` used to claim ["crop", "weed"] unconditionally, which is
+    # wrong whenever the partial classes leak in -- keep it describing what
+    # `mAP_cls` actually holds.
+    results["class_names"] = UPSTREAM_CLASS_NAMES[: len(per_class)] + [
+        UPSTREAM_PARTIAL_LABELS.get(3 + i, f"extra-{i}")
+        for i in range(max(0, len(per_class) - len(UPSTREAM_CLASS_NAMES)))
+    ]
+    results["predicted_classes"] = predicted_classes
+
+    if partial_scores:
+        print(
+            "[faithful] upstream scored "
+            f"{len(per_class)} classes, not {len(UPSTREAM_CLASS_NAMES)}: "
+            "PhenoBench's partial semantic ids (3/4) leaked into the ground "
+            f"truth for the {images_without_predictions} evaluated image(s) "
+            "that got no predictions (upstream's partial filter only runs when "
+            "an image has at least one prediction). They can never be "
+            "predicted, so each drags the reported 'mAP' toward 0 -- use "
+            "'mAP_plants' for a comparable number.",
+            file=sys.stderr,
+        )
+
+    return results
 
 
 def _detect_image_size(image_index: dict[int, dict]) -> tuple[int, int]:
@@ -320,6 +502,7 @@ def evaluate_faithful(
     predictions_path: str | Path,
     phenobench_dir: str | Path,
     split: str = "val",
+    allow_corrupt: bool = False,
 ) -> dict:
     """
     Run the official PhenoBench plant-detection evaluation on our predictions.
@@ -340,18 +523,25 @@ def evaluate_faithful(
         tiled evaluation this is the tiled raw dataset (512 tiles).
     split:
         Which split the predictions correspond to (``val`` by default).
+    allow_corrupt:
+        Score predictions containing non-finite boxes / out-of-range scores
+        instead of refusing them. The result is meaningless; see
+        :mod:`agri_vision_edge.evaluation.integrity`.
 
     Returns
     -------
     dict
         The upstream ``eval_results`` (``mAP`` / ``mAP_50`` / ``mAP_75`` and
-        per-class ``mAP_cls``), as torchmetrics percentages, annotated with
-        ``class_names`` (the class order of ``mAP_cls``) and
-        ``predicted_classes`` (the classes this model can actually emit). For a
-        weed-only model the latter is ``["weed"]`` and ``mAP`` is *not* the
-        comparable number -- upstream averages it over both ground-truth
-        classes, so the never-predicted crop class drags it to roughly half the
-        weed AP.
+        per-class ``mAP_cls``) as torchmetrics percentages, annotated by
+        :func:`annotate_class_metrics`.
+
+        **Read ``mAP_plants``, not ``mAP``.** Upstream's ``mAP`` is an
+        unweighted mean over every class it happened to score, which includes
+        classes this model cannot emit (``crop`` for a weed-only model) and
+        PhenoBench's partial semantic ids when its partial filter did not run
+        (see :func:`annotate_class_metrics`). ``mAP_plants`` averages only the
+        classes in ``predicted_classes`` and is what lines up with the
+        pycocotools ``AP`` in ``metrics.json``.
     """
 
     evaluate_plant_detection = _require_upstream()
@@ -368,6 +558,24 @@ def evaluate_faithful(
         for name in UPSTREAM_CLASS_NAMES
         if UPSTREAM_LABELS[name] in set(label_map.values())
     ]
+
+    check_tiling_consistency(image_index, phenobench_dir)
+
+    with open(predictions_path) as f:
+        predictions = json.load(f)
+
+    check_predictions(
+        predictions,
+        source=predictions_path,
+        strict=not allow_corrupt,
+    )
+
+    # Upstream's partial filter only removes partial ground truth on images that
+    # have at least one prediction, so the count of prediction-less images
+    # explains any phantom classes in `mAP_cls` (see annotate_class_metrics).
+    images_without_predictions = len(image_index) - len(
+        {int(p["image_id"]) for p in predictions}
+    )
 
     width, height = _detect_image_size(image_index)
 
@@ -407,19 +615,24 @@ def evaluate_faithful(
     finally:
         restore()
 
-    # `mAP_cls` is a bare list; without the class order it cannot be read back
-    # unambiguously, and without `predicted_classes` a weed-only model's halved
-    # `mAP` looks like a genuine (catastrophic) result.
-    results["class_names"] = list(UPSTREAM_CLASS_NAMES)
-    results["predicted_classes"] = predicted_classes
-
-    return results
+    # `mAP_cls` is a bare list whose length varies with the run; without the
+    # class order it cannot be read back unambiguously, and the bare `mAP` is
+    # not comparable to anything.
+    return annotate_class_metrics(
+        results,
+        predicted_classes,
+        images_without_predictions,
+    )
 
 
 __all__ = [
+    "annotate_class_metrics",
+    "annotation_tile_indices",
+    "check_tiling_consistency",
     "coco_predictions_to_yolo_lines",
     "evaluate_faithful",
     "upstream_label_map",
     "UPSTREAM_CLASS_NAMES",
     "UPSTREAM_LABELS",
+    "UPSTREAM_PARTIAL_LABELS",
 ]

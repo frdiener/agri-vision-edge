@@ -286,8 +286,17 @@ def _faithful_fields(faithful: dict | None, *, classes: str | None) -> dict:
     ``class_names`` -- for older ones the upstream ``[crop, weed]`` order is
     assumed.
 
-    Single-class runs need two caveats, both flagged rather than silently
-    averaged away:
+    ``faithful_mAP`` is upstream's own aggregate and is **not** comparable
+    across runs: it is the unweighted mean over whichever classes upstream
+    happened to score, which includes classes the model cannot predict (``crop``
+    for a weed-only model) and PhenoBench's partial semantic ids when upstream's
+    partial filter did not run. Prefer ``faithful_mAP_plants``, which averages
+    only the predictable classes and lines up with the pycocotools ``AP`` to
+    within ~0.6 AP -- see
+    :func:`agri_vision_edge.evaluation.faithful.annotate_class_metrics`.
+
+    Single-class runs need two further caveats, both flagged rather than
+    silently averaged away:
 
     * ``faithful_mAP`` averages over crop and weed, so a weed-only model is
       penalised for a class it cannot predict -- ``faithful_weed_AP`` is the
@@ -307,6 +316,12 @@ def _faithful_fields(faithful: dict | None, *, classes: str | None) -> dict:
         "faithful_mAP": _pct(faithful.get("mAP")),
         "faithful_mAP50": _pct(faithful.get("mAP_50")),
         "faithful_mAP75": _pct(faithful.get("mAP_75")),
+        # The comparable aggregate (newer artifacts only).
+        "faithful_mAP_plants": _pct(faithful.get("mAP_plants")),
+        "faithful_upstream_classes": faithful.get("upstream_class_count"),
+        "faithful_images_without_predictions": faithful.get(
+            "images_without_predictions"
+        ),
     }
 
     for name, value in zip(names, per_class, strict=False):
@@ -369,7 +384,14 @@ def load_benchmark_results(
 
             metrics = _read_json(run_dir / "metrics.json")
             if metrics is None:
-                skipped.append(f"{tag} (no metrics)")
+                # A run whose predictions failed the integrity check has its
+                # metrics.json removed and a metrics_invalid.json left behind.
+                # Say so, otherwise it is indistinguishable from a run that was
+                # simply never evaluated.
+                if (run_dir / "metrics_invalid.json").exists():
+                    skipped.append(f"{tag} (corrupt predictions)")
+                else:
+                    skipped.append(f"{tag} (no metrics)")
                 continue
 
             info = parse_run_name(run_dir.name)
