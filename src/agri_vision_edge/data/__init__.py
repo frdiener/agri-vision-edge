@@ -32,6 +32,11 @@ from .preprocessing import (
     resize_image_and_boxes,
     split_indices,
 )
+from .raw_tiling import (
+    materialize_tiled_dataset,
+    read_tiling_config,
+    tile_name,
+)
 from .rep_dataset import (
     build_rep_indices,
     normalized_representative_dataset,
@@ -65,4 +70,7 @@ __all__ = [
     "normalized_representative_dataset",
     "build_rep_indices",
     "write_label_map",
+    "materialize_tiled_dataset",
+    "read_tiling_config",
+    "tile_name",
 ]

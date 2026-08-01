@@ -8,6 +8,50 @@ app = marimo.App(width="medium")
 def _():
     import marimo as mo
 
+    mo.md(
+        r"""
+        # Dataset Conversion
+
+        Local counterpart of the Kaggle export notebooks
+        `01`–`04_export_{mc,sc}_phenobench[-tiled]_no-partials.ipynb`.
+        **Those notebooks are authoritative** — training runs on their output —
+        so the defaults here mirror them and any change there has to be mirrored
+        back into this notebook.
+
+        Two bundle types:
+
+        * **Prepared Dataset** — TFRecords + COCO annotations + label map +
+          representative-dataset indices, i.e. `datasets/phenobench_*_no-partials`.
+        * **Source Dataset** — a second *raw* PhenoBench tree cut into tiles,
+          i.e. `datasets/phenobench_raw_tiled`. Nothing trains on it; it exists
+          because `ave benchmark` needs tile **images** on disk and
+          `ave evaluate --faithful` needs tile **masks** on disk. Both join it to
+          the prepared bundle *by file name*, so its grid must match the prepared
+          bundle's — see the warning under "Tiling".
+
+        ## Partial (do-not-care) plants
+
+        Per the upstream PhenoBench protocol, a plant with visibility
+        `<= partial_threshold` is *partial*. Since the preprocessing overhaul it
+        is no longer dropped at load time (`ignore_partial`); instead it is
+        **tagged** and the policy is applied per artifact:
+
+        | artifact | partials |
+        |---|---|
+        | `train.record`, `train_annotations.json` | dropped (`include_partials=False`) |
+        | `val` / `test` / `true_eval` records + annotations | kept, flagged `ignore` / `is_partial` (`include_partials=True`) |
+
+        For tiled bundles the criterion is the plant's *effective* visibility —
+        upstream frame visibility × the fraction surviving the tile cut — so a
+        plant sliced by a tile border is treated exactly like an
+        originally-partial one.
+        """
+    )
+    return (mo,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
     dataset = mo.ui.dropdown(
         options={"PhenoBench": "phenobench"},
         value="PhenoBench",
@@ -29,25 +73,41 @@ def _():
         value="Single-class",
     )
 
+    # Defaults are the geometry of notebooks 03/04: a 3x3 grid with half-tile
+    # overlap, which on a 1024 frame yields uniform 512 px tiles (same tile size
+    # as the old 2x2 grid, but tile-boundary plants are recovered by the
+    # overlap).
     tile_rows = mo.ui.number(
         start=1,
         stop=10,
-        value=2,
+        value=3,
         label="Tile rows",
     )
 
     tile_cols = mo.ui.number(
         start=1,
         stop=10,
-        value=2,
+        value=3,
         label="Tile columns",
     )
 
+    # FRACTION of the tile size, not pixels: `compute_tiles` solves
+    # tile = width / ((cols - 1) * (1 - overlap) + 1) and requires [0, 1).
     tile_overlap = mo.ui.number(
-        start=0,
-        stop=512,
-        value=0,
-        label="Tile overlap (pixels)",
+        start=0.0,
+        stop=0.95,
+        step=0.05,
+        value=0.5,
+        label="Tile overlap (fraction of tile size)",
+    )
+
+    # Upstream do-not-care criterion: effective visibility <= this ratio.
+    partial_threshold = mo.ui.number(
+        start=0.0,
+        stop=1.0,
+        step=0.05,
+        value=0.5,
+        label="Partial (do-not-care) visibility threshold",
     )
 
     resolution = mo.ui.dropdown(
@@ -60,7 +120,7 @@ def _():
         bundle_type,
         dataset,
         label_mode,
-        mo,
+        partial_threshold,
         resize,
         resolution,
         run,
@@ -72,24 +132,12 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(mo, tiling):
-    # Drop PhenoBench's partial (border) plants? True matches the official
-    # PhenoBench bbox protocol (its evaluator filters partials) and the Kaggle
-    # tiled bundles. Default tracks tiling: on for tiled, off otherwise.
-    ignore_partial = mo.ui.checkbox(
-        value=tiling.value,
-        label="Ignore partial (border) plants",
-    )
-    return (ignore_partial,)
-
-
-@app.cell(hide_code=True)
 def _(
     bundle_type,
     dataset,
-    ignore_partial,
     label_mode,
     mo,
+    partial_threshold,
     resize,
     resolution,
     run,
@@ -98,6 +146,8 @@ def _(
     tile_rows,
     tiling,
 ):
+    prepared = bundle_type.value == "Prepared Dataset"
+
     label_section = (
         mo.vstack(
             [
@@ -105,7 +155,7 @@ def _(
                 label_mode,
             ]
         )
-        if bundle_type.value == "Prepared Dataset"
+        if prepared
         else mo.md("")
     )
 
@@ -116,9 +166,31 @@ def _(
                 tile_rows,
                 tile_cols,
                 tile_overlap,
+                mo.callout(
+                    mo.md(
+                        "A materialized tiled tree and a prepared bundle are "
+                        "joined **by file name** (`{stem}_tile{i}.png`). A 2x2 "
+                        "and a 3x3 tree share `_tile0..3` while those denote "
+                        "*different crops*, so a mismatched grid evaluates "
+                        "against the wrong ground truth **without raising**. "
+                        "Keep this identical to notebooks `03`/`04`."
+                    ),
+                    kind="warn",
+                ),
             ]
         )
         if tiling.value
+        else mo.md("")
+    )
+
+    partial_section = (
+        mo.vstack(
+            [
+                mo.md("### Partials"),
+                partial_threshold,
+            ]
+        )
+        if prepared
         else mo.md("")
     )
 
@@ -127,6 +199,16 @@ def _(
             [
                 mo.md("### Target Resolution"),
                 resolution,
+                mo.callout(
+                    mo.md(
+                        "Notebooks `01`–`04` store images at their **native** "
+                        "resolution (1024 frames / 512 tiles) and let the "
+                        "trainer's `fixed_shape_resizer` downsize at runtime, "
+                        "so TFOD's crop/zoom augmentations still see full "
+                        "detail. Leave this off to match them."
+                    ),
+                    kind="warn",
+                ),
             ]
         )
         if resize.value
@@ -140,23 +222,22 @@ def _(
     |----------|----------|
     | Dataset | {dataset.value} |
     | Bundle | {bundle_type.value} |
-    | Labels | {label_mode.value if bundle_type.value == "Prepared Dataset" else "N/A"} |
-    | Tiling | {"Enabled" if tiling.value else "Disabled"} |
-    | Ignore partials | {ignore_partial.value} |
-    | Resize | {"Enabled" if resize.value else "Disabled"} |
+    | Labels | {label_mode.value if prepared else "N/A"} |
+    | Tiling | {f"{tile_rows.value}x{tile_cols.value} @ overlap {tile_overlap.value}" if tiling.value else "Disabled"} |
+    | Partial threshold | {partial_threshold.value if prepared else "N/A"} |
+    | Resize | {resolution.value if resize.value else "Native resolution"} |
     """)
 
     mo.hstack(
         [
             mo.vstack(
                 [
-                    mo.md("# Dataset Conversion"),
                     dataset,
                     bundle_type,
                     label_section,
                     tiling,
                     tiling_section,
-                    ignore_partial,
+                    partial_section,
                     resize,
                     resolution_section,
                 ]
@@ -177,8 +258,9 @@ def _(
 def _(
     bundle_type,
     dataset,
-    ignore_partial,
     label_mode,
+    mo,
+    partial_threshold,
     resize,
     resolution,
     run,
@@ -189,57 +271,52 @@ def _(
 ):
     from pprint import pprint
 
-    if run.value:
-        config = {
-            "dataset": dataset.value,
-            "bundle_type": bundle_type.value,
-            "label_mode": (
-                label_mode.value if bundle_type.value == "Prepared Dataset" else None
-            ),
-            "tiling": tiling.value,
-            "tile_rows": tile_rows.value if tiling.value else None,
-            "tile_cols": tile_cols.value if tiling.value else None,
-            "tile_overlap": tile_overlap.value if tiling.value else None,
-            "ignore_partial": ignore_partial.value,
-            "resize": resize.value,
-            "resolution": resolution.value if resize.value else None,
-        }
+    mo.stop(not run.value, mo.md("Press **Generate Dataset** to start."))
 
-        pprint(config)
+    config = {
+        "dataset": dataset.value,
+        "bundle_type": bundle_type.value,
+        "label_mode": (
+            label_mode.value if bundle_type.value == "Prepared Dataset" else None
+        ),
+        "tiling": tiling.value,
+        "tile_rows": tile_rows.value if tiling.value else None,
+        "tile_cols": tile_cols.value if tiling.value else None,
+        # Fraction of the tile size, see `compute_tiles`.
+        "tile_overlap": float(tile_overlap.value) if tiling.value else None,
+        "partial_threshold": float(partial_threshold.value),
+        "resize": resize.value,
+        "resolution": int(resolution.value) if resize.value else None,
+    }
+
+    pprint(config)
     return (config,)
 
 
 @app.cell
 def _(config):
-    from pathlib import Path
     import json
-
-    import numpy as np
-    from PIL import Image
-    from tqdm.auto import tqdm
+    from pathlib import Path
 
     from phenobench import PhenoBench
+    from tqdm.auto import tqdm
 
-    from agri_vision_edge.data.tiling import (
-        TiledPhenoBench,
-        compute_tiles,
-        crop_array,
-    )
     from agri_vision_edge.data import (
         PHENOBENCH_MULTICLASS,
         PHENOBENCH_WEED_ONLY,
-        split_indices,
         build_record,
         build_rep_indices,
-        write_label_map,
         export_coco_annotations,
+        split_indices,
+        write_label_map,
     )
+    from agri_vision_edge.data.plant_boxes import PartialAwarePhenoBench
+    from agri_vision_edge.data.raw_tiling import materialize_tiled_dataset
+    from agri_vision_edge.data.tiling import TiledPhenoBench
 
     SEED = 42
 
-    IMAGE_SIZE = (
-        config["resolution"] if config["resize"] else 512 if config["tiling"] else 1024
-    )
+    PREPARED = config["bundle_type"] == "Prepared Dataset"
 
     DATASET_DEFINITION = (
         PHENOBENCH_MULTICLASS if config["label_mode"] == "mc" else PHENOBENCH_WEED_ONLY
@@ -247,46 +324,52 @@ def _(config):
 
     SOURCE_ROOT = Path("datasets") / (config["dataset"] + "_raw_full")
 
-    DEST_ROOT = Path("datasets") / (
-        config["dataset"]
-        + "_"
-        + (
-            config["label_mode"] + "_tiled"
-            if config["tiling"] and config["bundle_type"] == "Prepared Dataset"
-            else "raw_tiled"
-            if ["tiling"]
-            else f"raw_{config['resolution']}"
-            if config["resize"]
-            else "raw_full"
+    if PREPARED:
+        # Matches the Kaggle bundles the trainer/converter look for:
+        # phenobench_{sc,mc}[_tiled]_no-partials.
+        _suffix = (
+            config["label_mode"]
+            + ("_tiled" if config["tiling"] else "")
+            + "_no-partials"
         )
-    )
+    elif config["tiling"]:
+        _suffix = "raw_tiled"
+    else:
+        # A "Source Dataset" bundle is only ever a re-cut of the raw tree; with
+        # tiling off there is nothing to produce (SOURCE_ROOT already is it).
+        raise ValueError(
+            "Source Dataset export needs tiling enabled — without it the "
+            f"result would be a copy of {SOURCE_ROOT}."
+        )
+
+    DEST_ROOT = Path("datasets") / (config["dataset"] + "_" + _suffix)
 
     if DEST_ROOT.exists():
         raise FileExistsError(
             f"Destination path {DEST_ROOT} already exists. "
-            "Please remove it before running the export."
+            "Please remove or rename it before running the export."
         )
 
-    assert SOURCE_ROOT.exists()
+    assert SOURCE_ROOT.exists(), f"Missing source dataset: {SOURCE_ROOT}"
+
     DEST_ROOT.mkdir(parents=True)
-    DEST_ROOT
+
+    DEST_ROOT  # noqa: B018 -- bare expression = this marimo cell's rendered output
     return (
         DATASET_DEFINITION,
         DEST_ROOT,
-        IMAGE_SIZE,
-        Image,
+        PREPARED,
         Path,
+        PartialAwarePhenoBench,
         PhenoBench,
         SEED,
         SOURCE_ROOT,
         TiledPhenoBench,
         build_record,
         build_rep_indices,
-        compute_tiles,
-        crop_array,
         export_coco_annotations,
         json,
-        np,
+        materialize_tiled_dataset,
         split_indices,
         tqdm,
         write_label_map,
@@ -294,154 +377,83 @@ def _(config):
 
 
 @app.cell
-def _(
-    DEST_ROOT,
-    Image,
-    Path,
-    SOURCE_ROOT,
-    compute_tiles,
-    config,
-    crop_array,
-    json,
-    np,
-    tqdm,
-):
-    TARGET_DIRS = [
-        "images",
-        "semantics",
-        "plant_instances",
-        "leaf_instances",
-        "plant_visibility",
-        "leaf_visibility",
-    ]
+def _(DEST_ROOT, PREPARED, SOURCE_ROOT, config, materialize_tiled_dataset, tqdm):
+    # --- Source Dataset: materialize the tiled RAW tree ------------------------
+    #
+    # Cuts every split/sub-directory of SOURCE_ROOT with the same
+    # `compute_tiles` geometry the in-memory `TiledPhenoBench` uses, and names
+    # the tiles `{stem}_tile{i}.png` starting at i=0 exactly like that wrapper —
+    # which is what makes the prepared bundle's annotations resolve against
+    # these files. The grid is recorded in `tiling_config.json`.
+    tiling_stats = None
 
-    def tile_file(
-        src: Path,
-        dst_dir: Path,
-    ):
-        array = np.array(Image.open(src))
-
-        h, w = array.shape[:2]
-
-        tiles = compute_tiles(
-            width=w,
-            height=h,
+    if not PREPARED:
+        tiling_stats = materialize_tiled_dataset(
+            SOURCE_ROOT,
+            DEST_ROOT,
             rows=config["tile_rows"],
             cols=config["tile_cols"],
             overlap=config["tile_overlap"],
+            workers=None,
+            progress=lambda iterable, desc="": tqdm(iterable, desc=desc),
+            exist_ok=True,
         )
 
-        for tile_idx, tile in enumerate(
-            tiles,
-            start=1,
-        ):
-            tile_array = crop_array(
-                array,
-                tile,
-            )
-
-            out_path = dst_dir / f"{src.stem}_tile{tile_idx}{src.suffix}"
-
-            Image.fromarray(tile_array).save(out_path)
-
-    if config["tiling"] and config["bundle_type"] == "Source Dataset":
-        for split in [
-            "train",
-            "val",
-            "test",
-        ]:
-            print(f"Processing {split}...")
-
-            image_dir = SOURCE_ROOT / split / "images"
-
-            filenames = sorted(image_dir.glob("*.png"))
-
-            for filename in tqdm(
-                filenames,
-                desc=split,
-            ):
-                for target_dir in TARGET_DIRS:
-                    src = SOURCE_ROOT / split / target_dir / filename.name
-
-                    if not src.exists():
-                        continue
-
-                    dst_dir = DEST_ROOT / split / target_dir
-
-                    dst_dir.mkdir(
-                        parents=True,
-                        exist_ok=True,
-                    )
-
-                    tile_file(
-                        src,
-                        dst_dir,
-                    )
-
-        print("Done.")
-
-        json.dump(
-            {
-                "rows": config["tile_rows"],
-                "cols": config["tile_cols"],
-                "overlap": config["tile_overlap"],
-                "source_dataset": str(SOURCE_ROOT),
-            },
-            (DEST_ROOT / "tiling_config.json").open("w"),
-            indent=2,
-        )
+    tiling_stats  # noqa: B018 -- bare expression = this marimo cell's rendered output
     return
 
 
 @app.cell
-def _(PhenoBench, SOURCE_ROOT, TiledPhenoBench, config, mo):
+def _(
+    PREPARED,
+    PartialAwarePhenoBench,
+    PhenoBench,
+    SOURCE_ROOT,
+    TiledPhenoBench,
+    config,
+    mo,
+):
     mo.stop(
-        config["bundle_type"] == "Source Dataset",
+        not PREPARED,
         mo.md(
-            "Further cells will be executed only if "
-            "'Prepared Dataset' bundle type is selected."
+            "**Source Dataset** bundle complete — the remaining cells build a "
+            "*Prepared Dataset* (TFRecords / COCO) and are skipped."
         ),
     )
 
-    train_dataset = PhenoBench(
-        root=SOURCE_ROOT,
-        split="train",
-        target_types=[
-            "semantics",
-            "plant_instances",
-        ],
-        ignore_partial=config["ignore_partial"],
-    )
-
-    val_dataset = PhenoBench(
-        root=SOURCE_ROOT,
-        split="val",
-        target_types=[
-            "semantics",
-            "plant_instances",
-        ],
-        ignore_partial=config["ignore_partial"],
-    )
-
-    if config["tiling"]:
-        # Match the export notebooks (03/04): 3x3 tiles with 0.5 overlap.
-        # Partial (do-not-care) plants -- including tile-border fragments --
-        # are tagged via partial_threshold instead of being size-filtered out.
-        train_dataset = TiledPhenoBench(
-            train_dataset,
-            rows=3,
-            cols=3,
-            overlap=0.5,
-            partial_threshold=0.5,
+    def _raw(split):
+        # `ignore_partial=False`: partials are NOT dropped at load time any
+        # more. They are tagged below and filtered per artifact via
+        # `include_partials`, which is what lets the eval records carry them as
+        # do-not-care. `plant_visibility` is the upstream partiality source.
+        return PhenoBench(
+            root=SOURCE_ROOT,
+            split=split,
+            target_types=[
+                "semantics",
+                "plant_instances",
+                "plant_visibility",
+            ],
+            ignore_partial=False,
         )
 
-        val_dataset = TiledPhenoBench(
-            val_dataset,
-            rows=3,
-            cols=3,
-            overlap=0.5,
-            partial_threshold=0.5,
+    def _wrap(raw):
+        if config["tiling"]:
+            return TiledPhenoBench(
+                raw,
+                rows=config["tile_rows"],
+                cols=config["tile_cols"],
+                overlap=config["tile_overlap"],
+                partial_threshold=config["partial_threshold"],
+            )
+
+        return PartialAwarePhenoBench(
+            raw,
+            partial_threshold=config["partial_threshold"],
         )
+
+    train_dataset = _wrap(_raw("train"))
+    val_dataset = _wrap(_raw("val"))
 
     print("Train samples:", len(train_dataset))
     print("Validation samples:", len(val_dataset))
@@ -449,7 +461,29 @@ def _(PhenoBench, SOURCE_ROOT, TiledPhenoBench, config, mo):
 
 
 @app.cell
+def _(config, train_dataset):
+    # Native resolution unless explicitly resized: 1024 for full frames, the
+    # actual tile size for tiled bundles (derived from the computed grid rather
+    # than assumed, so a non-default grid stays correct).
+    if config["resize"]:
+        IMAGE_SIZE = config["resolution"]
+    elif config["tiling"]:
+        _tile = train_dataset.tiles[0]
+        assert _tile.width == _tile.height, (
+            f"Non-square tile {_tile.width}x{_tile.height}: the exporter "
+            "resizes each tile to a square, which would distort it."
+        )
+        IMAGE_SIZE = _tile.width
+    else:
+        IMAGE_SIZE = 1024
+
+    print("Image size:", IMAGE_SIZE)
+    return (IMAGE_SIZE,)
+
+
+@app.cell
 def _(DEST_ROOT, SEED, json, split_indices, val_dataset):
+    # The official val split is halved into val + held-out test (deterministic).
     val_idx, test_idx = split_indices(
         len(val_dataset),
         val_ratio=0.5,
@@ -485,6 +519,7 @@ def _(
         dataset_definition=DATASET_DEFINITION,
         target_size=IMAGE_SIZE,
         skip_negatives=False,
+        include_partials=False,  # do not train on partials
     )
 
     true_eval_stats = build_record(
@@ -493,6 +528,7 @@ def _(
         dataset_definition=DATASET_DEFINITION,
         target_size=IMAGE_SIZE,
         skip_negatives=False,
+        include_partials=True,  # flag partials as do-not-care
     )
 
     val_stats = build_record(
@@ -502,6 +538,7 @@ def _(
         indices=val_idx,
         target_size=IMAGE_SIZE,
         skip_negatives=False,
+        include_partials=True,
     )
 
     test_stats = build_record(
@@ -511,6 +548,7 @@ def _(
         indices=test_idx,
         target_size=IMAGE_SIZE,
         skip_negatives=False,
+        include_partials=True,
     )
     return test_stats, train_stats, true_eval_stats, val_stats
 
@@ -525,16 +563,19 @@ def _(
     val_dataset,
     val_idx,
 ):
+    # Consumed by `ave evaluate` (`--ignore-partials` reads the partial flags).
     export_coco_annotations(
         DEST_ROOT / "train_annotations.json",
         train_dataset,
         dataset_definition=DATASET_DEFINITION,
+        include_partials=False,
     )
 
     export_coco_annotations(
         DEST_ROOT / "true_eval_annotations.json",
         val_dataset,
         dataset_definition=DATASET_DEFINITION,
+        include_partials=True,
     )
 
     export_coco_annotations(
@@ -542,6 +583,7 @@ def _(
         val_dataset,
         dataset_definition=DATASET_DEFINITION,
         indices=val_idx,
+        include_partials=True,
     )
 
     export_coco_annotations(
@@ -549,12 +591,15 @@ def _(
         val_dataset,
         dataset_definition=DATASET_DEFINITION,
         indices=test_idx,
+        include_partials=True,
     )
     return
 
 
 @app.cell
 def _(DEST_ROOT, SEED, build_rep_indices, json, train_dataset):
+    # INT8 calibration indices. These are *positions* into the train split, so
+    # they are only valid for a dataset rebuilt with this exact geometry.
     rep_indices = build_rep_indices(
         dataset=train_dataset,
         num_samples=200,
@@ -596,10 +641,22 @@ def _(
             "categories": DATASET_DEFINITION.categories,
         },
         "image_size": IMAGE_SIZE,
+        # Recorded so the converter can rebuild the calibration dataset with the
+        # geometry this bundle's rep_dataset.json indices address.
+        "tiling": (
+            {
+                "rows": config["tile_rows"],
+                "cols": config["tile_cols"],
+                "overlap": config["tile_overlap"],
+            }
+            if config["tiling"]
+            else None
+        ),
+        "partial_threshold": config["partial_threshold"],
+        "partials_policy": "drop in train, do-not-care in eval",
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
         "rep_samples": len(rep_indices),
-        "ignore_partial": config["ignore_partial"],
         "split_seed": SEED,
         "train_stats": train_stats,
         "true_eval_stats": true_eval_stats,
@@ -638,11 +695,7 @@ def _(DEST_ROOT):
     assert not missing, f"Missing artifacts: {missing}"
 
     print("All artifacts generated successfully.")
-    return (artifacts,)
 
-
-@app.cell
-def _(artifacts):
     for artifact in artifacts:
         print(artifact)
     return

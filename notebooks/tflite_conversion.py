@@ -80,7 +80,10 @@ def configuration(
             ),
             tiled=mo.ui.switch(
                 value=True if "tiled" in model_root.value.name else False,
-                label="Tiled 2x2",
+                # Grid comes from the exported bundle's dataset_metadata.json,
+                # not from this label -- currently 3x3 @ overlap 0.5 (512 px
+                # tiles), per notebooks 03/04.
+                label="Tiled (3x3 @ 0.5)",
             ),
             classes=mo.ui.radio(
                 options={
