@@ -268,12 +268,30 @@ def _runtime_fields(runtime: dict) -> dict:
         "delegate": requested,
         "delegate_active": runtime.get("delegate_active"),
         "backend": backend,
-        "input_dtype": (
-            (runtime.get("input_details") or [{}])[0].get("dtype", "").split("'")[-2]
-            if runtime.get("input_details")
-            else None
-        ),
+        # Which pipeline stage produced the predictions. Artifacts written
+        # before this existed are all TFLite.
+        "format": runtime.get("format", "tflite"),
+        "input_dtype": _input_dtype(runtime),
     }
+
+
+def _input_dtype(runtime: dict) -> str | None:
+    """
+    Input dtype of the first input, across both artifact flavours.
+
+    TFLite records a repr (``<class 'numpy.float32'>``); the SavedModel runtime
+    records a bare name (``uint8``). Splitting on quotes unconditionally raises
+    on the latter, so fall back to the value as written.
+    """
+    details = runtime.get("input_details") or []
+
+    if not details:
+        return None
+
+    raw = details[0].get("dtype") or ""
+    parts = raw.split("'")
+
+    return parts[-2] if len(parts) >= 2 else (raw or None)
 
 
 def _faithful_fields(faithful: dict | None, *, classes: str | None) -> dict:
@@ -401,6 +419,11 @@ def load_benchmark_results(
 
             row = dict(info)
             row["platform"] = platform_dir.name
+            # A `<board>_cpu` results tree is the same board with the delegate
+            # switched off, not a separate target. Carry the board separately
+            # from the backend so figures can group by hardware instead of
+            # treating the CPU reference run as a peer platform.
+            row["device"] = platform_dir.name.removesuffix("_cpu")
 
             for key in _METRIC_KEYS:
                 row[key] = metrics.get(key)
@@ -473,6 +496,7 @@ def _grouped_bars(
     annotate=True,
     fmt="{:.3f}",
     rotation=0,
+    horizontal=False,
 ):
     """
     Draw side-by-side bar groups.
@@ -480,6 +504,12 @@ def _grouped_bars(
     Args:
         values:
             Mapping ``{group_label: [value per category]}``.
+        horizontal:
+            Put the categories on the **y** axis and the bars along x. Worth it
+            once the category labels stop fitting side by side: a vertical
+            chart has to share one figure width between every category, while a
+            horizontal one gives each label a full line and grows downward
+            instead (see :func:`plot_quantization_effect`).
     """
     n_groups = max(len(group_labels), 1)
     x = np.arange(len(categories))
@@ -489,10 +519,13 @@ def _grouped_bars(
         offset = (i - (n_groups - 1) / 2) * width
         vals = values[glabel]
 
-        bars = ax.bar(
+        draw = ax.barh if horizontal else ax.bar
+        size_kw = "height" if horizontal else "width"
+
+        bars = draw(
             x + offset,
             vals,
-            width,
+            **{size_kw: width},
             label=glabel,
             color=colors[i % len(colors)],
             edgecolor="white",
@@ -503,29 +536,47 @@ def _grouped_bars(
             for bar, v in zip(bars, vals, strict=False):
                 if v is None or (isinstance(v, float) and np.isnan(v)):
                     continue
+
+                if horizontal:
+                    xy = (v, bar.get_y() + bar.get_height() / 2)
+                    align = {"ha": "left", "va": "center"}
+                    offset_pts = (2, 0)
+                else:
+                    xy = (bar.get_x() + bar.get_width() / 2, v)
+                    align = {"ha": "center", "va": "bottom"}
+                    offset_pts = (0, 1)
+
                 ax.annotate(
                     fmt.format(v),
-                    (bar.get_x() + bar.get_width() / 2, v),
-                    ha="center",
-                    va="bottom",
+                    xy,
                     fontsize=7,
-                    xytext=(0, 1),
+                    xytext=offset_pts,
                     textcoords="offset points",
+                    **align,
                 )
 
-    ax.set_xticks(x)
-    # Anchor rotated labels by their upper (right) end at the tick, so the
-    # text reads from the category position outward instead of being centred
-    # under it (much easier to read with long labels).
-    ax.set_xticklabels(
-        categories,
-        rotation=rotation,
-        ha="right" if rotation else "center",
-        rotation_mode="anchor" if rotation else "default",
-    )
-    ax.set_ylabel(ylabel)
+    if horizontal:
+        ax.set_yticks(x)
+        ax.set_yticklabels(categories)
+        # Read the categories top-down, the order they were passed in.
+        ax.invert_yaxis()
+        ax.set_xlabel(ylabel)
+        ax.margins(x=0.15)
+    else:
+        ax.set_xticks(x)
+        # Anchor rotated labels by their upper (right) end at the tick, so the
+        # text reads from the category position outward instead of being centred
+        # under it (much easier to read with long labels).
+        ax.set_xticklabels(
+            categories,
+            rotation=rotation,
+            ha="right" if rotation else "center",
+            rotation_mode="anchor" if rotation else "default",
+        )
+        ax.set_ylabel(ylabel)
+        ax.margins(y=0.15)
+
     ax.set_title(title)
-    ax.margins(y=0.15)
     _prepare_axis(ax)
     return ax
 
@@ -539,28 +590,52 @@ def _short(series: pd.Series) -> pd.Series:
 # =========================================================
 
 
-def plot_quantization_effect(df: pd.DataFrame):
+def plot_quantization_effect(
+    df: pd.DataFrame,
+    *,
+    eval_tiling: str | None = None,
+    platform: str | None = None,
+):
     """FP32 vs INT8 on overall AP and weed AP (PTQ runs).
 
     INT8 is represented by the per-tensor export (the default deployment
     granularity) so each config contributes one FP32/INT8 pair; per-channel PTQ
     is compared separately elsewhere.
+
+    Bars are **horizontal**, and the figure height grows with the number of
+    categories. Vertical bars do not survive a multi-platform sweep: one
+    category is ``platform | arch | classes | trained-on | eval-input``, so the
+    count is the product of all five and every added platform multiplies it.
+    At four platforms that is 67 categories sharing a 10-inch axis -- 0.15 in
+    each, for labels averaging 56 characters -- which no rotation can rescue.
+    Horizontal bars give each label its own line, and the two metric panels sit
+    side by side sharing one set of labels instead of repeating them.
+
+    ``eval_tiling`` / ``platform`` narrow the figure the same way
+    :func:`plot_scheme_effect` does; without them every regime and board is
+    shown at once.
     """
     df = df[df.get("quant") == "ptq"].copy() if "quant" in df else df.copy()
     if "granularity" in df.columns:
         df = df[
             (df["precision"] == "fp32") | (df["granularity"] == "per-tensor")
         ].copy()
+    if eval_tiling is not None and "eval_tiling" in df.columns:
+        df = df[df["eval_tiling"] == eval_tiling].copy()
+    if platform is not None and "platform" in df.columns:
+        df = df[df["platform"] == platform].copy()
     if df.empty or df["precision"].nunique() < 2:
         return None
 
-    df["group"] = df["platform"] + " | " + df["config"]
+    group_cols = ["platform", "config"] if platform is None else ["config"]
+    df["group"] = df[group_cols].agg(" | ".join, axis=1)
     precisions = [p for p in ("fp32", "int8") if p in df["precision"].values]
     groups = sorted(df["group"].unique())
 
-    # Stack vertically so each subplot spans the full figure width — the
-    # `platform | config` group labels are too long to share a row.
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8.4), sharex=True)
+    # One line per category, floored so a short figure still looks deliberate.
+    height = max(3.0, 0.28 * len(groups)) + 1.1
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, height), sharey=True)
     for ax, metric, title in (
         (axes[0], "AP", "Overall AP (COCO)"),
         (axes[1], "weed_AP", "Weed AP"),
@@ -580,13 +655,124 @@ def plot_quantization_effect(df: pd.DataFrame):
             [PRECISION_COLORS[p] for p in precisions],
             ylabel=metric,
             title=title,
-            rotation=20,
+            horizontal=True,
         )
-        ax.legend(title="precision")
+        ax.legend(title="precision", loc="lower right")
 
-    fig.suptitle("FP32 -> INT8 quantization effect", y=1.0)
+    suffix = []
+    if platform:
+        suffix.append(platform)
+    if eval_tiling:
+        suffix.append(f"{eval_tiling} input")
+    title = "FP32 -> INT8 quantization effect"
+    if suffix:
+        title += f" ({', '.join(suffix)})"
+
+    fig.suptitle(title)
     fig.tight_layout()
     return fig
+
+
+#: Host whose CPU runs stand in for "unaccelerated reference" everywhere.
+CPU_REFERENCE_PLATFORM = "gaia"
+
+#: Metrics compared when checking that every CPU tree agrees with the reference.
+CPU_REFERENCE_METRICS = ("AP", "AP50", "AP75", "weed_AP", "crop_AP")
+
+#: Largest absolute metric difference still counted as "same result". CPU INT8
+#: predictions are bit-identical across x86 and ARM; only fp32 kernels differ,
+#: and only by pycocotools accumulation noise (measured max 2.3e-07 AP). Four
+#: orders of magnitude below the spread between INT8 *backends* (0.002-0.008).
+CPU_REFERENCE_TOLERANCE = 1e-5
+
+
+def cpu_reference_divergence(
+    df: pd.DataFrame,
+    *,
+    reference: str = CPU_REFERENCE_PLATFORM,
+    metrics: Iterable[str] = CPU_REFERENCE_METRICS,
+) -> pd.DataFrame:
+    """
+    How far each CPU-backend results tree sits from the reference host's.
+
+    Reporting one CPU curve instead of one per board is only honest if the
+    boards actually agree, so this is the check that licenses it -- run it
+    before any figure that collapses them. One row per
+    ``(platform, metric)`` with the worst and mean absolute difference over the
+    configs the two have in common.
+
+    Empty when there is nothing to compare (no reference tree, or no other CPU
+    tree), which callers should treat as "unverified", not "passed".
+    """
+    if df.empty or "backend" not in df.columns:
+        return pd.DataFrame()
+
+    cpu = df[df["backend"] == "cpu"]
+    if reference not in set(cpu.get("platform", [])):
+        return pd.DataFrame()
+
+    keys = [
+        k
+        for k in (
+            "arch_label",
+            "class_label",
+            "dataset",
+            "eval_tiling",
+            "precision",
+            "quant",
+            "granularity",
+        )
+        if k in cpu.columns
+    ]
+
+    def _indexed(frame):
+        f = frame.copy()
+        # fp32 rows carry no granularity; NaN never equals NaN, so a NaN key
+        # would silently drop every float config from the comparison.
+        for k in keys:
+            f[k] = f[k].astype("object").where(f[k].notna(), "-")
+        f = f.set_index(keys)
+        return f[~f.index.duplicated(keep="first")]
+
+    ref = _indexed(cpu[cpu["platform"] == reference])
+
+    rows = []
+    for platform, group in cpu[cpu["platform"] != reference].groupby("platform"):
+        other = _indexed(group)
+        common = other.index.intersection(ref.index)
+
+        for metric in metrics:
+            if metric not in other.columns or metric not in ref.columns:
+                continue
+
+            diff = (other.loc[common, metric] - ref.loc[common, metric]).abs().dropna()
+            if diff.empty:
+                continue
+
+            rows.append(
+                {
+                    "platform": platform,
+                    "reference": reference,
+                    "metric": metric,
+                    "configs": int(len(diff)),
+                    "max_abs_diff": float(diff.max()),
+                    "mean_abs_diff": float(diff.mean()),
+                    "bit_identical": int((diff < 1e-9).sum()),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def cpu_reference_holds(
+    divergence: pd.DataFrame,
+    *,
+    tolerance: float = CPU_REFERENCE_TOLERANCE,
+) -> bool:
+    """Whether every compared CPU tree matched the reference within tolerance."""
+    if divergence.empty:
+        return False
+    return bool((divergence["max_abs_diff"] < tolerance).all())
 
 
 #: Colours for the five deployable exports, float first then INT8 coarse->fine.
@@ -604,14 +790,23 @@ def plot_scheme_effect(
     *,
     eval_tiling: str | None = "untiled",
     metric: str = "AP",
-    platform: str | None = None,
+    platform: str | None = CPU_REFERENCE_PLATFORM,
 ):
     """
     All five quantization schemes side by side, one bar group per variant.
 
-    This is the figure for the PTQ-vs-QAT question, and unlike the aggregated
+    This is the figure for the PTQ-vs-QAT question, and unlike an aggregated
     FP32-vs-INT8 view it shows each export on its own: a single broken scheme
     stays visible instead of being averaged into an "INT8" bar.
+
+    ``platform`` defaults to the CPU reference, which makes this the *export*
+    comparison -- quantization cost with the accelerator held out. It has to be
+    pinned to one platform: a bar is a mean over the matching rows, so leaving
+    it open averages every board into each bar. With the i.MX8MP's collapsed
+    per-channel runs in the frame that turned a 0.313 bar into 0.235, a number
+    describing no configuration that exists. Pass ``platform=None`` deliberately
+    to get the old cross-platform mean; use :func:`plot_backend_effect` for the
+    CPU-vs-NPU question.
     """
     if df.empty or metric not in df.columns:
         return None
@@ -657,10 +852,102 @@ def plot_scheme_effect(
         title=(
             f"{metric} by quantization scheme"
             + (f" ({eval_tiling} input)" if eval_tiling else "")
+            + (f" — {platform}" if platform else " — mean over platforms")
         ),
         rotation=20,
     )
     ax.legend(title="scheme", ncol=2)
+    fig.tight_layout()
+    return fig
+
+
+#: Bar colours for the backend comparison: the CPU reference first, then the
+#: accelerated boards.
+BACKEND_COLORS = ("#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3")
+
+
+def plot_backend_effect(
+    df: pd.DataFrame,
+    *,
+    eval_tiling: str | None = "untiled",
+    metric: str = "AP",
+    reference: str = CPU_REFERENCE_PLATFORM,
+):
+    """
+    INT8 on the CPU reference vs each NPU delegate, per variant and scheme.
+
+    The companion to :func:`plot_scheme_effect`: that one holds the hardware
+    fixed and varies the export, this one holds the export fixed and varies the
+    hardware. Splitting them is what keeps either readable -- a single figure
+    crossing both axes is the product of every variant, scheme and board.
+
+    Only INT8 exports appear, because that is the only precision an NPU
+    delegate actually accelerates; the float baseline lives in the scheme
+    figure. A delegate that reproduces its CPU reference should draw bars of
+    equal height, so any visible gap is the accelerator changing the result.
+    """
+    if df.empty or metric not in df.columns or "backend" not in df.columns:
+        return None
+
+    sel = df[df["precision"] == "int8"].copy()
+    if eval_tiling is not None and "eval_tiling" in sel.columns:
+        sel = sel[sel["eval_tiling"] == eval_tiling]
+    if sel.empty:
+        return None
+
+    sel = add_scheme(sel)
+
+    # One series per hardware backend: the CPU reference, then each board that
+    # actually ran through a delegate.
+    is_reference = (sel["platform"] == reference) & (sel["backend"] == "cpu")
+    sel = sel[is_reference | (sel["backend"] == "delegate")].copy()
+    sel["series"] = np.where(
+        sel["platform"] == reference,
+        f"{reference} (CPU ref)",
+        sel.get("device", sel["platform"]).astype(str) + " (NPU)",
+    )
+
+    series = [f"{reference} (CPU ref)"] + sorted(
+        s for s in set(sel["series"]) if not s.startswith(reference)
+    )
+    if len(series) < 2:
+        return None
+
+    sel["group"] = (
+        _short(sel["arch_label"])
+        + " | "
+        + sel["classes"].str.upper()
+        + " | "
+        + sel["dataset"]
+        + " | "
+        + sel["scheme"].str.replace("int8_", "", regex=False)
+    )
+    groups = sorted(sel["group"].unique())
+
+    values = {
+        s: [
+            sel[(sel["group"] == g) & (sel["series"] == s)][metric].mean()
+            for g in groups
+        ]
+        for s in series
+    }
+
+    height = max(3.0, 0.28 * len(groups)) + 1.1
+    fig, ax = plt.subplots(figsize=(9, height))
+    _grouped_bars(
+        ax,
+        groups,
+        series,
+        values,
+        BACKEND_COLORS,
+        ylabel=metric,
+        title=(
+            f"INT8 {metric}: CPU reference vs NPU"
+            + (f" ({eval_tiling} input)" if eval_tiling else "")
+        ),
+        horizontal=True,
+    )
+    ax.legend(title="backend", loc="lower right")
     fig.tight_layout()
     return fig
 
@@ -1460,6 +1747,100 @@ def quantization_delta_table(df: pd.DataFrame) -> pd.DataFrame:
         rows.append(rec)
 
     return pd.DataFrame(rows)
+
+
+#: Results tree holding the pre-conversion SavedModel reference. The *floored*
+#: one: its NMS score threshold matches the TFLite graphs', which is what keeps
+#: the first rung like-for-like. (`tf-savedmodel-nms0` is the floor-free control
+#: and is worth +0.002 AP on average -- see CLAUDE.md.)
+REFERENCE_PLATFORM = "tf-savedmodel"
+
+
+def degradation_ladder_table(
+    df: pd.DataFrame,
+    *,
+    npu_platform: str = "frdm-imx93",
+    eval_tiling: str | None = "untiled",
+    quant: str = "ptq",
+    reference: str = REFERENCE_PLATFORM,
+    cpu_platform: str = CPU_REFERENCE_PLATFORM,
+    metric: str = "AP",
+) -> pd.DataFrame:
+    """
+    Decompose the deployment chain into its four rungs and three losses.
+
+    ::
+
+        SavedModel  --conversion-->  TFLite fp32  --quantization-->  int8 CPU
+                    --delegation-->  int8 NPU
+
+    Each delta isolates one transformation by holding the others fixed, which is
+    the point: without the SavedModel rung the conversion loss is invisible and
+    gets folded into "quantization". It is not small -- averaged over the
+    variants it is about a third of the quantization loss, and for at least one
+    config it is *larger*.
+
+    Two things to keep in mind when reading the first column:
+
+    * **Conversion is not only numerical.** The TFLite export swaps TFOD's
+      post-processing for ``TFLite_Detection_PostProcess``, a different NMS
+      implementation, so this rung measures an algorithm substitution as much as
+      a precision change.
+    * **Resampling is folded in.** The SavedModel resizes inside the graph
+      (``fixed_shape_resizer``) while the TFLite path resizes externally with
+      ``cv2``, so part of the gap is interpolation. Splitting the two needs a
+      pre-resized control run.
+
+    Rows are dropped only when a rung is missing entirely; a missing reference
+    leaves the conversion column empty rather than removing the config, so an
+    incomplete reference sweep is visible instead of silently narrowing the
+    table.
+    """
+    if df.empty or metric not in df.columns:
+        return pd.DataFrame()
+
+    sel = add_scheme(df.copy())
+
+    if eval_tiling is not None and "eval_tiling" in sel.columns:
+        sel = sel[sel["eval_tiling"] == eval_tiling]
+
+    keys = [k for k in ("arch_label", "classes", "dataset") if k in sel.columns]
+    if not keys:
+        return pd.DataFrame()
+
+    def _rung(platform, scheme=None, quantization=None):
+        rows = sel[sel["platform"] == platform]
+        if scheme is not None:
+            rows = rows[rows["scheme"] == scheme]
+        if quantization is not None:
+            rows = rows[rows["quant"] == quantization]
+        rows = rows.dropna(subset=[metric])
+        if rows.empty:
+            return pd.Series(dtype="float64")
+        return rows.groupby(keys)[metric].mean()
+
+    int8_scheme = scheme_name("int8", quant, "per-tensor")
+
+    rungs = {
+        "SavedModel": _rung(reference, quantization=quant),
+        "TFLite fp32": _rung(cpu_platform, scheme=scheme_name("fp32", "ptq")),
+        "int8 CPU": _rung(cpu_platform, scheme=int8_scheme),
+        f"int8 NPU ({npu_platform})": _rung(npu_platform, scheme=int8_scheme),
+    }
+
+    table = pd.DataFrame(rungs)
+
+    # A config needs at least the deployed chain to be worth a row.
+    table = table.dropna(subset=["TFLite fp32", "int8 CPU"], how="any")
+    if table.empty:
+        return pd.DataFrame()
+
+    columns = list(table.columns)
+    table["conversion"] = table["TFLite fp32"] - table["SavedModel"]
+    table["quantization"] = table["int8 CPU"] - table["TFLite fp32"]
+    table["delegation"] = table[columns[3]] - table["int8 CPU"]
+
+    return table.round(4)
 
 
 def master_table(df: pd.DataFrame) -> pd.DataFrame:

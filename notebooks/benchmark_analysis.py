@@ -37,7 +37,7 @@ def _(mo):
     variants contributes 2 (regimes) × 5 (export schemes) = 10 runs per
     platform.
 
-    ## Two metric families — never mix them
+    ## Two metric families -- should not be mixed
 
     - **pycocotools** (`AP`, `AP50`, `weed_AP`, …): our own consistent numbers,
       used for every internal comparison.
@@ -242,13 +242,58 @@ def _(br, mo, runs_df, show_table):
 
 
 @app.cell(hide_code=True)
+def _(br, mo, runs_df):
+    # Guard for §2/§2b: those sections report ONE CPU curve and treat it as the
+    # unaccelerated reference for every board. That is only legitimate while the
+    # per-board `<board>_cpu` trees actually agree with the reference host, so
+    # check it here rather than assuming it.
+    _div = br.cpu_reference_divergence(runs_df)
+
+    if _div.empty:
+        _verdict = mo.callout(
+            mo.md(
+                "**Unverified** — no second CPU tree to compare against "
+                f"`{br.CPU_REFERENCE_PLATFORM}`. The sections below still show "
+                "that host alone; they just cannot claim it stands for the "
+                "boards."
+            ),
+            kind="warn",
+        )
+    else:
+        _ok = br.cpu_reference_holds(_div)
+        _verdict = mo.callout(
+            mo.md(
+                (
+                    "**CPU reference holds.** "
+                    if _ok
+                    else "**CPU reference FAILS — do not collapse the CPU trees.** "
+                )
+                + f"Worst disagreement with `{br.CPU_REFERENCE_PLATFORM}` across "
+                f"{int(_div['configs'].max())} shared configs is "
+                f"`{_div['max_abs_diff'].max():.2e}` "
+                f"(tolerance `{br.CPU_REFERENCE_TOLERANCE:.0e}`). INT8 "
+                "predictions are bit-identical across x86 and ARM; only fp32 "
+                "kernels differ, and only by pycocotools accumulation noise."
+            ),
+            kind="success" if _ok else "danger",
+        )
+
+    mo.vstack([_verdict, mo.ui.table(_div, selection=None)])
+    return
+
+
+@app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ## 2 · PTQ vs. QAT
+    ## 2 · PTQ vs. QAT — on the CPU reference
 
     The core quantization table: every variant against all five deployable
     exports, with `dAP vs fp32` giving each INT8 export's cost against **its
     own** float baseline.
+
+    Scoped to the **CPU reference** so this measures the *export* alone, with
+    the accelerator held out — the guard above licenses using one CPU curve for
+    every board. What the NPUs then do to these INT8 exports is §2b.
 
     Expected ordering is `fp32 ≥ per-channel ≥ per-tensor` within a scheme, and
     QAT ≥ PTQ at equal granularity. Rows that break it are exactly what §0
@@ -260,12 +305,16 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(PRIMARY_EVAL_TILING, br, mo, runs_df, show_table):
     show_table(
-        br.scheme_comparison_table(runs_df, eval_tiling=PRIMARY_EVAL_TILING),
+        br.scheme_comparison_table(
+            runs_df,
+            eval_tiling=PRIMARY_EVAL_TILING,
+            platform=br.CPU_REFERENCE_PLATFORM,
+        ),
         f"scheme_comparison_{PRIMARY_EVAL_TILING}",
         mo,
         caption="Detection quality per quantization scheme "
-        f"({PRIMARY_EVAL_TILING} input), with the relative change against each "
-        "variant's own FP32 baseline.",
+        f"({PRIMARY_EVAL_TILING} input) on the CPU reference, with the relative "
+        "change against each variant's own FP32 baseline.",
     )
     return
 
@@ -295,19 +344,77 @@ def _(PRIMARY_EVAL_TILING, br, mo, runs_df, show_fig):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 2b · Aggregate FP32 → INT8 view
+    ### 2b · What the accelerators do to those INT8 exports
 
-    The condensed FP32-vs-INT8 comparison used as the chapter opener. INT8 is
-    represented by the per-tensor PTQ export (the default deployment
-    granularity) so each config contributes exactly one pair; the per-scheme
-    detail is in §2.
+    §2 held the hardware fixed and varied the export; this holds the export
+    fixed and varies the hardware. Only INT8 appears — it is the only precision
+    a delegate accelerates, and the float baseline is already in §2.
+
+    A delegate that faithfully reproduces its CPU reference draws bars of equal
+    height, so **any visible gap is the accelerator changing the result**, not
+    the quantization.
+
+    The two axes are deliberately not crossed in one figure: a category would
+    then be the product of variant × scheme × board, which is what made the
+    previous combined version illegible.
     """)
     return
 
 
 @app.cell(hide_code=True)
-def _(br, mo, runs_df, show_fig):
-    show_fig(br.plot_quantization_effect(runs_df), "quantization_effect", mo)
+def _(PRIMARY_EVAL_TILING, br, mo, runs_df, show_fig):
+    show_fig(
+        br.plot_backend_effect(runs_df, eval_tiling=PRIMARY_EVAL_TILING),
+        f"backend_effect_{PRIMARY_EVAL_TILING}",
+        mo,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    ### 2c · Degradation ladder — where the accuracy actually goes
+
+    The deployment chain has four rungs, and each delta below isolates one
+    transformation by holding the others fixed:
+
+    | rung | delta | what it measures |
+    |---|---|---|
+    | SavedModel (TF float, TFOD post-processing) | | the trained model |
+    | ↓ TFLite fp32 | `conversion` | graph conversion **and** the swap to `TFLite_Detection_PostProcess` |
+    | ↓ INT8 on CPU | `quantization` | the precision change alone |
+    | ↓ INT8 on NPU | `delegation` | what the accelerator does to it |
+
+    The first rung is the one that was missing until now: without it, conversion
+    loss is invisible and gets folded into `quantization`. It is not negligible
+    — for `MNv2 | mc | phenobench-tiled` it is **larger** than that config's
+    quantization loss.
+
+    Two caveats on `conversion`. It is not purely numerical: the TFLite export
+    substitutes a *different NMS implementation*. And it still folds in
+    **resampling** — the SavedModel resizes inside its graph
+    (`fixed_shape_resizer`) while the TFLite path resizes externally with
+    `cv2` — so isolating the post-processing substitution alone would need a
+    pre-resized control run.
+
+    The reference is the *floored* export, matching the 0.05 NMS score
+    threshold the TFLite graphs bake in, which is what keeps this rung
+    like-for-like (see §4.6.1 of the thesis for why the floor stays).
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(PRIMARY_EVAL_TILING, br, mo, runs_df, show_table):
+    show_table(
+        br.degradation_ladder_table(runs_df, eval_tiling=PRIMARY_EVAL_TILING),
+        f"degradation_ladder_{PRIMARY_EVAL_TILING}",
+        mo,
+        caption="Detection AP across the four deployment rungs "
+        f"({PRIMARY_EVAL_TILING} input, PTQ path), with the loss attributable "
+        "to conversion, quantization and delegation separately.",
+    )
     return
 
 
@@ -532,24 +639,22 @@ def _(br, mo, runs_df, show_table):
 
 @app.cell(hide_code=True)
 def _(br, mo):
-    mo.md(
-        f"""
-        ## 9 · Coverage — progress toward a full run
+    mo.md(f"""
+    ## 9 · Coverage — progress toward a full run
 
-        A *full run* benchmarks every trained variant in `artifacts/tf`, for
-        every export scheme, on both input regimes, on every target platform:
+    A *full run* benchmarks every trained variant in `artifacts/tf`, for
+    every export scheme, on both input regimes, on every target platform:
 
-        - schemes (`br.DEFAULT_SCHEMES`):
-          {", ".join(f"`{br.scheme_name(*s)}`" for s in br.DEFAULT_SCHEMES)}
-        - input regimes (`br.DEFAULT_EVAL_TILINGS`):
-          {", ".join(f"`{t}`" for t in br.DEFAULT_EVAL_TILINGS)}
-        - platforms (`br.DEFAULT_EXPECTED_PLATFORMS`):
-          {", ".join(f"`{p}`" for p in br.DEFAULT_EXPECTED_PLATFORMS)}
+    - schemes (`br.DEFAULT_SCHEMES`):
+      {", ".join(f"`{br.scheme_name(*s)}`" for s in br.DEFAULT_SCHEMES)}
+    - input regimes (`br.DEFAULT_EVAL_TILINGS`):
+      {", ".join(f"`{t}`" for t in br.DEFAULT_EVAL_TILINGS)}
+    - platforms (`br.DEFAULT_EXPECTED_PLATFORMS`):
+      {", ".join(f"`{p}`" for p in br.DEFAULT_EXPECTED_PLATFORMS)}
 
-        That is 8 variants x 5 schemes x 2 regimes = **80 runs per platform**.
-        The grid tracks done (`x`) vs. missing (`-`).
-        """
-    )
+    That is 8 variants x 5 schemes x 2 regimes = **80 runs per platform**.
+    The grid tracks done (`x`) vs. missing (`-`).
+    """)
     return
 
 
@@ -557,7 +662,7 @@ def _(br, mo):
 def _(ARTIFACTS_TF, br, runs_df):
     model_variants = br.discover_model_variants(ARTIFACTS_TF)
     coverage = br.build_coverage(runs_df, model_variants)
-    return coverage, model_variants
+    return (coverage,)
 
 
 @app.cell(hide_code=True)
