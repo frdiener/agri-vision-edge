@@ -1,12 +1,17 @@
 """
 Detector-runtime factory.
 
-Picks the right :class:`~.base.BaseRuntime` for a TFLite model by its output
-shape, so callers (``ave infer`` / ``ave benchmark``) stay model-agnostic:
+Picks the right :class:`~.base.BaseRuntime` for a model, so callers
+(``ave infer`` / ``ave benchmark``) stay model-agnostic:
 
+- **a SavedModel directory** → the pre-conversion TF reference:
+  :class:`~.saved_model.SavedModelRuntime`.
 - **4 outputs** → SSD MobileNetV2 (post-NMS boxes/scores/classes/count):
   :class:`~.tflite.TFLiteRuntime`.
 - **3 outputs** → YOLOv7-tiny raw grids: :class:`~.yolo.YoloTFLiteRuntime`.
+
+TFLite models are dispatched on output shape; the SavedModel is dispatched on
+the path first, because peeking at it with ``Interpreter`` would raise.
 
 Imports are deferred into the function so importing this module stays light
 (neither runtime — nor TensorFlow — is pulled in until a runtime is built).
@@ -43,6 +48,19 @@ def build_runtime(
     the model's embedded metadata by the runtime (falling back to built-in
     defaults); pass explicit values to override.
     """
+
+    # Checked before the peek: `Interpreter` raises on a SavedModel directory,
+    # so the reference runtime has to be dispatched on the path shape instead of
+    # the output layout.
+    from .saved_model import is_saved_model_dir
+
+    if is_saved_model_dir(model_path):
+        from .saved_model import SavedModelRuntime
+
+        return SavedModelRuntime(
+            model_path=model_path,
+            score_threshold=score_threshold,
+        )
 
     peek = Interpreter(model_path=str(model_path))
     peek.allocate_tensors()

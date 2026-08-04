@@ -35,6 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from agri_vision_edge.conversion.tflite import stage_graph_flags
+
 from .run import FinetuneRunConfig
 
 
@@ -46,6 +48,123 @@ class ExportResult:
     checkpoint: Path  # <export_dir>/checkpoint/ckpt-0
     saved_model_dir: Path  # <export_dir>/saved_model
     pipeline_config: Path  # <export_dir>/pipeline.config
+
+
+#: Sub-directory holding the scoring re-export (see
+#: :func:`export_scoring_saved_model`). Sits beside the stage's own
+#: ``saved_model/`` rather than replacing it -- the stock export is what the
+#: TFLite conversion is traced from and must not move.
+SCORING_EXPORT_NAME = "saved_model_nms0"
+
+
+def export_scoring_saved_model(
+    stage_dir,
+    *,
+    output_dir=None,
+    score_threshold: float = 0.0,
+    qat: bool | None = None,
+    qat_per_channel: bool | None = None,
+    input_type: str = "image_tensor",
+) -> Path:
+    """
+    Re-export a stage's checkpoint with the NMS score threshold removed.
+
+    The stage ``saved_model/`` bakes the pipeline's
+    ``batch_non_max_suppression.score_threshold`` (0.05 for these runs) into the
+    graph, and it cannot be overridden at inference time. That is fatal for a
+    *reference* measurement: COCO AP integrates the whole precision/recall
+    curve, so a floored detector loses the low-score tail and scores below the
+    TFLite export it is supposed to be the ceiling for. ``ave benchmark`` pins
+    the TFLite runtimes to ``score_threshold=0`` for exactly this reason; this
+    is the equivalent for the SavedModel, where the only way through is to
+    re-export.
+
+    Everything else is held fixed -- same checkpoint, same graph
+    modifications, same ``iou_threshold`` and ``max_total_detections`` -- so the
+    result differs from the stock export in the score floor alone.
+
+    Writes ``<stage_dir>/saved_model_nms0/`` plus the patched
+    ``pipeline.config`` beside it, and returns the SavedModel directory.
+    """
+    from agri_vision_edge.third_party import setup_tensorflow_models
+
+    setup_tensorflow_models()
+
+    import tensorflow as tf
+    from object_detection.builders import model_builder
+    from object_detection.exporter_lib_v2 import DETECTION_MODULE_MAP
+    from object_detection.utils import config_util
+
+    from agri_vision_edge.tfod import load_pipeline_config
+
+    stage_dir = Path(stage_dir)
+
+    if input_type not in DETECTION_MODULE_MAP:
+        raise ValueError(
+            f"Unrecognized input_type {input_type!r}; "
+            f"expected one of {sorted(DETECTION_MODULE_MAP)}"
+        )
+
+    inferred_qat, inferred_per_channel = stage_graph_flags(stage_dir.name)
+    qat = inferred_qat if qat is None else qat
+    qat_per_channel = (
+        inferred_per_channel if qat_per_channel is None else qat_per_channel
+    )
+
+    export_dir = (
+        stage_dir / SCORING_EXPORT_NAME if output_dir is None else Path(output_dir)
+    )
+
+    pipeline_config = load_pipeline_config(stage_dir / "pipeline.config")
+    pipeline_config.model.ssd.post_processing.batch_non_max_suppression.score_threshold = (  # noqa: E501
+        score_threshold
+    )
+    resolution = pipeline_config.model.ssd.image_resizer.fixed_shape_resizer.height
+
+    detection_model = model_builder.build(
+        model_config=pipeline_config.model,
+        is_training=False,
+    )
+
+    if qat:
+        from agri_vision_edge.tfod.qat import (
+            ensure_model_is_built_for_qat,
+            quantize_detection_model,
+        )
+
+        ensure_model_is_built_for_qat(detection_model, pipeline_config)
+
+        # Reproduce the *trained* graph, not the conversion rewrite: this export
+        # stands in for the model as trained, so it mirrors `export_run` and
+        # deliberately does not pass `for_export`.
+        quantize_detection_model(
+            detection_model,
+            resolution,
+            per_channel=qat_per_channel,
+        )
+
+    checkpoint = tf.train.latest_checkpoint(str(stage_dir / "checkpoint"))
+    if not checkpoint:
+        raise FileNotFoundError(f"No checkpoint to export in {stage_dir / 'checkpoint'}")
+
+    ckpt = tf.train.Checkpoint(model=detection_model)
+    status = ckpt.restore(checkpoint).expect_partial()
+
+    module = DETECTION_MODULE_MAP[input_type](detection_model)
+    concrete_function = module.__call__.get_concrete_function()
+    status.assert_existing_objects_matched()
+
+    tf.saved_model.save(
+        module,
+        str(export_dir),
+        signatures=concrete_function,
+    )
+
+    # Keep the patched pipeline beside the export so the threshold it was built
+    # with is recoverable from the artifact alone.
+    config_util.save_pipeline_config(pipeline_config, str(export_dir))
+
+    return export_dir
 
 
 def export_run(

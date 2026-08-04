@@ -93,6 +93,13 @@ def save_benchmark_artifacts(
             "backend":
                 "delegate" if active_delegate else "cpu",
 
+            # Which stage of the pipeline produced these predictions. The
+            # SavedModel reference runs on the host and its latency is not
+            # comparable to a device figure, so the report needs to tell the
+            # rungs apart by more than the results directory name.
+            "format":
+                getattr(runtime, "runtime_format", "tflite"),
+
             "predictions_integrity":
                 integrity.to_dict(),
 

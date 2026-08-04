@@ -89,6 +89,23 @@ STANDARD_TARGETS: tuple[ConversionTarget, ...] = (
 )
 
 
+def stage_graph_flags(stage_name: str) -> tuple[bool, bool]:
+    """
+    ``(qat, per_channel)`` implied by a stage directory name.
+
+    The inverse of :attr:`ConversionTarget.stage_candidates`: given a stage
+    directory (``finetune`` / ``ptq`` / ``qat_per-tensor`` /
+    ``qat_per-channel``), say how its graph has to be rebuilt before the
+    checkpoint will restore. A QAT checkpoint stores *folded and fake-quantized*
+    variables, and the directory name is the only record of which.
+
+    Lives here rather than in ``tfod_trainer`` so it can be used -- and tested
+    -- without importing the vendored ``object_detection`` stack.
+    """
+    qat = stage_name.startswith("qat")
+    return qat, stage_name.endswith("per-channel")
+
+
 def _parse_variant(name: str) -> tuple[str, bool]:
     """Return (classes, tiled) parsed from a variant directory name."""
     classes = "mc" if "_mc_" in name else "sc"

@@ -40,19 +40,29 @@ def collect_models(
 
     Args:
         path:
-            Single .tflite model or
-            directory containing models.
+            Single .tflite model, a SavedModel directory, or a directory
+            containing either.
 
     Returns:
         List of model paths.
     """
+
+    from agri_vision_edge.runtime.inference.saved_model import is_saved_model_dir
 
     path = Path(path)
 
     if path.is_file():
         return [path]
 
-    return sorted(path.glob("*.tflite"))
+    # A SavedModel is itself a directory, so it has to be recognised before the
+    # directory is treated as a collection.
+    if is_saved_model_dir(path):
+        return [path]
+
+    models = sorted(path.glob("*.tflite"))
+
+    # ...and a directory may equally hold several SavedModels side by side.
+    return models or sorted(p for p in path.iterdir() if is_saved_model_dir(p))
 
 
 def benchmark_model(
