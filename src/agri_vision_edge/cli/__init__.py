@@ -37,6 +37,10 @@ _COMMANDS: dict[str, tuple[str, str]] = {
         "agri_vision_edge.cli.infer",
         "Run a TFLite detector on images and draw boxes (on-device)",
     ),
+    "resources": (
+        "agri_vision_edge.cli.resources",
+        "Sustained inference loop measuring CPU/memory/thermals (on-device)",
+    ),
 }
 
 
