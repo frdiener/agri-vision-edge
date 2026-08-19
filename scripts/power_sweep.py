@@ -600,7 +600,11 @@ def main(argv=None) -> int:
             f"printf '%s\\n' \"$pid\" > {shlex.quote(remote_stop_file)}; "
             "kill -INT $pid 2>/dev/null || true; "
             "fi; "
-            "while kill -0 $pid 2>/dev/null; do sleep 0.1; done"
+            "while kill -0 $pid 2>/dev/null; do "
+            "state=$(awk '{print $3}' /proc/$pid/stat 2>/dev/null || true); "
+            'test "$state" = Z && break; '
+            "sleep 0.1; "
+            "done"
         )
         while True:
             try:
@@ -651,18 +655,30 @@ def main(argv=None) -> int:
     if args.dry_run and runs_to_execute and not args.no_meter:
         print(
             f"meter start     : ssh {args.meter_host} "
-            f"'setsid nohup {args.meter_python} {remote_logger} "
-            f"-o {remote_power} &'"
+            f"\"setsid nohup sh -c 'trap - INT; exec {args.meter_python} "
+            f"{remote_logger} -o {remote_power}' &\""
         )
         print(f"meter settle    : {args.meter_settle}s (once)\n")
 
     try:
         if not args.dry_run and runs_to_execute and not args.no_meter:
             meter_start_attempted = True
+            logger_command = " ".join(
+                shlex.quote(part)
+                for part in (
+                    args.meter_python,
+                    remote_logger,
+                    "-o",
+                    remote_power,
+                )
+            )
+            # Asynchronous shell jobs inherit SIGINT as ignored. Reset it in an
+            # inner shell before exec so kill -INT reaches Python as
+            # KeyboardInterrupt and lets the logger finalize its gzip stream.
+            interruptible_logger = f"trap - INT; exec {logger_command}"
             started = meter_host.script(
                 "set -e\n"
-                f"setsid nohup {shlex.quote(args.meter_python)} "
-                f"{shlex.quote(remote_logger)} -o {shlex.quote(remote_power)} "
+                f"setsid nohup sh -c {shlex.quote(interruptible_logger)} "
                 f"> {shlex.quote(remote_meter_log)} 2>&1 < /dev/null &\n"
                 f"echo $! > {shlex.quote(remote_pid_file)}\n"
                 "echo PID:$!\n"
