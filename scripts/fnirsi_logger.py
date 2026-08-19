@@ -21,9 +21,8 @@ import time
 from pathlib import Path
 from typing import TextIO
 
-import usb.core
-import usb.util
-
+import usb.core  # pyright: ignore[reportMissingImports]
+import usb.util  # pyright: ignore[reportMissingImports]
 
 VID = 0x2E3C
 PID = 0x5558
@@ -36,7 +35,8 @@ def make_command(code: int, crc: int) -> bytes:
     return b"\xaa" + bytes([code]) + b"\x00" * 61 + bytes([crc])
 
 
-# Required FNB58 startup commands, followed by a low-rate keepalive/continue.
+# The startup sequence begins a streaming window. Command 0x83 extends that
+# window at low cadence; sending it for every report eventually wedges the meter.
 START_COMMANDS = (
     make_command(0x81, 0x8E),
     make_command(0x82, 0x96),
@@ -51,7 +51,9 @@ def crc8(payload: bytes) -> int:
     for byte in payload:
         value ^= byte
         for _ in range(8):
-            value = ((value << 1) ^ 0x39) & 0xFF if value & 0x80 else (value << 1) & 0xFF
+            value = (
+                ((value << 1) ^ 0x39) & 0xFF if value & 0x80 else (value << 1) & 0xFF
+            )
     return value
 
 
@@ -82,6 +84,26 @@ def open_meter():
     if device is None:
         raise RuntimeError("FNB58 not found (expected USB VID:PID 2e3c:5558)")
 
+    # Reset the retained firmware session. This meter can re-enumerate during
+    # reset, so the original PyUSB object must never be used afterwards.
+    try:
+        device.reset()
+    except usb.core.USBError as exc:
+        if getattr(exc, "errno", None) != 2:  # ENOENT can mean re-enumeration.
+            raise RuntimeError(f"could not reset FNB58 USB session: {exc}") from exc
+    finally:
+        usb.util.dispose_resources(device)
+
+    time.sleep(0.25)
+    deadline = time.monotonic() + 5.0
+    device = None
+    while device is None and time.monotonic() < deadline:
+        device = usb.core.find(idVendor=VID, idProduct=PID)
+        if device is None:
+            time.sleep(0.1)
+    if device is None:
+        raise RuntimeError("FNB58 did not re-enumerate within 5 seconds after reset")
+
     interface_number = None
     for config in device:
         for interface in config:
@@ -91,38 +113,52 @@ def open_meter():
         if interface_number is not None:
             break
     if interface_number is None:
+        usb.util.dispose_resources(device)
         raise RuntimeError("FNB58 HID interface not found")
 
-    detached = False
     try:
         if device.is_kernel_driver_active(interface_number):
             device.detach_kernel_driver(interface_number)
-            detached = True
-    except (NotImplementedError, usb.core.USBError):
+    except NotImplementedError:
         pass
-
-    # This may return BUSY if the existing configuration is already active.
-    try:
-        device.set_configuration()
     except usb.core.USBError as exc:
-        if getattr(exc, "errno", None) != 16:
-            raise
+        usb.util.dispose_resources(device)
+        raise RuntimeError(f"could not detach FNB58 HID driver: {exc}") from exc
 
-    interface = device.get_active_configuration()[(interface_number, 0)]
-    endpoint_in = usb.util.find_descriptor(
-        interface,
-        custom_match=lambda endpoint: usb.util.endpoint_direction(endpoint.bEndpointAddress)
-        == usb.util.ENDPOINT_IN,
-    )
-    endpoint_out = usb.util.find_descriptor(
-        interface,
-        custom_match=lambda endpoint: usb.util.endpoint_direction(endpoint.bEndpointAddress)
-        == usb.util.ENDPOINT_OUT,
-    )
-    if endpoint_in is None or endpoint_out is None:
-        raise RuntimeError("could not find FNB58 HID IN/OUT endpoints")
+    try:
+        # This may return BUSY if the existing configuration is already active.
+        try:
+            device.set_configuration()
+        except usb.core.USBError as exc:
+            if getattr(exc, "errno", None) != 16:
+                raise
 
-    return device, interface_number, detached, endpoint_in, endpoint_out
+        interface = device.get_active_configuration()[(interface_number, 0)]
+        endpoint_in = usb.util.find_descriptor(
+            interface,
+            custom_match=lambda endpoint: (
+                usb.util.endpoint_direction(endpoint.bEndpointAddress)
+                == usb.util.ENDPOINT_IN
+            ),
+        )
+        endpoint_out = usb.util.find_descriptor(
+            interface,
+            custom_match=lambda endpoint: (
+                usb.util.endpoint_direction(endpoint.bEndpointAddress)
+                == usb.util.ENDPOINT_OUT
+            ),
+        )
+        if endpoint_in is None or endpoint_out is None:
+            raise RuntimeError("could not find FNB58 HID IN/OUT endpoints")
+
+        usb.util.claim_interface(device, interface_number)
+    except BaseException:
+        usb.util.dispose_resources(device)
+        raise
+
+    # Do not reattach hid-generic on close. Rebinding it can hang this meter and
+    # remove it from USB enumeration; a later invocation can claim it directly.
+    return device, interface_number, endpoint_in, endpoint_out
 
 
 def open_csv(path: str) -> tuple[TextIO, bool]:
@@ -136,18 +172,53 @@ def open_csv(path: str) -> tuple[TextIO, bool]:
     return destination.open("w", encoding="utf-8", newline=""), True
 
 
-def try_continue(endpoint_out) -> None:
-    """A missed 1 Hz keepalive must not abort an otherwise valid recording."""
+def write_command(endpoint_out, command: bytes, description: str) -> None:
+    """Write one protocol command and turn opaque PyUSB errors into context."""
     try:
-        endpoint_out.write(CONTINUE_COMMAND, timeout=1_000)
-    except usb.core.USBTimeoutError:
-        print("warning: FNB58 continuation write timed out", file=sys.stderr)
+        endpoint_out.write(command, timeout=1_000)
+    except usb.core.USBError as exc:
+        raise RuntimeError(f"FNB58 {description} failed: {exc}") from exc
+
+
+def drain_reports(endpoint_in, timeout_ms: int, max_seconds: float = 3.0) -> int:
+    """Consume queued reports until quiet, but never block cleanup forever."""
+    drained = 0
+    deadline = time.monotonic() + max_seconds
+    while True:
+        remaining_ms = int((deadline - time.monotonic()) * 1_000)
+        if remaining_ms <= 0:
+            return drained
+        read_timeout_ms = max(1, min(timeout_ms, remaining_ms))
+        try:
+            endpoint_in.read(REPORT_SIZE, timeout=read_timeout_ms)
+            drained += 1
+        except usb.core.USBTimeoutError:
+            return drained
+        except usb.core.USBError:
+            # Cleanup must remain best-effort if the meter was disconnected.
+            return drained
+        except KeyboardInterrupt:
+            # A second Ctrl-C must not skip interface cleanup and recreate the
+            # stale-report problem this drain is intended to prevent.
+            continue
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compact FNB58 voltage/current/power logger")
-    parser.add_argument("-o", "--output", default="-", help="CSV path; use .gz for gzip compression, '-' for stdout")
-    parser.add_argument("--flush-seconds", type=float, default=1.0, help="flush interval; 0 flushes every report")
+    parser = argparse.ArgumentParser(
+        description="Compact FNB58 voltage/current/power logger"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="-",
+        help="CSV path; use .gz for gzip compression, '-' for stdout",
+    )
+    parser.add_argument(
+        "--flush-seconds",
+        type=float,
+        default=1.0,
+        help="flush interval; 0 flushes every report",
+    )
     args = parser.parse_args()
     if args.flush_seconds < 0:
         parser.error("--flush-seconds must be >= 0")
@@ -159,16 +230,16 @@ def main() -> int:
 
     device = None
     interface_number = None
-    detached = False
+    endpoint_in = None
     valid_reports = invalid_reports = 0
 
     try:
-        device, interface_number, detached, endpoint_in, endpoint_out = open_meter()
-        for command in START_COMMANDS:
-            endpoint_out.write(command, timeout=1_000)
+        device, interface_number, endpoint_in, endpoint_out = open_meter()
+
+        for index, command in enumerate(START_COMMANDS, start=1):
+            write_command(endpoint_out, command, f"startup command {index}")
         time.sleep(0.1)
 
-        # 1 second is a protocol keepalive cadence, not the measurement rate.
         next_continue_ns = time.monotonic_ns() + 1_000_000_000
         next_flush_ns = time.monotonic_ns() + int(args.flush_seconds * 1_000_000_000)
         print(
@@ -181,27 +252,37 @@ def main() -> int:
             try:
                 report = bytes(endpoint_in.read(REPORT_SIZE, timeout=1_000))
                 received_ns = time.monotonic_ns()
-            except usb.core.USBTimeoutError:
-                report = b""
-                received_ns = time.monotonic_ns()
+            except usb.core.USBTimeoutError as exc:
+                # Do not issue another request: the timed-out one may still be
+                # pending, and a second OUT write can wedge the meter.
+                raise RuntimeError("FNB58 report read timed out") from exc
 
-            if report:
-                try:
-                    samples = decode(report)
-                except ValueError as exc:
-                    invalid_reports += 1
-                    print(f"warning: skipped report ({exc})", file=sys.stderr)
-                    samples = None
+            try:
+                samples = decode(report)
+            except ValueError as exc:
+                invalid_reports += 1
+                print(f"warning: skipped report ({exc})", file=sys.stderr)
+                samples = None
 
-                if samples is not None:
-                    for index, (voltage, current) in enumerate(samples):
-                        t_ns = received_ns - (SAMPLES_PER_REPORT - 1 - index) * SAMPLE_PERIOD_NS
-                        writer.writerow((t_ns, f"{voltage:.6f}", f"{current:.6f}", f"{voltage * current:.6f}"))
-                    valid_reports += 1
+            if samples is not None:
+                for index, (voltage, current) in enumerate(samples):
+                    t_ns = (
+                        received_ns
+                        - (SAMPLES_PER_REPORT - 1 - index) * SAMPLE_PERIOD_NS
+                    )
+                    writer.writerow(
+                        (
+                            t_ns,
+                            f"{voltage:.6f}",
+                            f"{current:.6f}",
+                            f"{voltage * current:.6f}",
+                        )
+                    )
+                valid_reports += 1
 
             now_ns = time.monotonic_ns()
             if now_ns >= next_continue_ns:
-                try_continue(endpoint_out)
+                write_command(endpoint_out, CONTINUE_COMMAND, "continuation request")
                 next_continue_ns = now_ns + 1_000_000_000
 
             if args.flush_seconds == 0 or now_ns >= next_flush_ns:
@@ -209,19 +290,24 @@ def main() -> int:
                 next_flush_ns = now_ns + int(args.flush_seconds * 1_000_000_000)
 
     except KeyboardInterrupt:
-        print(f"Stopped: {valid_reports} valid, {invalid_reports} invalid reports.", file=sys.stderr)
+        print(
+            f"Stopped: {valid_reports} valid, {invalid_reports} invalid reports.",
+            file=sys.stderr,
+        )
         return 0
+    except (RuntimeError, usb.core.USBError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     finally:
+        if endpoint_in is not None:
+            # Let the last continuation window run dry before releasing the
+            # interface. Bound the drain in case broken firmware never goes quiet.
+            drain_reports(endpoint_in, timeout_ms=1_000, max_seconds=3.0)
         if device is not None and interface_number is not None:
             try:
                 usb.util.release_interface(device, interface_number)
             except usb.core.USBError:
                 pass
-            if detached:
-                try:
-                    device.attach_kernel_driver(interface_number)
-                except usb.core.USBError:
-                    pass
             usb.util.dispose_resources(device)
         if close_stream:
             stream.close()

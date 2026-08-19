@@ -10,10 +10,11 @@ repository over NFS::
       ├──────── ssh ─────────▶  target board  (runs `ave resources`)
       └──────── NFS ─────────▶  target board  (repo + results, same paths)
 
-Per model it starts the power logger on the lab server, runs one sustained
-inference loop on the board, stops the logger, and pulls the trace into the run
-directory next to the board's own artifacts. The board writes its CSVs straight
-to the NFS mount, so nothing has to be copied back from it.
+It starts the power logger once on the lab server, keeps it running across all
+selected inference loops on the board, then stops it and pulls one shared trace.
+That trace is linked into each newly executed run directory next to the board's
+own artifacts. The board writes its CSVs straight to the NFS mount, so nothing
+has to be copied back from it.
 
 Clock alignment
 ---------------
@@ -54,7 +55,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -471,17 +474,23 @@ def main(argv=None) -> int:
         else device_repo / "datasets" / "test-bundle" / "images"
     )
 
-    per_run = (
+    runs_to_execute = [
+        model
+        for model in models
+        if not (args.skip_existing and (output_dir / model.stem / "run.json").exists())
+    ]
+    run_time = (
         args.seconds
         + 2 * args.gap_seconds
         + 2 * args.chirp_seconds
-        + 2 * args.meter_settle
         + args.overhead_estimate
-        + args.cooldown
     )
+    cooldown_time = args.cooldown * max(0, len(runs_to_execute) - 1)
+    meter_time = 2 * args.meter_settle if runs_to_execute and not args.no_meter else 0.0
+    estimated_time = run_time * len(runs_to_execute) + cooldown_time + meter_time
 
     print(
-        f"models          : {len(models)}"
+        f"models          : {len(models)} selected, {len(runs_to_execute)} to run"
         + (f"  (preset {args.preset})" if args.preset else "")
     )
     print(f"device          : {args.device}  (repo {device_repo})")
@@ -489,9 +498,14 @@ def main(argv=None) -> int:
     print(f"delegate        : {delegate}")
     print(f"output          : {output_dir}")
     print(f"device sees     : {device_output}")
+    estimate_parts = [f"{format_duration(run_time)} per run"]
+    if len(runs_to_execute) > 1 and args.cooldown > 0:
+        estimate_parts.append(f"{format_duration(args.cooldown)} between runs")
+    if meter_time:
+        estimate_parts.append(f"{format_duration(meter_time)} one-time meter bracket")
     print(
-        f"estimated time  : {format_duration(per_run * len(models))} "
-        f"({format_duration(per_run)} per run)"
+        f"estimated time  : {format_duration(estimated_time)} "
+        f"({', '.join(estimate_parts)})"
     )
     print()
 
@@ -499,6 +513,10 @@ def main(argv=None) -> int:
     meter_host = Remote(args.meter_host, args.ssh_option, args.meter_python)
 
     remote_logger = f"/tmp/fnirsi_logger_{stamp}.py"
+    remote_power = f"/tmp/power_{stamp}.csv.gz"
+    remote_meter_log = f"/tmp/meter_{stamp}.log"
+    remote_pid_file = f"/tmp/fnirsi_logger_{stamp}.pid"
+    remote_stop_file = f"/tmp/fnirsi_logger_{stamp}.stopping"
 
     sweep: dict[str, Any] = {
         "schema": 1,
@@ -570,10 +588,35 @@ def main(argv=None) -> int:
             ]
         )
 
+    def stop_meter_and_wait(pid: int | None) -> None:
+        """Send SIGINT at most once remotely and wait through local Ctrl-C."""
+
+        pid_source = str(pid) if pid is not None else f"$(cat {remote_pid_file})"
+        command = (
+            f"if test -s {shlex.quote(remote_stop_file)}; then "
+            f"pid=$(cat {shlex.quote(remote_stop_file)}); "
+            "else "
+            f"pid={pid_source}; "
+            f"printf '%s\\n' \"$pid\" > {shlex.quote(remote_stop_file)}; "
+            "kill -INT $pid 2>/dev/null || true; "
+            "fi; "
+            "while kill -0 $pid 2>/dev/null; do sleep 0.1; done"
+        )
+        while True:
+            try:
+                meter_host.run(command, timeout=None)
+                return
+            except KeyboardInterrupt:
+                print("\ninterrupt while awaiting meter; still waiting for cleanup")
+
     if not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if not args.no_meter:
+        if not args.no_meter and runs_to_execute:
+            # Never let a failed final fetch expose a canonical trace left by
+            # an earlier partial sweep. Unlinking preserves any old hard links.
+            (output_dir / "power.csv.gz").unlink(missing_ok=True)
+
             # Staged over stdin rather than scp'd: the lab server needs no
             # checkout of this repo, and the logger that runs is by
             # construction the one in this tree.
@@ -598,12 +641,58 @@ def main(argv=None) -> int:
         ).stdout
 
     completed = failed = skipped = 0
+    meter_pid: int | None = None
+    meter_anchor: dict[str, Any] | None = None
+    meter_start_attempted = False
+    meter_started = False
+    executed_runs: list[tuple[Path, dict[str, Any]]] = []
+    active_record: dict[str, Any] | None = None
+
+    if args.dry_run and runs_to_execute and not args.no_meter:
+        print(
+            f"meter start     : ssh {args.meter_host} "
+            f"'setsid nohup {args.meter_python} {remote_logger} "
+            f"-o {remote_power} &'"
+        )
+        print(f"meter settle    : {args.meter_settle}s (once)\n")
 
     try:
+        if not args.dry_run and runs_to_execute and not args.no_meter:
+            meter_start_attempted = True
+            started = meter_host.script(
+                "set -e\n"
+                f"setsid nohup {shlex.quote(args.meter_python)} "
+                f"{shlex.quote(remote_logger)} -o {shlex.quote(remote_power)} "
+                f"> {shlex.quote(remote_meter_log)} 2>&1 < /dev/null &\n"
+                f"echo $! > {shlex.quote(remote_pid_file)}\n"
+                "echo PID:$!\n"
+                f"{shlex.quote(args.meter_python)} -c "
+                f"{shlex.quote(CLOCK_SNIPPET)}\n",
+                timeout=30.0,
+            )
+
+            for line in started.stdout.splitlines():
+                if line.startswith("PID:"):
+                    meter_pid = int(line[4:])
+                elif line.startswith("("):
+                    epoch, monotonic = eval(line)  # noqa: S307
+                    meter_anchor = {
+                        "t_epoch_s": epoch,
+                        "t_monotonic_ns": monotonic,
+                    }
+
+            # Once a PID has been returned, the finally block owns that process
+            # even if parsing the anchor or a later setup step fails.
+            meter_started = meter_pid is not None
+            if meter_pid is None or meter_anchor is None:
+                raise RuntimeError(f"meter did not start: {started.stderr.strip()}")
+
+            print(f"meter running (pid {meter_pid}), settling…", flush=True)
+            time.sleep(args.meter_settle)
+
         for index, model in enumerate(models, start=1):
             run_name = model.stem
             run_dir = output_dir / run_name
-            remote_power = f"/tmp/power_{stamp}_{run_name}.csv.gz"
 
             header = f"[{index}/{len(models)}] {run_name}"
 
@@ -616,31 +705,29 @@ def main(argv=None) -> int:
 
             if args.dry_run:
                 print(header)
-
                 if not args.no_meter:
                     print(
-                        f"  meter start : ssh {args.meter_host} "
-                        f"'setsid nohup {args.meter_python} {remote_logger} "
-                        f"-o {remote_power} &'"
+                        "  meter       : clock probe before/after (logger stays running)"
                     )
-
                 print(f"  device      : ssh {args.device} {command}")
-
-                if not args.no_meter:
-                    print(f"  meter stop  : ssh {args.meter_host} 'kill -INT <pid>'")
-                    print(
-                        f"  fetch       : ssh {args.meter_host} 'cat {remote_power}' "
-                        f"> {run_dir / 'power.csv.gz'}"
-                    )
-
-                print(f"  cooldown    : {args.cooldown}s\n")
+                if model != runs_to_execute[-1] and args.cooldown > 0:
+                    print(f"  cooldown    : {args.cooldown}s")
+                print()
                 continue
 
             print(header, flush=True)
             run_dir.mkdir(parents=True, exist_ok=True)
+            if not args.no_meter:
+                (run_dir / "power.csv.gz").unlink(missing_ok=True)
 
             record: dict[str, Any] = {"run": run_name, "model": model.name}
-            meter_pid = None
+            active_record = record
+            executed_runs.append((run_dir, record))
+            sweep["runs"].append(record)
+
+            if meter_started:
+                record["meter_pid"] = meter_pid
+                record["meter_anchor"] = meter_anchor
 
             # The board's clock is probed too, and it is not optional: every
             # phase boundary and resource sample is stamped in the *board's*
@@ -654,47 +741,14 @@ def main(argv=None) -> int:
             clock_sync["probes"].append(device_probe_before)
             record["device_clock_probe_before"] = device_probe_before
 
-            # ---- clock probes + meter start ----
-            if not args.no_meter:
+            # ---- per-run meter clock probe (logger is sweep-wide) ----
+            if meter_started:
                 probe_before = probe_clock(meter_host)
                 probe_before["phase"] = "before"
                 probe_before["run"] = run_name
                 probe_before["host"] = "meter"
                 clock_sync["probes"].append(probe_before)
-                # Recorded here, at the point it is taken, rather than at the
-                # end of the run: the tail of this block has several early
-                # exits, and a probe stored only on the happy path is a probe
-                # that goes missing exactly when a run needs explaining.
                 record["meter_clock_probe_before"] = probe_before
-
-                started = meter_host.script(
-                    "set -e\n"
-                    f"setsid nohup {shlex.quote(args.meter_python)} "
-                    f"{shlex.quote(remote_logger)} -o {shlex.quote(remote_power)} "
-                    f"> /tmp/meter_{stamp}.log 2>&1 < /dev/null &\n"
-                    "echo PID:$!\n"
-                    f"{shlex.quote(args.meter_python)} -c {shlex.quote(CLOCK_SNIPPET)}\n",
-                    timeout=30.0,
-                )
-
-                for line in started.stdout.splitlines():
-                    if line.startswith("PID:"):
-                        meter_pid = int(line[4:])
-                    elif line.startswith("("):
-                        epoch, monotonic = eval(line)  # noqa: S307
-                        record["meter_anchor"] = {
-                            "t_epoch_s": epoch,
-                            "t_monotonic_ns": monotonic,
-                        }
-
-                if meter_pid is None:
-                    print(f"  [error] meter did not start: {started.stderr.strip()}")
-                    failed += 1
-                    continue
-
-                record["meter_pid"] = meter_pid
-                print(f"  meter running (pid {meter_pid}), settling…", flush=True)
-                time.sleep(args.meter_settle)
 
             # ---- the run itself ----
             record["device_start_local_s"] = time.time()
@@ -731,10 +785,8 @@ def main(argv=None) -> int:
                 print("  " + (tail[-1] if tail else "done"))
                 completed += 1
 
-            # ---- meter stop + fetch ----
-            if not args.no_meter and meter_pid is not None:
-                time.sleep(args.meter_settle)
-
+            # ---- per-run meter clock probe (stop/fetch happens once below) ----
+            if meter_started:
                 probe_after = probe_clock(meter_host)
                 probe_after["phase"] = "after"
                 probe_after["run"] = run_name
@@ -742,32 +794,10 @@ def main(argv=None) -> int:
                 clock_sync["probes"].append(probe_after)
                 record["meter_clock_probe_after"] = probe_after
 
-                # SIGINT, not SIGTERM: the logger traps KeyboardInterrupt to
-                # flush and close its stream cleanly.
-                meter_host.run(f"kill -INT {meter_pid}", timeout=30.0)
-                time.sleep(1.0)
-
-                fetched = subprocess.run(
-                    [*meter_host.ssh, f"cat {shlex.quote(remote_power)}"],
-                    capture_output=True,
-                    timeout=300.0,
-                )
-
-                if fetched.returncode == 0 and fetched.stdout:
-                    (run_dir / "power.csv.gz").write_bytes(fetched.stdout)
-                    record["power_bytes"] = len(fetched.stdout)
-                    print(f"  power trace: {len(fetched.stdout) / 1024:.0f} KiB")
-                else:
-                    print("  [warning] no power trace retrieved")
-                    record["power_bytes"] = 0
-
-                meter_host.run(f"rm -f {shlex.quote(remote_power)}", timeout=30.0)
-
-            sweep["runs"].append(record)
-
             (run_dir / "sweep_run.json").write_text(json.dumps(record, indent=2) + "\n")
+            active_record = None
 
-            if index < len(models) and args.cooldown > 0:
+            if model != runs_to_execute[-1] and args.cooldown > 0:
                 print(f"  cooldown {args.cooldown:.0f}s", flush=True)
                 time.sleep(args.cooldown)
 
@@ -776,13 +806,104 @@ def main(argv=None) -> int:
 
     finally:
         if not args.dry_run:
-            if not args.no_meter:
-                # Belt and braces: a logger orphaned by an interrupt would keep
-                # the meter busy and silently corrupt the next sweep.
-                meter_host.run(
-                    f"pkill -INT -f {shlex.quote(remote_logger)} || true", timeout=30.0
+            if meter_started and meter_pid is not None:
+                # Preserve an after-probe for an interrupted in-flight run when
+                # possible. Normal runs take this probe in the loop above.
+                if (
+                    active_record is not None
+                    and "meter_clock_probe_before" in active_record
+                    and "meter_clock_probe_after" not in active_record
+                ):
+                    try:
+                        probe_after = probe_clock(meter_host)
+                        probe_after["phase"] = "after"
+                        probe_after["run"] = active_record["run"]
+                        probe_after["host"] = "meter"
+                        clock_sync["probes"].append(probe_after)
+                        active_record["meter_clock_probe_after"] = probe_after
+                    except (Exception, KeyboardInterrupt) as exc:
+                        print(f"  [warning] final meter clock probe failed: {exc}")
+
+                try:
+                    time.sleep(args.meter_settle)
+                except KeyboardInterrupt:
+                    print("\ninterrupt during meter settle; cleaning up now")
+
+                print(
+                    f"stopping meter pid {meter_pid} and awaiting cleanup…", flush=True
                 )
-                meter_host.run(f"rm -f {shlex.quote(remote_logger)}", timeout=30.0)
+                try:
+                    # One SIGINT lets fnirsi_logger.py drain USB reports and
+                    # close gzip. Do not fetch until kill -0 says it has exited.
+                    stop_meter_and_wait(meter_pid)
+
+                    fetched = subprocess.run(
+                        [*meter_host.ssh, f"cat {shlex.quote(remote_power)}"],
+                        capture_output=True,
+                        timeout=300.0,
+                    )
+                except (Exception, KeyboardInterrupt) as exc:
+                    print(f"  [warning] meter cleanup/fetch failed: {exc}")
+                    fetched = None
+
+                power_bytes = 0
+                if fetched is not None and fetched.returncode == 0 and fetched.stdout:
+                    canonical_power = output_dir / "power.csv.gz"
+                    temporary_power = output_dir / ".power.csv.gz.tmp"
+                    temporary_power.write_bytes(fetched.stdout)
+                    temporary_power.replace(canonical_power)
+                    power_bytes = len(fetched.stdout)
+
+                    for executed in executed_runs:
+                        run_power = executed[0] / "power.csv.gz"
+                        run_power.unlink(missing_ok=True)
+                        try:
+                            os.link(canonical_power, run_power)
+                        except OSError:
+                            shutil.copy2(canonical_power, run_power)
+
+                    print(f"power trace: {power_bytes / 1024:.0f} KiB (shared)")
+                else:
+                    print("  [warning] no finalized power trace retrieved")
+
+                for executed in executed_runs:
+                    executed[1]["power_bytes"] = power_bytes
+
+                try:
+                    meter_host.run(
+                        f"rm -f {shlex.quote(remote_power)} "
+                        f"{shlex.quote(remote_logger)} "
+                        f"{shlex.quote(remote_pid_file)} "
+                        f"{shlex.quote(remote_stop_file)}",
+                        timeout=30.0,
+                    )
+                except (Exception, KeyboardInterrupt) as exc:
+                    print(f"  [warning] remote meter cleanup failed: {exc}")
+            elif meter_start_attempted:
+                # If ssh failed after launch but before returning PID:$!, the
+                # pid file still lets this path stop and await the logger.
+                try:
+                    stop_meter_and_wait(None)
+                    meter_host.run(
+                        f"rm -f {shlex.quote(remote_power)} "
+                        f"{shlex.quote(remote_logger)} "
+                        f"{shlex.quote(remote_pid_file)} "
+                        f"{shlex.quote(remote_stop_file)}",
+                        timeout=30.0,
+                    )
+                except Exception as exc:
+                    print(f"  [warning] remote meter cleanup failed: {exc}")
+            elif not args.no_meter and runs_to_execute:
+                # Staging may have succeeded even if startup was never reached.
+                try:
+                    meter_host.run(f"rm -f {shlex.quote(remote_logger)}", timeout=30.0)
+                except (Exception, KeyboardInterrupt) as exc:
+                    print(f"  [warning] remote meter cleanup failed: {exc}")
+
+            for run_dir, record in executed_runs:
+                (run_dir / "sweep_run.json").write_text(
+                    json.dumps(record, indent=2) + "\n"
+                )
 
             sweep["finished"] = datetime.now(timezone.utc).isoformat()
             sweep["completed"] = completed
@@ -795,7 +916,15 @@ def main(argv=None) -> int:
             )
 
     if args.dry_run:
-        print(f"dry run: {len(models)} run(s) planned")
+        if runs_to_execute and not args.no_meter:
+            print(f"meter settle    : {args.meter_settle}s (once)")
+            print(f"meter stop      : ssh {args.meter_host} 'kill -INT <pid>; wait' ")
+            print(
+                f"fetch once      : ssh {args.meter_host} 'cat {remote_power}' "
+                f"> {output_dir / 'power.csv.gz'}"
+            )
+            print("distribute      : hard-link into each new run (copy fallback)\n")
+        print(f"dry run: {len(runs_to_execute)} run(s) planned, {skipped} skipped")
         return 0
 
     print(f"\ndone: {completed} completed, {failed} failed, {skipped} skipped")
