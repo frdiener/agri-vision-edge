@@ -337,7 +337,7 @@ def main(argv=None) -> int:
         default=None,
         help=(
             "Sweep directory; must be inside the repo so the board can write "
-            "to it over NFS (default: benchmark_results/power/<host>/<stamp>)"
+            "to it over NFS (default: resource_results/<host>/<stamp>)"
         ),
     )
     selection.add_argument(
@@ -451,9 +451,11 @@ def main(argv=None) -> int:
         output_dir = Path(args.output).resolve()
     else:
         suffix = "_cpu" if args.cpu else ""
-        output_dir = (
-            REPO_ROOT / "benchmark_results" / "power" / f"{device_tag}{suffix}" / stamp
-        )
+        # Sibling of benchmark_results/, not a subtree of it: `ave resources`
+        # is a separate measurement path (steady-state cost, not predictions)
+        # and already defaults here, and a `power/` directory inside
+        # benchmark_results/ gets scanned as if it were a platform.
+        output_dir = REPO_ROOT / "resource_results" / f"{device_tag}{suffix}" / stamp
 
     # The board reaches the results tree only through the NFS mount, so the
     # sweep directory has to be expressible as a repo-relative path.
