@@ -5,12 +5,15 @@
 # name. Tiling is encoded by the tiled_ / untiled_ result-directory prefix.
 #
 # Usage:
-#   scripts/evaluate_all.sh [--faithful [--only-relevant]] [target-dir]
+#   scripts/evaluate_all.sh [--faithful [--only-relevant]] [--overwrite] [target-dir]
 #
 # target-dir defaults to benchmark_results/<hostname>. Each immediate subdir is
 # expected to contain a predictions.json (as written by `ave benchmark`);
 # dirs without one (e.g. failed runs holding error.json) are skipped. metrics.json
-# is written beside each predictions.json.
+# is written beside each predictions.json. Existing metrics are skipped by
+# default; pass --overwrite to regenerate them. Lightweight and faithful outputs
+# are checked independently, so a missing metrics_faithful.json is still created
+# when metrics.json already exists.
 #
 # Pass --faithful to ALSO run the official PhenoBench evaluator
 # (`ave evaluate --faithful`, writing metrics_faithful.json) alongside the
@@ -56,6 +59,7 @@ raw_tiled_dir="${PHENOBENCH_RAW_TILED:-${repo_root}/datasets/phenobench_raw_tile
 
 faithful=0
 only_relevant=0
+overwrite=0
 target_dir=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -65,7 +69,22 @@ while [[ $# -gt 0 ]]; do
         --only-relevant)
             only_relevant=1
             ;;
+        --overwrite)
+            overwrite=1
+            ;;
+        -h|--help)
+            echo "usage: $0 [--faithful [--only-relevant]] [--overwrite] [target-dir]"
+            exit 0
+            ;;
+        --*)
+            echo "unknown option: $1" >&2
+            exit 2
+            ;;
         *)
+            if [[ -n "${target_dir}" ]]; then
+                echo "multiple target directories provided: ${target_dir} and $1" >&2
+                exit 2
+            fi
             target_dir="$1"
             ;;
     esac
@@ -106,6 +125,8 @@ for model_dir in "${target_dir}"/*/; do
 
     name="$(basename "${model_dir}")"
     predictions="${model_dir}predictions.json"
+    metrics="${model_dir}metrics.json"
+    faithful_metrics="${model_dir}metrics_faithful.json"
 
     if [[ ! -f "${predictions}" ]]; then
         echo "[skip] ${name}: no predictions.json"
@@ -137,17 +158,27 @@ for model_dir in "${target_dir}"/*/; do
         continue
     fi
 
-    echo "[eval] ${name}  (annotations=$(basename "${annotations}"))"
-    "${script_dir}/ave" evaluate \
-        "${annotations}" \
-        "${predictions}"
+    if [[ -f "${metrics}" && ${overwrite} -eq 0 ]]; then
+        echo "[eval-skip] ${name}: metrics.json already exists"
+        skipped=$((skipped + 1))
+    else
+        echo "[eval] ${name}  (annotations=$(basename "${annotations}"))"
+        "${script_dir}/ave" evaluate \
+            "${annotations}" \
+            "${predictions}"
+        evaluated=$((evaluated + 1))
+    fi
 
     # Optional: official upstream (faithful) evaluation, using the raw dataset
-    # that matches this model's tiling.
+    # that matches this model's tiling. Its output is checked independently from
+    # the lightweight metrics above.
     if [[ ${faithful} -eq 1 ]]; then
         if [[ ${only_relevant} -eq 1 ]] && ! is_relevant_for_faithful "${name}"; then
             echo "[faithful-skip] ${name}: not leaderboard-comparable" \
                  "(--only-relevant keeps untiled_ + mc only)"
+            faithful_skipped=$((faithful_skipped + 1))
+        elif [[ -f "${faithful_metrics}" && ${overwrite} -eq 0 ]]; then
+            echo "[faithful-skip] ${name}: metrics_faithful.json already exists"
             faithful_skipped=$((faithful_skipped + 1))
         elif [[ ! -d "${raw_dir}" ]]; then
             echo "[warn] ${name}: raw dataset not found at ${raw_dir}" >&2
@@ -165,8 +196,6 @@ for model_dir in "${target_dir}"/*/; do
                         "torch/torchvision/torchmetrics)" >&2
         fi
     fi
-
-    evaluated=$((evaluated + 1))
 done
 
 echo
