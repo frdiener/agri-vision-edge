@@ -3,8 +3,8 @@ Batch TFLite conversion of trained TF model variants.
 
 Ports the conversion path of ``notebooks/tflite_conversion.py`` into a reusable
 function for the ``ave convert`` CLI: for a model variant under ``artifacts/tf/``
-it rebuilds the deployable TFLite models (default IoU threshold, fast NMS) and
-embeds ObjectDetector metadata. Conversion + metadata only -- no evaluation.
+it rebuilds the deployable TFLite models (default IoU threshold) and embeds
+ObjectDetector metadata. Conversion + metadata only -- no evaluation.
 
 For each variant the standard targets below are produced *as long as the backing
 stage is present* (``ptq/``, ``qat_per-tensor/`` or ``qat_per-channel/``):
@@ -18,13 +18,26 @@ stage is present* (``ptq/``, ``qat_per-tensor/`` or ``qat_per-channel/``):
 PTQ per-channel reuses the per-tensor ``ptq/`` checkpoint (granularity is a
 converter flag); QAT trains a distinct checkpoint per granularity, so each has
 its own stage directory (``qat_per-tensor/`` and ``qat_per-channel/``).
+
+Each of those is emitted twice, once per NMS flavour:
+
+    _fastnms   class-agnostic NMS over each anchor's argmax class. This is
+               what ships to the device.
+    _regnms    per-class NMS, i.e. what the training checkpoint's
+               ``batch_multiclass_non_max_suppression`` does. Built as the
+               control that isolates the cost of the substitution.
+
+The pair differs only in the ``use_regular_nms`` attribute of the emitted
+``TFLite_Detection_PostProcess`` op -- same checkpoint, same graph, same
+calibration -- so any delta between them is attributable to post-processing
+alone.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # Calibration samples drawn from the representative dataset for int8 PTQ.
@@ -33,11 +46,18 @@ _REPRESENTATIVE_SAMPLES = 200
 
 @dataclass(frozen=True)
 class ConversionTarget:
-    """One deployable model: a (precision, checkpoint, granularity) combination."""
+    """One deployable model: a (precision, checkpoint, granularity, NMS) combination."""
 
     precision: str  # "int8" | "fp32"
     quantization: str  # "ptq" | "qat"
     per_channel: bool
+
+    #: Post-processing flavour baked into ``TFLite_Detection_PostProcess``.
+    #: ``False`` (default) is the shipping one: class-agnostic "fast" NMS over
+    #: each anchor's argmax class. ``True`` reproduces the checkpoint's per-class
+    #: NMS and exists as the control for the substitution's cost -- it does not
+    #: change the graph, only the custom op's ``use_regular_nms`` attribute.
+    regular_nms: bool = False
 
     @property
     def stage_candidates(self) -> tuple[str, ...]:
@@ -63,30 +83,55 @@ class ConversionTarget:
         )
 
     @property
+    def nms(self) -> str:
+        """``"regular"`` (per-class) or ``"fast"`` (class-agnostic)."""
+        return "regular" if self.regular_nms else "fast"
+
+    @property
+    def nms_suffix(self) -> str:
+        """Filename token for the NMS flavour.
+
+        Matches the naming ``notebooks/tflite_conversion.py`` has always used,
+        so the two conversion paths stay interchangeable.
+        """
+        return "_regnms" if self.regular_nms else "_fastnms"
+
+    @property
     def suffix(self) -> str:
-        """Filename suffix appended to the variant stem (always fast NMS)."""
+        """Filename suffix appended to the variant stem."""
         # int8 models carry their weight granularity explicitly (per-tensor vs
         # per-channel); fp32 has no quantization granularity, so it stays bare.
         if self.precision == "int8":
             granularity = "_per-channel" if self.per_channel else "_per-tensor"
         else:
             granularity = ""
-        return f"{self.precision}_{self.quantization}{granularity}_fastnms"
+        return f"{self.precision}_{self.quantization}{granularity}{self.nms_suffix}"
 
     @property
     def label(self) -> str:
-        return self.suffix.removesuffix("_fastnms")
+        return self.suffix.removesuffix(self.nms_suffix)
 
 
-# Emitted per variant, in dependency order (PTQ first). A target is skipped when
-# its stage_subdir is absent.
-STANDARD_TARGETS: tuple[ConversionTarget, ...] = (
+#: The deployable set: what actually ships to the device.
+FAST_NMS_TARGETS: tuple[ConversionTarget, ...] = (
     ConversionTarget("int8", "ptq", per_channel=False),
     ConversionTarget("int8", "ptq", per_channel=True),
     ConversionTarget("fp32", "ptq", per_channel=False),
     ConversionTarget("int8", "qat", per_channel=False),
     ConversionTarget("int8", "qat", per_channel=True),
 )
+
+#: The per-class-NMS control for each of them. Same checkpoint, same graph, same
+#: calibration -- only the custom op's ``use_regular_nms`` attribute differs, so
+#: the pair isolates the post-processing substitution from everything else.
+REGULAR_NMS_TARGETS: tuple[ConversionTarget, ...] = tuple(
+    replace(target, regular_nms=True) for target in FAST_NMS_TARGETS
+)
+
+# Emitted per variant, in dependency order: PTQ first, and the deployable
+# fast-NMS set before its controls, so an interrupted sweep has produced the
+# models that ship. A target is skipped when its backing stage is absent.
+STANDARD_TARGETS: tuple[ConversionTarget, ...] = FAST_NMS_TARGETS + REGULAR_NMS_TARGETS
 
 
 def stage_graph_flags(stage_name: str) -> tuple[bool, bool]:
@@ -345,11 +390,16 @@ def _convert_one(
             for_export=True,
         )
 
+    # Fast NMS (the default) is what ships; regular NMS reproduces the
+    # checkpoint's per-class `batch_multiclass_non_max_suppression` and is built
+    # as its control. Nothing else about the graph changes -- this only sets the
+    # `use_regular_nms` attribute of the TFLite_Detection_PostProcess op that
+    # MLIR legalizes the `dummy_post_processing` stub into.
     detection_module = SSDModule(
         pipeline_config,
         detection_model,
         max_detections=max_detections,
-        use_regular_nms=False,
+        use_regular_nms=target.regular_nms,
     )
 
     ckpt = tf.train.Checkpoint(model=detection_model)
@@ -381,7 +431,8 @@ def _convert_one(
         converter.representative_dataset = _representative_dataset_fn(
             variant_dir.name, datasets_dir, resolution
         )
-        converter._experimental_new_quantizer = True # this may be set to false if problems arise.
+        # This may be set to False if problems arise.
+        converter._experimental_new_quantizer = True
         converter._experimental_disable_per_channel = not target.per_channel
     else:  # fp32: keep float weights, no calibration, float builtins only.
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
@@ -398,7 +449,7 @@ def _convert_one(
         num_classes=num_classes,
         extra_metadata={
             "iou_threshold": iou_threshold,
-            "nms": "fast",
+            "nms": target.nms,
             "max_detections": max_detections,
             "score_threshold": score_threshold,
         },
@@ -423,6 +474,10 @@ def convert_variant(
     existing outputs are skipped unless ``overwrite`` is set. Returns the list of
     written ``.tflite`` paths.
 
+    ``targets`` defaults to :data:`STANDARD_TARGETS`, i.e. every deployable
+    model *and* its per-class-NMS control. Pass :data:`FAST_NMS_TARGETS` to
+    build only what ships.
+
     ``native_resize`` (default True) builds FPN models with the NPU-delegatable
     ``RESIZE_NEAREST_NEIGHBOR`` upsample instead of the ``PACK`` reshape trick, so
     the full FPN graph delegates to the Teflon/etnaviv NPU; no-op for non-FPN
@@ -431,6 +486,10 @@ def convert_variant(
     written: list[Path] = []
 
     for target in targets:
+        # `label` drops the NMS token, so the flavour has to be named
+        # explicitly or the two halves of a pair log identical lines.
+        description = f"{target.label} ({target.nms} NMS)"
+
         stage_dir = next(
             (
                 variant_dir / name
@@ -442,7 +501,7 @@ def convert_variant(
 
         if stage_dir is None:
             log(
-                f"  skip {target.label}: none of "
+                f"  skip {description}: none of "
                 f"{'/'.join(target.stage_candidates)} present"
             )
             continue
@@ -450,10 +509,10 @@ def convert_variant(
         out_path = out_dir / f"{variant_dir.name}_{target.suffix}.tflite"
 
         if out_path.exists() and not overwrite:
-            log(f"  skip {target.label}: exists ({out_path.name})")
+            log(f"  skip {description}: exists ({out_path.name})")
             continue
 
-        log(f"  convert {target.label} ({stage_dir.name}) -> {out_path.name}")
+        log(f"  convert {description} ({stage_dir.name}) -> {out_path.name}")
         _convert_one(
             variant_dir,
             target,

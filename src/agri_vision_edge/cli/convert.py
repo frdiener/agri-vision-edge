@@ -4,8 +4,13 @@ Batch-convert trained TF model variants to deployable TFLite models.
 For each variant under ``artifacts/tf/`` (or a single named variant), build the
 standard int8/fp32 TFLite models -- one per training stage that is present
 (``ptq`` -> int8/int8 per-channel/fp32, ``qat_per-tensor`` -> int8,
-``qat_per-channel`` -> int8 per-channel) -- with the default IoU threshold and
-fast NMS, embedding ObjectDetector metadata. Conversion only; no evaluation.
+``qat_per-channel`` -> int8 per-channel) -- with the default IoU threshold,
+embedding ObjectDetector metadata. Conversion only; no evaluation.
+
+Each model is built in both NMS flavours (``--nms``): the deployable
+``_fastnms`` one and its ``_regnms`` control, which keeps the checkpoint's
+per-class NMS so the post-processing substitution can be priced separately from
+the conversion itself.
 """
 
 from __future__ import annotations
@@ -62,6 +67,17 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
+        "--nms",
+        choices=("both", "fast", "regular"),
+        default="both",
+        help=(
+            "post-processing flavour to build: 'fast' is the deployable "
+            "class-agnostic NMS (_fastnms), 'regular' the per-class control "
+            "matching the training checkpoint (_regnms), 'both' the pair "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="reconvert even if the output .tflite already exists",
@@ -86,7 +102,18 @@ def main(argv=None):
             parser.error(f"no variants found under {args.artifacts}")
 
     # Imported here so other `ave` subcommands don't pull in TensorFlow.
-    from agri_vision_edge.conversion.tflite import convert_variant
+    from agri_vision_edge.conversion.tflite import (
+        FAST_NMS_TARGETS,
+        REGULAR_NMS_TARGETS,
+        STANDARD_TARGETS,
+        convert_variant,
+    )
+
+    targets = {
+        "both": STANDARD_TARGETS,
+        "fast": FAST_NMS_TARGETS,
+        "regular": REGULAR_NMS_TARGETS,
+    }[args.nms]
 
     total = 0
     for variant_dir in variant_dirs:
@@ -95,6 +122,7 @@ def main(argv=None):
             variant_dir,
             datasets_dir=args.datasets,
             out_dir=args.out,
+            targets=targets,
             iou_threshold=args.iou,
             native_resize=args.native_resize,
             overwrite=args.overwrite,
