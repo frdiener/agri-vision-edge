@@ -16,6 +16,11 @@
 # benchmark_results/<hostname>_cpu/ instead, for a clean CPU-only run alongside
 # the delegated one.
 #
+# The platform directory is $(hostname), plus --suffix for a tree that is the
+# same board under a different delegate build, plus _cpu when --cpu is given:
+#   --suffix unpatched            -> benchmark_results/<hostname>_unpatched/
+#   --suffix unpatched --cpu      -> benchmark_results/<hostname>_unpatched_cpu/
+#
 # This script only *measures*: it writes predictions.json / latency.json /
 # runtime.json and stops there. Scoring is a separate step -- run
 # scripts/evaluate_all.sh afterwards. Keeping the two apart matters on a device:
@@ -42,6 +47,7 @@ bundle_dir="${repo_root}/datasets/test-bundle"
 override=0
 cpu_only=0
 delegate="/usr/lib/libteflon.so"
+suffix=""
 forward_args=()
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +65,13 @@ while [[ $# -gt 0 ]]; do
         --delegate=*)
             delegate="${1#*=}"
             ;;
+        --suffix)
+            suffix="$2"
+            shift
+            ;;
+        --suffix=*)
+            suffix="${1#*=}"
+            ;;
         *)
             forward_args+=("$1")
             ;;
@@ -67,12 +80,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 # CPU-only runs go to a separate <hostname>_cpu/ tree so they don't clobber the
-# delegated results.
-if [[ ${cpu_only} -eq 1 ]]; then
-    output_root="${repo_root}/benchmark_results/$(hostname)_cpu"
-else
-    output_root="${repo_root}/benchmark_results/$(hostname)"
+# delegated results; --suffix separates whole trees measured on the same board
+# under a different delegate build, and `_cpu` stays last so it names the
+# unaccelerated variant of whichever tree that is.
+platform="$(hostname)"
+if [[ -n "${suffix}" ]]; then
+    platform="${platform}_${suffix#_}"
 fi
+
+if [[ ${cpu_only} -eq 1 ]]; then
+    platform="${platform}_cpu"
+fi
+
+output_root="${repo_root}/benchmark_results/${platform}"
 
 shopt -s nullglob
 models=("${models_dir}"/*.tflite)
