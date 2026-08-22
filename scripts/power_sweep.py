@@ -412,6 +412,17 @@ def main(argv=None) -> int:
         ),
     )
     meter.add_argument(
+        "--meter-stop-grace",
+        type=float,
+        default=15.0,
+        help=(
+            "Seconds to wait at each shutdown stage before escalating "
+            "INT -> TERM -> KILL. INT lets the logger finalize its gzip "
+            "stream, but a logger blocked on a misbehaving meter cannot "
+            "receive it, so the wait is bounded (default: %(default)s)"
+        ),
+    )
+    meter.add_argument(
         "--no-meter",
         action="store_true",
         help="skip the power meter entirely (resource-only sweep)",
@@ -591,9 +602,24 @@ def main(argv=None) -> int:
         )
 
     def stop_meter_and_wait(pid: int | None) -> None:
-        """Send SIGINT at most once remotely and wait through local Ctrl-C."""
+        """
+        Stop the logger, escalating rather than waiting forever.
+
+        SIGINT first and only once, so the logger can finalize its gzip stream;
+        the stop file records that it was sent so a retry does not interrupt the
+        finalization it is waiting for. But INT is not always deliverable: a
+        logger blocked in an uninterruptible USB read -- a misbehaving meter,
+        which is the case worth surviving -- stays in ``D`` state with the
+        signal pending, and the original unbounded wait then hung the sweep at
+        "awaiting cleanup" with local Ctrl-C caught and ignored.
+
+        So each stage is bounded, and TERM then KILL follow. Losing the gzip
+        footer of a trace costs its tail; hanging costs the sweep.
+        """
 
         pid_source = str(pid) if pid is not None else f"$(cat {remote_pid_file})"
+        grace = max(args.meter_stop_grace, 1.0)
+
         command = (
             f"if test -s {shlex.quote(remote_stop_file)}; then "
             f"pid=$(cat {shlex.quote(remote_stop_file)}); "
@@ -602,18 +628,35 @@ def main(argv=None) -> int:
             f"printf '%s\\n' \"$pid\" > {shlex.quote(remote_stop_file)}; "
             "kill -INT $pid 2>/dev/null || true; "
             "fi; "
-            "while kill -0 $pid 2>/dev/null; do "
-            "state=$(awk '{print $3}' /proc/$pid/stat 2>/dev/null || true); "
-            'test "$state" = Z && break; '
-            "sleep 0.1; "
-            "done"
+            "gone() { "
+            "  kill -0 $pid 2>/dev/null || return 0; "
+            "  state=$(awk '{print $3}' /proc/$pid/stat 2>/dev/null || true); "
+            '  test "$state" = Z; '
+            "}; "
+            "for stage in INT TERM KILL; do "
+            "  i=0; "
+            f"  while [ $i -lt {max(int(grace * 10), 1)} ]; "
+            "  do gone && break; sleep 0.1; i=$((i+1)); done; "
+            '  gone && { echo "stopped after $stage"; exit 0; }; '
+            '  test "$stage" = INT || kill -$stage $pid 2>/dev/null || true; '
+            "done; "
+            'gone && echo "stopped after KILL" || echo "STILL RUNNING"'
         )
-        while True:
-            try:
-                meter_host.run(command, timeout=None)
-                return
-            except KeyboardInterrupt:
-                print("\ninterrupt while awaiting meter; still waiting for cleanup")
+
+        try:
+            result = meter_host.run(command, timeout=3 * grace + 30.0)
+        except subprocess.TimeoutExpired:
+            print(
+                f"meter pid {pid} did not stop within "
+                f"{3 * grace + 30.0:.0f}s — leaving it and continuing; "
+                f"check {args.meter_host} by hand",
+                flush=True,
+            )
+            return
+
+        outcome = (result.stdout or "").strip().splitlines()
+        if outcome and outcome[-1] != "stopped after INT":
+            print(f"meter stop: {outcome[-1]}", flush=True)
 
     if not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -707,6 +750,26 @@ def main(argv=None) -> int:
 
             print(f"meter running (pid {meter_pid}), settling…", flush=True)
             time.sleep(args.meter_settle)
+
+            # The logger creates its gzip stream whether or not the meter is
+            # actually delivering samples, so a dead FNB58 looks exactly like a
+            # healthy one until the trace is opened hours later. One sweep ran
+            # 83 models over ~2.8 h against a trace that turned out to hold
+            # nothing but its CSV header. Cost of checking here: one ssh.
+            settled = meter_host.run(
+                f"gzip -dc {shlex.quote(remote_power)} 2>/dev/null | head -5 | wc -l"
+            )
+            try:
+                sample_lines = int(settled.stdout.strip() or 0)
+            except ValueError:
+                sample_lines = 0
+
+            if sample_lines < 2:
+                raise RuntimeError(
+                    f"meter logged no samples in {args.meter_settle}s "
+                    f"({remote_power} holds only its header) — check the FNB58 "
+                    "is connected and powered before spending the sweep on it"
+                )
 
         for index, model in enumerate(models, start=1):
             run_name = model.stem
@@ -936,7 +999,10 @@ def main(argv=None) -> int:
     if args.dry_run:
         if runs_to_execute and not args.no_meter:
             print(f"meter settle    : {args.meter_settle}s (once)")
-            print(f"meter stop      : ssh {args.meter_host} 'kill -INT <pid>; wait' ")
+            print(
+                f"meter stop      : ssh {args.meter_host} "
+                f"'kill -INT/-TERM/-KILL <pid>', {args.meter_stop_grace}s per stage"
+            )
             print(
                 f"fetch once      : ssh {args.meter_host} 'cat {remote_power}' "
                 f"> {output_dir / 'power.csv.gz'}"
