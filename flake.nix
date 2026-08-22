@@ -21,6 +21,8 @@
             netron
             microcom
 
+            graphviz  # experiment visualization
+
             uv
 
             # deployment tools
