@@ -225,6 +225,21 @@ class RunResult:
     detection_model: object
     configs: dict
 
+    #: Why the training loop returned (see ``training.TrainOutcome``). Notably
+    #: ``outcome.budget_exhausted`` tells a notebook whether this run finished
+    #: or merely ran out of wall clock and has to be resumed in another session.
+    #: Optional so callers constructing a ``RunResult`` by hand keep working.
+    outcome: object = None
+
+    @property
+    def converged(self) -> bool:
+        """
+        False only when the run stopped on its wall-clock budget. A run with no
+        budget configured cannot end that way, so this is True for every run
+        that predates ``max_runtime_hours``.
+        """
+        return getattr(self.outcome, "converged", True)
+
 
 def write_pipeline(cfg: FinetuneRunConfig) -> Path:
     """
@@ -406,7 +421,7 @@ def run_finetune(cfg) -> RunResult:
         eval_ignore_partials=cfg.control.eval_ignore_partials,
     )
 
-    train(
+    outcome = train(
         detection_model,
         runtime,
         trainer_cfg,
@@ -420,4 +435,5 @@ def run_finetune(cfg) -> RunResult:
         history_path=trainer_cfg.history_path,
         detection_model=detection_model,
         configs=configs,
+        outcome=outcome,
     )

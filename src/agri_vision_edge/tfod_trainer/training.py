@@ -5,6 +5,7 @@ Training loop.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
 import tensorflow as tf
 from object_detection import inputs
@@ -351,6 +352,27 @@ def assert_finite_model(detection_model, step):
         )
 
 
+@dataclass
+class TrainOutcome:
+    """
+    Why the training loop returned.
+
+    ``budget_exhausted`` is the one the caller must not ignore: it means the run
+    stopped on the clock rather than on a stopping rule, so the model is
+    *unconverged* and the train dir has to be carried into another session. Every
+    other outcome (a metric-driven stop, or reaching the step horizon) means the
+    run is done and the train dir is disposable.
+    """
+
+    stop_reason: str | None = None
+    budget_exhausted: bool = False
+    final_step: int = 0
+
+    @property
+    def converged(self) -> bool:
+        return not self.budget_exhausted
+
+
 def train(
     detection_model,
     runtime,
@@ -375,11 +397,37 @@ def train(
     )
 
     # Restore weights before training (resume, fine-tune, and EMA setup).
-    restore_weights(
+    resumed = restore_weights(
         detection_model,
         runtime,
         train_ds,
     )
+
+    # The checkpoint restored weights, optimizer slots and the global step; the
+    # trainer's own bookkeeping lives outside it and has to be reloaded
+    # explicitly, or the run would restart its schedule from scratch (best
+    # metric back to -inf, plateau patience back to zero, curves truncated to
+    # this session). Only trusted on an actual resume: a state file left in a
+    # train dir whose checkpoints are gone describes weights we no longer have.
+    if resumed and trainer_cfg.state_path.is_file():
+        state = TrainerState.load(
+            trainer_cfg.state_path,
+            train_dir=trainer_cfg.train_dir,
+            history_path=trainer_cfg.history_path,
+        )
+        print(
+            f"Resumed trainer state: best={state.best_metric:.5f} "
+            f"plateau={state.plateau_counter}/{trainer_cfg.control.lr_plateau_patience} "
+            f"cooldown={state.cooldown_counter} "
+            f"floored_stalls={state.min_lr_stall_counter} "
+            f"history={len(state.metrics_history)} record(s)."
+        )
+    elif resumed:
+        print(
+            "Resumed from a checkpoint with no trainer_state.json alongside it: "
+            "schedule bookkeeping restarts from scratch (pre-resume evals are "
+            "not in the history and the best-metric tracker is re-seeded)."
+        )
 
     # Apply optimizer reset / BN folding / backbone QAT before the train
     # step is traced, so the modified optimizer and backbone are captured.
@@ -422,7 +470,10 @@ def train(
     # "best" checkpoint is never worse than the starting point: a reduced
     # schedule that only ever regresses (e.g. a PTQ float base resuming an
     # already-converged finetune) will export the baseline itself.
-    if trainer_cfg.control.initial_eval_checkpoint:
+    # Skipped on a resume: the tracker is already seeded from the restored
+    # state, and re-seeding it here would overwrite a genuinely better earlier
+    # best with whatever the mid-run weights happen to score.
+    if trainer_cfg.control.initial_eval_checkpoint and not resumed:
         current_step = int(runtime.global_step.numpy())
 
         print(
@@ -505,6 +556,24 @@ def train(
             "Epoch geometry unavailable (no train_samples in bundle metadata); "
             f"falling back to eval every {eval_interval} steps."
         )
+
+    # Wall-clock budget, measured from here so it covers training and the
+    # evaluations interleaved with it -- at high resolution the evals are the
+    # larger half, and a budget that ignored them would overshoot badly.
+    wall_clock_start = time.time()
+    runtime_budget_seconds = (
+        control.max_runtime_hours * 3600
+        if control.max_runtime_hours is not None
+        else None
+    )
+    if runtime_budget_seconds is not None:
+        print(
+            f"Wall-clock budget: {control.max_runtime_hours:.2f} h "
+            "(checked at evaluation boundaries; the run stops gracefully so it "
+            "can export and be resumed)."
+        )
+
+    outcome = TrainOutcome()
 
     print("Making trainstep_fn...")
     train_step_fn = make_train_step(runtime, detection_model)
@@ -660,11 +729,36 @@ def train(
                 f"{state.patience_counter}/{es_limit}"
             )
 
+        # The stop conditions below record their reason rather than breaking
+        # immediately, so the trainer state can be persisted once, after the
+        # counters settle, on every path out of the eval block.
+        stop_reason = None
+
+        # 0) Wall-clock budget. Checked first and independently of the metric:
+        #    this is not a statement about convergence but about the session
+        #    being about to end, and stopping here is what lets the run export
+        #    and be resumed rather than be killed mid-step.
+        if runtime_budget_seconds is not None:
+            elapsed = time.time() - wall_clock_start
+            if elapsed >= runtime_budget_seconds:
+                stop_reason = (
+                    f"Stopping at step {current_step}: wall-clock budget spent "
+                    f"({elapsed / 3600:.2f} h of "
+                    f"{runtime_budget_seconds / 3600:.2f} h). The run has NOT "
+                    "converged -- resume it in a new session with this train "
+                    "dir attached."
+                )
+                outcome.budget_exhausted = True
+
         # 3) Plateau counter, delta-gated against its own reference; on a stall
         #    it drives the LR reduction (no-op unless lr_plateau is enabled).
         #    A True return means the LR schedule is exhausted (floored for
         #    `lr_plateau_exhausted_patience` stalls) -> stop.
-        if trainer_cfg.control.lr_plateau:
+        #    Skipped once we are stopping on the clock: a plateau trigger can
+        #    warm-restart to the best checkpoint, and rewinding the weights in
+        #    the same breath as snapshotting them for resume would hand the next
+        #    session an older model than the one it just trained.
+        if not stop_reason and trainer_cfg.control.lr_plateau:
             if (
                 metric_value
                 > state.plateau_ref + trainer_cfg.control.lr_plateau_min_delta
@@ -682,25 +776,42 @@ def train(
                     metric_value,
                 )
                 if lr_exhausted:
-                    print(
+                    stop_reason = (
                         f"Stopping at step {current_step}: LR schedule exhausted "
                         f"(at min_lr {trainer_cfg.control.lr_plateau_min_lr:.3e} with no "
                         f"improvement for {state.min_lr_stall_counter} floored "
                         f"stalls)."
                     )
-                    break
 
         # early_stopping_patience == 0 disables the stop entirely (the counter
         # above is still advanced + logged for diagnostics); the LR-plateau
         # schedule then owns termination.
         if (
-            trainer_cfg.control.early_stopping_patience
+            not stop_reason
+            and trainer_cfg.control.early_stopping_patience
             and state.patience_counter
             >= trainer_cfg.control.early_stopping_patience
         ):
-            print(
+            stop_reason = (
                 f"Stopping at step {current_step}: early-stopping patience "
                 f"{state.patience_counter}/{trainer_cfg.control.early_stopping_patience} "
                 f"reached."
             )
+
+        # Persist the resume point now that this eval's counters have settled
+        # (and after any LR reduction), so both artifacts describe a *completed*
+        # evaluation. The checkpoint carries weights/optimizer/step, the state
+        # file carries everything else; restoring one without the other is what
+        # makes a resumed run diverge from an uninterrupted one. Deliberately
+        # written before the stop, so a graceful end is also recorded.
+        runtime.last_manager.save()
+        state.save(trainer_cfg.state_path)
+
+        if stop_reason:
+            print(stop_reason)
+            outcome.stop_reason = stop_reason
+            outcome.final_step = current_step
             break
+
+    outcome.final_step = int(runtime.global_step.numpy())
+    return outcome

@@ -140,6 +140,26 @@ class TrainingControlConfig:
     # LR annealing.
     lr_plateau_exhausted_patience: int = 0
 
+    # Wall-clock budget for the training loop, in hours. When the budget is
+    # spent the run stops *gracefully* at the next evaluation boundary, exactly
+    # as if a stopping rule had fired, so the notebook goes on to export and
+    # publish its artifacts.
+    #
+    # This exists because of how hosted sessions die. A run that overruns the
+    # platform's limit (12 h on Kaggle) is killed outright: the export cells
+    # never execute and, in a batch "Save & Run All", the version fails and the
+    # output -- checkpoints included -- is discarded. A run that has no hope of
+    # converging inside one session must therefore stop *itself* early enough
+    # to publish, and be resumed in a following session from the checkpoint and
+    # `trainer_state.json` in its train dir. Set this comfortably below the
+    # platform limit: the budget is only checked at evaluation boundaries, so
+    # the overshoot is up to one train-plus-eval interval, and export,
+    # plotting and upload all happen afterwards.
+    #
+    # None (the default) means "no wall-clock limit" -- the metric-driven rules
+    # own termination, which is what every rung that fits a session should use.
+    max_runtime_hours: float | None = None
+
     # Enable quantization-aware training. False = plain finetune (-> PTQ at
     # conversion). True = the full int8 scheme: BatchNorms folded into the convs,
     # backbone + SSD head fake-quantized up to the float postprocess (see
@@ -188,3 +208,13 @@ class TrainerConfig:
     @property
     def best_metric_path(self) -> Path:
         return self.train_dir / "best_metric.json"
+
+    @property
+    def state_path(self) -> Path:
+        """
+        Trainer bookkeeping (best metric, stall counters, history), written
+        every eval so a killed run can resume without restarting its schedule.
+        Lives in ``train_dir`` next to the checkpoints it belongs to, so
+        carrying the train dir between sessions carries the state with it.
+        """
+        return self.train_dir / "trainer_state.json"

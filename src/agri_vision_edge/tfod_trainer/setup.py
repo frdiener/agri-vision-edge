@@ -11,6 +11,7 @@ Responsible for:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import tensorflow as tf
 from google.protobuf import text_format
@@ -41,6 +42,17 @@ class Runtime:
     ckpt: tf.train.Checkpoint
 
     manager: tf.train.CheckpointManager
+
+    #: Rolling snapshot of the *latest* training state, in a `last/`
+    #: subdirectory of the train dir. `manager` only ever saves on a new best
+    #: (see `save_best_checkpoint`), so it is the wrong thing to resume from: a
+    #: session killed well after its best would rewind to that best and re-tread
+    #: the ground between, with its plateau counters already spent. This one is
+    #: written every evaluation so an interrupted run continues where it
+    #: stopped. Kept in a subdirectory so `export_run`, which opens its own
+    #: manager on the train dir, still finds only best checkpoints and exports
+    #: the best model rather than the newest one.
+    last_manager: tf.train.CheckpointManager
 
     evaluators: list
 
@@ -301,6 +313,15 @@ def create_runtime(
         max_to_keep=checkpoint_max_to_keep,
     )
 
+    # Same Checkpoint object (so model + optimizer + step are all captured),
+    # separate directory and state file. Only one is kept: this exists to answer
+    # "where had the run got to", not to provide history.
+    last_manager = tf.train.CheckpointManager(
+        ckpt,
+        str(Path(train_dir) / "last"),
+        max_to_keep=1,
+    )
+
     # NOTE: weights are restored later in `restore_weights` (called from
     # `train`), once the train dataset is available. With EMA enabled the
     # optimizer's shadow variables must be created before any restore, and
@@ -313,6 +334,7 @@ def create_runtime(
         global_step=global_step,
         ckpt=ckpt,
         manager=manager,
+        last_manager=last_manager,
         evaluators=create_evaluators(configs),
         add_regularization_loss=(configs["train_config"].add_regularization_loss),
         unpad_groundtruth_tensors=(configs["train_config"].unpad_groundtruth_tensors),
@@ -395,9 +417,19 @@ def restore_weights(
          exist before any restore and are themselves restored on resume.
       2. If a checkpoint already exists in the train directory, resume from
          it (this restores model, optimizer, shadow variables and step).
+         The rolling ``last/`` snapshot wins over the best-checkpoint history:
+         it is never older (both are written at the same evaluation, and only
+         one of them is conditional on an improvement), and resuming from the
+         *best* would silently rewind the run to it and redo everything since.
       3. Otherwise, load the pretrained fine-tune checkpoint.
 
     ``train_dataset`` is required to build the model on a real input batch.
+
+    Returns:
+        bool: True if training resumed from a checkpoint already in the train
+        directory (so the caller should also restore the trainer's own
+        bookkeeping, see ``TrainerState.load``), False if the weights came from
+        the pretrained fine-tune checkpoint (a cold start).
     """
 
     if runtime.use_moving_average:
@@ -409,16 +441,22 @@ def restore_weights(
         )
         runtime.optimizer.shadow_copy(detection_model)
 
-    if runtime.manager.latest_checkpoint:
-        print(f"Resuming from checkpoint: {runtime.manager.latest_checkpoint}")
-        runtime.ckpt.restore(runtime.manager.latest_checkpoint)
-        return
+    resume_from = (
+        runtime.last_manager.latest_checkpoint
+        or runtime.manager.latest_checkpoint
+    )
+    if resume_from:
+        print(f"Resuming from checkpoint: {resume_from}")
+        runtime.ckpt.restore(resume_from)
+        print(f"Resumed at step {int(runtime.global_step.numpy())}.")
+        return True
 
     maybe_load_fine_tune_checkpoint(
         detection_model,
         runtime,
         train_dataset,
     )
+    return False
 
 
 def apply_graph_modifications(
