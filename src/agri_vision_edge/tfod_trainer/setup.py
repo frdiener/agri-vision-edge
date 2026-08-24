@@ -432,6 +432,8 @@ def restore_weights(
         the pretrained fine-tune checkpoint (a cold start).
     """
 
+    model_built = False
+
     if runtime.use_moving_average:
         print("EMA enabled: creating optimizer shadow variables...")
         _ensure_model_is_built(
@@ -439,6 +441,7 @@ def restore_weights(
             train_dataset,
             runtime.unpad_groundtruth_tensors,
         )
+        model_built = True
         runtime.optimizer.shadow_copy(detection_model)
 
     resume_from = (
@@ -446,6 +449,20 @@ def restore_weights(
         or runtime.manager.latest_checkpoint
     )
     if resume_from:
+        # Build the variables before restoring. `ckpt.restore` is object-based
+        # and therefore lazy: with nothing built it quietly defers every value
+        # instead of failing, and the caller then trips over a model whose
+        # `trainable_variables` is empty (ValueError out of
+        # `ensure_optimizer_state_created`). The cold-start path below gets this
+        # for free -- `load_fine_tune_checkpoint` forces the same dummy forward
+        # pass -- which is why only resuming hit it.
+        if not model_built:
+            _ensure_model_is_built(
+                detection_model,
+                train_dataset,
+                runtime.unpad_groundtruth_tensors,
+            )
+
         print(f"Resuming from checkpoint: {resume_from}")
         runtime.ckpt.restore(resume_from)
         print(f"Resumed at step {int(runtime.global_step.numpy())}.")

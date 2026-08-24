@@ -197,11 +197,13 @@ def test_unknown_keys_are_ignored(tmp_path):
 
 
 class _FakeCheckpoint:
-    def __init__(self):
+    def __init__(self, events):
         self.restored = None
+        self._events = events
 
     def restore(self, path):
         self.restored = path
+        self._events.append("restore")
 
 
 class _FakeManager:
@@ -214,68 +216,117 @@ class _FakeStep:
         return 4242
 
 
+class _FakeOptimizer:
+    def __init__(self, events):
+        self._events = events
+
+    def shadow_copy(self, model):
+        self._events.append("shadow")
+
+
 class _FakeRuntime:
     """Just enough of `Runtime` for `restore_weights` without a real graph."""
 
-    use_moving_average = False
-
-    def __init__(self, last, best):
+    def __init__(self, last, best, use_moving_average=False):
+        self.events = []
         self.last_manager = _FakeManager(last)
         self.manager = _FakeManager(best)
-        self.ckpt = _FakeCheckpoint()
+        self.ckpt = _FakeCheckpoint(self.events)
+        self.optimizer = _FakeOptimizer(self.events)
         self.global_step = _FakeStep()
         self.unpad_groundtruth_tensors = False
+        self.use_moving_average = use_moving_average
 
 
-def test_resume_prefers_the_rolling_snapshot_over_the_best(monkeypatch):
+@pytest.fixture
+def traced(monkeypatch):
+    """Record model-build and cold-start calls in the runtime's event log."""
+
+    def _install(runtime):
+        monkeypatch.setattr(
+            trainer_setup,
+            "_ensure_model_is_built",
+            lambda *a, **k: runtime.events.append("build"),
+        )
+        monkeypatch.setattr(
+            trainer_setup,
+            "maybe_load_fine_tune_checkpoint",
+            lambda *a, **k: runtime.events.append("cold"),
+        )
+        return runtime
+
+    return _install
+
+
+def test_resume_builds_the_model_before_restoring(traced):
+    """
+    ckpt.restore is object-based and lazy: with no variables built it defers
+    every value instead of failing, and ensure_optimizer_state_created() then
+    dies on a model with no trainable_variables. Only the resume path is
+    exposed -- the cold start builds inside load_fine_tune_checkpoint.
+    """
+    runtime = traced(_FakeRuntime(last="/train/last/ckpt-5", best="/train/ckpt-2"))
+
+    trainer_setup.restore_weights(None, runtime, None)
+
+    assert runtime.events == ["build", "restore"]
+
+
+def test_resume_does_not_build_twice_under_ema(traced):
+    """EMA already builds the model to create shadow variables."""
+    runtime = traced(
+        _FakeRuntime(
+            last="/train/last/ckpt-5", best=None, use_moving_average=True
+        )
+    )
+
+    trainer_setup.restore_weights(None, runtime, None)
+
+    assert runtime.events == ["build", "shadow", "restore"]
+
+
+def test_cold_start_leaves_the_build_to_the_fine_tune_load(traced):
+    runtime = traced(_FakeRuntime(last=None, best=None))
+
+    trainer_setup.restore_weights(None, runtime, None)
+
+    assert runtime.events == ["cold"]
+
+
+def test_resume_prefers_the_rolling_snapshot_over_the_best(traced):
     """
     `manager` only saves on an improvement, so after a long non-improving tail
     its latest checkpoint is far behind. Resuming from it would rewind the run
     and redo that tail -- with the plateau counters already spent, so the
     resumed session would re-derive the same best instead of training further.
     """
-    calls = []
-    monkeypatch.setattr(
-        trainer_setup,
-        "maybe_load_fine_tune_checkpoint",
-        lambda *a, **k: calls.append("cold"),
-    )
+    runtime = traced(_FakeRuntime(last="/train/last/ckpt-5", best="/train/ckpt-2"))
 
-    runtime = _FakeRuntime(last="/train/last/ckpt-5", best="/train/ckpt-2")
     resumed = trainer_setup.restore_weights(None, runtime, None)
 
     assert resumed is True
     assert runtime.ckpt.restored == "/train/last/ckpt-5"
-    assert calls == []
+    assert "cold" not in runtime.events
 
 
-def test_resume_falls_back_to_the_best_checkpoint(monkeypatch):
+def test_resume_falls_back_to_the_best_checkpoint(traced):
     """Runs from before the rolling snapshot existed still resume."""
-    monkeypatch.setattr(
-        trainer_setup, "maybe_load_fine_tune_checkpoint", lambda *a, **k: None
-    )
+    runtime = traced(_FakeRuntime(last=None, best="/train/ckpt-2"))
 
-    runtime = _FakeRuntime(last=None, best="/train/ckpt-2")
     assert trainer_setup.restore_weights(None, runtime, None) is True
     assert runtime.ckpt.restored == "/train/ckpt-2"
 
 
-def test_cold_start_reports_no_resume(monkeypatch):
+def test_cold_start_reports_no_resume(traced):
     """
     An empty train dir must report False, so the caller does not apply a stale
     state file to freshly initialised weights.
     """
-    calls = []
-    monkeypatch.setattr(
-        trainer_setup,
-        "maybe_load_fine_tune_checkpoint",
-        lambda *a, **k: calls.append("cold"),
-    )
+    runtime = traced(_FakeRuntime(last=None, best=None))
 
-    runtime = _FakeRuntime(last=None, best=None)
     assert trainer_setup.restore_weights(None, runtime, None) is False
     assert runtime.ckpt.restored is None
-    assert calls == ["cold"]
+    assert runtime.events == ["cold"]
 
 
 # ---------------------------------------------------------------------------
