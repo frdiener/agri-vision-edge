@@ -135,6 +135,21 @@ def latency_stats(latencies_ms: list[float]) -> dict[str, float]:
     }
 
 
+#: Share of a ``--max-seconds`` budget the warm-up may consume. A model whose
+#: single inference takes seconds -- which is exactly the case the budget
+#: exists for -- would otherwise spend the entire budget on the 20 warm-up
+#: iterations and measure nothing at all. One iteration always runs regardless,
+#: because the integrity check reads its output and a run that cannot say
+#: whether the runtime produced garbage is worse than a slow one.
+WARMUP_BUDGET_SHARE = 0.25
+
+
+#: Below this many measured iterations a truncated run has not characterised
+#: anything: the loop is meant to be a steady state for a power meter to
+#: average over, and a handful of inferences is a transient.
+MIN_USABLE_ITERATIONS = 10
+
+
 #: Phases a runtime may report, in execution order. ``postprocess`` is derived
 #: rather than measured -- it is whatever the call spent outside the three
 #: timed regions, which is exactly the detection decode -- and ``resize`` is a
@@ -259,6 +274,21 @@ def main(argv=None):
         type=int,
         default=0,
         help="Run exactly N inferences instead of a fixed duration",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Hard wall-clock budget for the whole run: pool decode, model "
+            "load, warm-up and the measured loop (0 = unbounded, the "
+            "default). --seconds bounds only the loop, which is no protection "
+            "at all against the case that actually costs hours -- a model the "
+            "delegate rejects, falling back to CPU, where a single inference "
+            "runs for seconds and 20 warm-up iterations alone take minutes. "
+            "A run stopped by this budget is marked truncated and is NOT "
+            "steady-state; see the warning it prints"
+        ),
     )
     parser.add_argument(
         "--warmup",
@@ -403,6 +433,30 @@ def main(argv=None):
 
     cpu_count = os.cpu_count() or 1
 
+    # The budget starts here, before a single PNG is decoded, because the point
+    # is a predictable wall-clock ceiling per model and every second before the
+    # loop is a second of it. The closing gap + chirp is deliberately *outside*
+    # it: those exist so the off-board power trace can be aligned to this run
+    # at all, and a run whose trace cannot be joined is not a cheap run, it is
+    # a wasted one.
+    budget_deadline = (
+        time.monotonic() + args.max_seconds if args.max_seconds > 0 else None
+    )
+
+    budget: dict[str, Any] = {
+        "max_seconds": args.max_seconds or None,
+        "warmup_requested": args.warmup,
+        "warmup_completed": 0,
+        "truncated": False,
+        "truncated_at": None,
+        "usable": True,
+    }
+
+    run["budget"] = budget
+
+    def over_budget() -> bool:
+        return budget_deadline is not None and time.monotonic() >= budget_deadline
+
     try:
         image_paths = collect_images(Path(args.images), args.pool_size)
 
@@ -439,12 +493,37 @@ def main(argv=None):
         run["input_details"] = _jsonable(getattr(runtime, "input_details", None))
         run["output_details"] = _jsonable(getattr(runtime, "output_details", None))
 
+        if over_budget():
+            budget["truncated"] = True
+            budget["truncated_at"] = "model_load"
+
         run["phases"]["warmup_start"] = time.time()
 
         warmup_detections = []
 
+        # Warm-up gets a slice of what is left rather than all of it. Its job
+        # is to get past the allocator, the delegate's first-call compile and
+        # the DVFS ramp, and on a model slow enough to need this budget those
+        # are done after a couple of iterations.
+        if budget_deadline is None:
+            warmup_deadline = None
+        else:
+            warmup_deadline = time.monotonic() + WARMUP_BUDGET_SHARE * max(
+                0.0, budget_deadline - time.monotonic()
+            )
+
         for index in range(args.warmup):
+            # The first one is unconditional: check_output() reads it, and a
+            # run that cannot say whether the runtime produced garbage is worse
+            # than a slow one.
+            if index > 0 and warmup_deadline is not None:
+                if time.monotonic() >= warmup_deadline:
+                    budget["truncated"] = True
+                    budget["truncated_at"] = "warmup"
+                    break
+
             warmup_detections = runtime.predict(pool[index % len(pool)])
+            budget["warmup_completed"] = index + 1
 
         run["phases"]["warmup_end"] = time.time()
 
@@ -542,6 +621,15 @@ def main(argv=None):
 
             iteration += 1
 
+            # Checked between inferences, never during one: an in-flight
+            # `Invoke` cannot be interrupted, so the granularity floor of every
+            # bound here is a single inference. On the case this budget exists
+            # for that is seconds, and the overshoot is real.
+            if over_budget():
+                budget["truncated"] = True
+                budget["truncated_at"] = "measure"
+                break
+
             if args.iterations > 0:
                 if iteration >= args.iterations:
                     break
@@ -549,6 +637,12 @@ def main(argv=None):
                 break
 
         run["phases"]["measure_end"] = time.time()
+
+        budget["measured_iterations"] = iteration
+        budget["measured_seconds"] = time.perf_counter() - loop_start
+        budget["usable"] = not budget["truncated"] or (
+            iteration >= MIN_USABLE_ITERATIONS
+        )
 
         run["phases"]["idle_post_start"] = time.time()
         time.sleep(args.gap_seconds)
@@ -612,6 +706,30 @@ def main(argv=None):
             f"{net['throughput_fps']:.1f} fps"
             + (f"  (resize is {share * 100:.1f} % of the call)" if share else "")
         )
+
+    if budget["truncated"]:
+        # Said loudly, because the failure mode is silent: a truncated run
+        # writes exactly the same artifacts as a complete one and its mean
+        # latency looks entirely plausible. What it does not have is a steady
+        # state -- the loop was cut before current, clock and die temperature
+        # settled -- so the power average over it is not the same quantity as
+        # every other run's, and the two must not sit in one table.
+        print(
+            f"\n[warning] budget of {args.max_seconds:.0f}s exhausted during "
+            f"{budget['truncated_at']}: {budget.get('measured_iterations', 0)} "
+            f"measured iteration(s) over "
+            f"{budget.get('measured_seconds', 0.0):.1f}s, "
+            f"{budget['warmup_completed']}/{budget['warmup_requested']} warm-ups. "
+            "This run is NOT steady-state; its power number is not comparable "
+            "with an untruncated one."
+        )
+
+        if not budget["usable"]:
+            print(
+                f"[warning] fewer than {MIN_USABLE_ITERATIONS} measured "
+                "iterations — this characterises nothing. Raise --max-seconds "
+                "for this model or drop it from the sweep."
+            )
 
     print(f"artifacts: {output_dir}")
 
