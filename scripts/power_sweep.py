@@ -191,13 +191,123 @@ def probe_clock(remote: Remote, samples: int = 7) -> dict[str, Any]:
 #:
 #: This is about resource cost only. Accuracy obviously does depend on class
 #: count and training data -- `ave benchmark` still needs the full matrix.
+#:
+#: ``res-ladder`` is the input-resolution axis, and it is confined to
+#: **untiled-trained models evaluated on untiled frames** on purpose, on three
+#: separate grounds:
+#:
+#: * it is the only cell that exists across the whole ladder. 512 and 1024 were
+#:   only ever trained on full frames -- ``phenobench-tiled`` stops at 320 --
+#:   so a ladder that admitted tiled-trained models would have three rungs at
+#:   320 and one everywhere else;
+#: * training tiling was measured not to affect compute at all (-0.02 % /
+#:   -0.05 % in file size: the same graph with different weights), so nothing
+#:   is lost by fixing it;
+#: * evaluation tiling, unlike the other two, is *not* free -- it changes the
+#:   source resolution and therefore the resize inside every ``predict()``.
+#:   Leaving it open would confound the very axis this preset varies, since
+#:   input size and source size would move together.
+#:
+#: One post-processing flavour only (``fastnms``, what ``ave convert`` emits by
+#: default), because NMS mode is priced by ``ave benchmark`` against accuracy
+#: and does not need a power number per rung. That leaves 5 export schemes x 3
+#: sizes x 2 architectures = 30 runs, ~1.5 h of measured loop at the default
+#: ``--seconds 120`` before cooldowns. Halve ``--seconds`` if that is too long;
+#: 60 s is still far past the thermal settling point on both boards.
+#:
+#: fp32 rungs need ``--cpu``: the Teflon delegate claims float convolutions and
+#: returns NaN, so a delegated fp32 power figure describes a computation that
+#: did not happen.
 PRESETS: dict[str, list[str]] = {
     "arch-matrix": [
         "ssd-mn2_mc_phenobench_320_*",
         "ssd-mn2-fpnlite_mc_phenobench_320_*",
         "yolov7-tiny_*",
     ],
+    "res-ladder": [
+        "ssd-mn2_mc_phenobench_320_*_fastnms*",
+        "ssd-mn2_mc_phenobench_512_*_fastnms*",
+        "ssd-mn2_mc_phenobench_1024_*_fastnms*",
+        "ssd-mn2-fpnlite_mc_phenobench_320_*_fastnms*",
+        "ssd-mn2-fpnlite_mc_phenobench_512_*_fastnms*",
+        "ssd-mn2-fpnlite_mc_phenobench_1024_*_fastnms*",
+    ],
 }
+
+
+#: An environment applied to one pass over the selected models, and the
+#: directory-name token that keeps its results apart from the others'.
+class Variant:
+    """
+    One named environment the sweep runs every model under.
+
+    The delegate is configurable at run time -- ``TEFLON_UNSUPPORTED_NODES`` and
+    ``TEFLON_UNSUPPORTED_OPS`` push individual nodes or whole operators back
+    onto the CPU -- and the question those switches exist to answer is *what
+    did that cost*. Answering it needs two runs of the **same file** that
+    differ in nothing but the environment, which is why a variant is a
+    first-class thing here rather than two invocations of this script: two
+    sweeps hours apart differ in die temperature and in ambient, and both move
+    power.
+
+    Interleaved per model (see the run loop) for the same reason: the pair
+    being compared should be adjacent in time, not separated by the rest of the
+    matrix.
+    """
+
+    def __init__(self, name: str, env: dict[str, str]):
+        self.name = name
+        self.env = env
+
+    @property
+    def suffix(self) -> str:
+        # The unnamed default variant leaves run directories exactly as every
+        # previously collected sweep named them.
+        return f"__{self.name}" if self.name else ""
+
+    def run_name(self, model: Path) -> str:
+        return f"{model.stem}{self.suffix}"
+
+    def describe(self) -> str:
+        if not self.env:
+            return f"{self.name or '(default)'}: clean environment"
+
+        settings = " ".join(f"{key}={value}" for key, value in self.env.items())
+
+        return f"{self.name or '(default)'}: {settings}"
+
+
+def parse_variant(tokens: list[str], base_env: dict[str, str]) -> Variant:
+    """
+    ``--variant NAME KEY=VALUE ...`` -> a :class:`Variant`.
+
+    Each ``KEY=VALUE`` is its own argv item rather than a comma-separated list,
+    which is not cosmetic: the switch this feature exists for takes a comma
+    list of its own (``TEFLON_UNSUPPORTED_NODES=66,68,69,71-73,75``), and any
+    comma-splitting syntax would mangle it.
+
+    ``--env`` is merged first so it stays the sweep-wide baseline and a variant
+    can override one key of it without restating the rest.
+    """
+
+    if not tokens:
+        raise argparse.ArgumentTypeError("--variant needs at least a name")
+
+    name, *settings = tokens
+    env = dict(base_env)
+
+    for setting in settings:
+        if "=" not in setting:
+            raise SystemExit(f"--variant {name}: expected KEY=VALUE, got {setting!r}")
+
+        key, value = setting.split("=", 1)
+
+        if not key:
+            raise SystemExit(f"--variant {name}: empty variable name")
+
+        env[key] = value
+
+    return Variant(name, env)
 
 
 def collect_models(models_dir: Path, patterns: list[str] | None) -> list[Path]:
@@ -318,9 +428,12 @@ def main(argv=None) -> int:
         default=None,
         help=(
             "Named selection. 'arch-matrix' keeps one model per "
-            "architecture x precision (13 instead of 43): class count and "
-            "training tiling were measured not to affect resource cost — "
-            "see PRESETS in this file for the numbers"
+            "architecture x precision: class count and training tiling were "
+            "measured not to affect resource cost. 'res-ladder' is the "
+            "320/512/1024 input ladder, untiled-trained and untiled-evaluated "
+            "(the only cell that spans it, and the only one in which input "
+            "size is not confounded with source size) — see PRESETS in this "
+            "file for both arguments"
         ),
     )
     selection.add_argument(
@@ -347,7 +460,18 @@ def main(argv=None) -> int:
     )
 
     load = parser.add_argument_group("load")
-    load.add_argument("--seconds", type=float, default=120.0)
+    load.add_argument(
+        "--seconds",
+        type=float,
+        default=120.0,
+        help=(
+            "Measured-loop duration per model, which is what caps sweep time "
+            "(default: %(default)s). The board checks the deadline between "
+            "inferences, so a run overshoots by at most one -- 0.2 s even for "
+            "the 1024 fp32 rung. Use --iterations for fixed work instead of "
+            "fixed time"
+        ),
+    )
     load.add_argument("--warmup", type=int, default=20)
     load.add_argument("--pool-size", type=int, default=16)
     load.add_argument("--sample-interval", type=float, default=0.2)
@@ -379,10 +503,25 @@ def main(argv=None) -> int:
         default=[],
         metavar="KEY=VALUE",
         help=(
-            "Environment variable for the board run, forwarded to "
+            "Environment variable for every board run, forwarded to "
             "`ave resources` (repeatable). Note that TEFLON_DEBUG=verbose et al "
             "add console I/O to a measured window — useful for a delegation "
             "probe, not for a power number"
+        ),
+    )
+    load.add_argument(
+        "--variant",
+        action="append",
+        nargs="+",
+        default=[],
+        metavar="NAME KEY=VALUE",
+        help=(
+            "Run every model once per named environment, back to back "
+            "(repeatable). This is how a delegate switch gets priced: "
+            "`--variant baseline --variant no-pack TEFLON_UNSUPPORTED_OPS=83` "
+            "runs the same file twice, adjacent in time, and files the results "
+            "under <model>__baseline / <model>__no-pack. Without it there is "
+            "one unnamed variant and directory names are unchanged"
         ),
     )
     load.add_argument(
@@ -487,10 +626,40 @@ def main(argv=None) -> int:
         else device_repo / "datasets" / "test-bundle" / "images"
     )
 
+    base_env: dict[str, str] = {}
+
+    for entry in args.env:
+        if "=" not in entry:
+            print(f"--env expects KEY=VALUE, got {entry!r}", file=sys.stderr)
+            return 1
+
+        key, value = entry.split("=", 1)
+        base_env[key] = value
+
+    # No --variant is one unnamed variant carrying just --env, which keeps run
+    # directories named exactly as every sweep before this feature named them.
+    variants = [parse_variant(tokens, base_env) for tokens in args.variant] or [
+        Variant("", base_env)
+    ]
+
+    # The whole point of a variant is that its results are distinguishable; two
+    # unnamed ones would silently overwrite each other's run directory.
+    if len({variant.name for variant in variants}) != len(variants):
+        print("--variant names must be unique", file=sys.stderr)
+        return 1
+
+    # Every model under every variant, variant innermost: the pair being
+    # compared runs back to back, so the thermal state between them is as close
+    # as this rig can make it.
+    runs = [(model, variant) for model in models for variant in variants]
+
     runs_to_execute = [
-        model
-        for model in models
-        if not (args.skip_existing and (output_dir / model.stem / "run.json").exists())
+        (model, variant)
+        for model, variant in runs
+        if not (
+            args.skip_existing
+            and (output_dir / variant.run_name(model) / "run.json").exists()
+        )
     ]
     run_time = (
         args.seconds
@@ -503,9 +672,15 @@ def main(argv=None) -> int:
     estimated_time = run_time * len(runs_to_execute) + cooldown_time + meter_time
 
     print(
-        f"models          : {len(models)} selected, {len(runs_to_execute)} to run"
+        f"models          : {len(models)} selected"
+        + (f" x {len(variants)} variant(s)" if len(variants) > 1 else "")
+        + f", {len(runs_to_execute)} run(s) to execute"
         + (f"  (preset {args.preset})" if args.preset else "")
     )
+
+    if len(variants) > 1 or base_env:
+        for variant in variants:
+            print(f"variant         : {variant.describe()}")
     print(f"device          : {args.device}  (repo {device_repo})")
     print(f"meter host      : {'disabled' if args.no_meter else args.meter_host}")
     print(f"delegate        : {delegate}")
@@ -538,6 +713,14 @@ def main(argv=None) -> int:
         "meter_host": None if args.no_meter else args.meter_host,
         "device_repo": str(device_repo),
         "delegate": delegate,
+        # Recorded, not just applied. A delegate switch changes which nodes run
+        # where, so a power figure whose environment is not written down beside
+        # it is a number about an unknown machine -- and these sweeps are read
+        # months later, from the tree, by something that was not at the console.
+        "env": base_env,
+        "variants": [
+            {"name": variant.name, "env": variant.env} for variant in variants
+        ],
         "config": {
             "seconds": args.seconds,
             "warmup": args.warmup,
@@ -566,11 +749,13 @@ def main(argv=None) -> int:
     if args.dry_run:
         print("--- dry run: commands that would be issued ---\n")
 
-    def device_command(model: Path, run_name: str) -> str:
+    def device_command(model: Path, variant: Variant) -> str:
         env_args: list[str] = []
 
-        for entry in args.env:
-            env_args += ["--env", entry]
+        for key, value in variant.env.items():
+            env_args += ["--env", f"{key}={value}"]
+
+        run_name = variant.run_name(model)
 
         return " ".join(
             shlex.quote(part)
@@ -581,6 +766,10 @@ def main(argv=None) -> int:
                 str(device_images),
                 "--output-dir",
                 str(device_output),
+                # Without this the run directory is the model stem, so a second
+                # variant of the same file would overwrite the first.
+                "--output-name",
+                run_name,
                 "--seconds",
                 str(args.seconds),
                 "--warmup",
@@ -771,27 +960,30 @@ def main(argv=None) -> int:
                     "is connected and powered before spending the sweep on it"
                 )
 
-        for index, model in enumerate(models, start=1):
-            run_name = model.stem
+        for index, (model, variant) in enumerate(runs, start=1):
+            run_name = variant.run_name(model)
             run_dir = output_dir / run_name
 
-            header = f"[{index}/{len(models)}] {run_name}"
+            header = f"[{index}/{len(runs)}] {run_name}"
 
             if args.skip_existing and (run_dir / "run.json").exists():
                 print(f"{header}  [skip] already present")
                 skipped += 1
                 continue
 
-            command = device_command(model, run_name)
+            command = device_command(model, variant)
+            is_last = not runs_to_execute or (model, variant) == runs_to_execute[-1]
 
             if args.dry_run:
                 print(header)
+                if variant.env:
+                    print(f"  env         : {variant.describe()}")
                 if not args.no_meter:
                     print(
                         "  meter       : clock probe before/after (logger stays running)"
                     )
                 print(f"  device      : ssh {args.device} {command}")
-                if model != runs_to_execute[-1] and args.cooldown > 0:
+                if not is_last and args.cooldown > 0:
                     print(f"  cooldown    : {args.cooldown}s")
                 print()
                 continue
@@ -801,7 +993,12 @@ def main(argv=None) -> int:
             if not args.no_meter:
                 (run_dir / "power.csv.gz").unlink(missing_ok=True)
 
-            record: dict[str, Any] = {"run": run_name, "model": model.name}
+            record: dict[str, Any] = {
+                "run": run_name,
+                "model": model.name,
+                "variant": variant.name,
+                "env": variant.env,
+            }
             active_record = record
             executed_runs.append((run_dir, record))
             sweep["runs"].append(record)
@@ -878,7 +1075,7 @@ def main(argv=None) -> int:
             (run_dir / "sweep_run.json").write_text(json.dumps(record, indent=2) + "\n")
             active_record = None
 
-            if model != runs_to_execute[-1] and args.cooldown > 0:
+            if not is_last and args.cooldown > 0:
                 print(f"  cooldown {args.cooldown:.0f}s", flush=True)
                 time.sleep(args.cooldown)
 
