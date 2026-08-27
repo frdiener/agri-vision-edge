@@ -84,8 +84,9 @@ def open_meter():
     if device is None:
         raise RuntimeError("FNB58 not found (expected USB VID:PID 2e3c:5558)")
 
-    # Reset the retained firmware session. This meter can re-enumerate during
-    # reset, so the original PyUSB object must never be used afterwards.
+    # Clears the retained firmware session; without it the start sequence opens
+    # no streaming window. The meter can re-enumerate during reset, so the
+    # original PyUSB object must not be used afterwards.
     try:
         device.reset()
     except usb.core.USBError as exc:
@@ -126,14 +127,21 @@ def open_meter():
         raise RuntimeError(f"could not detach FNB58 HID driver: {exc}") from exc
 
     try:
-        # This may return BUSY if the existing configuration is already active.
+        # This device is composite and usb-storage holds interface 0, so
+        # set_configuration() -- which acts on the whole device -- wedges it:
+        # "usbfs: interface 0 claimed by usb-storage while 'python3' sets
+        # config #1", after which it streams nothing and the next reset drops
+        # it off the bus. The kernel has already configured it.
         try:
-            device.set_configuration()
-        except usb.core.USBError as exc:
-            if getattr(exc, "errno", None) != 16:
-                raise
+            configuration = device.get_active_configuration()
+        except usb.core.USBError:
+            configuration = None
 
-        interface = device.get_active_configuration()[(interface_number, 0)]
+        if configuration is None:
+            device.set_configuration()
+            configuration = device.get_active_configuration()
+
+        interface = configuration[(interface_number, 0)]
         endpoint_in = usb.util.find_descriptor(
             interface,
             custom_match=lambda endpoint: (
@@ -253,9 +261,12 @@ def main() -> int:
                 report = bytes(endpoint_in.read(REPORT_SIZE, timeout=1_000))
                 received_ns = time.monotonic_ns()
             except usb.core.USBTimeoutError as exc:
-                # Do not issue another request: the timed-out one may still be
-                # pending, and a second OUT write can wedge the meter.
-                raise RuntimeError("FNB58 report read timed out") from exc
+                # Do not retry: the timed-out request may still be pending, and
+                # retrying skips the continuation command below, which is the
+                # only thing that extends the streaming window.
+                raise RuntimeError(
+                    f"FNB58 report read timed out ({valid_reports} report(s))"
+                ) from exc
 
             try:
                 samples = decode(report)
