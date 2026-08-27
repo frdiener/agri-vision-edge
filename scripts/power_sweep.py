@@ -529,6 +529,17 @@ def main(argv=None) -> int:
         ),
     )
     selection.add_argument(
+        "--platform",
+        default=None,
+        help=(
+            "Name the results tree after this instead of after --device "
+            "(default: the host part of --device). Use it whenever the board "
+            "is reached by IP: resource_results/192.168.11.131/ joins to no "
+            "benchmark_results tree and to no earlier sweep of the same board, "
+            "so pass the hostname those use — e.g. --platform frdm-imx8mp"
+        ),
+    )
+    selection.add_argument(
         "--suffix",
         default="",
         help=(
@@ -698,17 +709,23 @@ def main(argv=None) -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     device_tag = args.device.split("@")[-1].replace(":", "_")
 
+    # How the board is *reached* and what its results are *called* are two
+    # different things, and they only coincide when the hostname resolves.
+    # Reaching it by IP would otherwise file the sweep under 192.168.11.131/,
+    # which joins to no benchmark_results tree and to no earlier sweep of the
+    # same board.
+    platform = args.platform or device_tag
+
+    if args.suffix:
+        platform = f"{platform}_{args.suffix.lstrip('_')}"
+
+    # Last, so it names the unaccelerated variant of whichever tree that is.
+    if args.cpu:
+        platform = f"{platform}_cpu"
+
     if args.output:
         output_dir = Path(args.output).resolve()
     else:
-        platform = device_tag
-
-        if args.suffix:
-            platform = f"{platform}_{args.suffix.lstrip('_')}"
-
-        if args.cpu:
-            platform = f"{platform}_cpu"
-
         # Sibling of benchmark_results/, not a subtree of it: `ave resources`
         # is a separate measurement path (steady-state cost, not predictions)
         # and already defaults here, and a `power/` directory inside
@@ -809,7 +826,10 @@ def main(argv=None) -> int:
     if len(variants) > 1 or base_env:
         for variant in variants:
             print(f"variant         : {variant.describe()}")
-    print(f"device          : {args.device}  (repo {device_repo})")
+    print(
+        f"device          : {args.device}  (repo {device_repo})"
+        + (f"  filed as {platform}" if args.platform else "")
+    )
     print(f"meter host      : {'disabled' if args.no_meter else args.meter_host}")
     print(f"delegate        : {delegate}")
     print(f"output          : {output_dir}")
@@ -846,6 +866,9 @@ def main(argv=None) -> int:
         "schema": 1,
         "started": datetime.now(timezone.utc).isoformat(),
         "device": args.device,
+        # The board's name in the results trees, which is not necessarily how
+        # it was reached (see --platform).
+        "platform": platform,
         "meter_host": None if args.no_meter else args.meter_host,
         "device_repo": str(device_repo),
         "delegate": delegate,
