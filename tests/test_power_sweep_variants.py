@@ -127,5 +127,20 @@ def test_the_resolution_ladder_preset_is_confined_to_untiled_training():
 
     assert not any("phenobench-tiled" in pattern for pattern in patterns)
     assert all("_mc_" in pattern for pattern in patterns)
-    assert all("fastnms" in pattern for pattern in patterns)
     assert {"320", "512", "1024"} == {pattern.split("_")[3] for pattern in patterns}
+
+
+def test_the_resolution_ladder_preset_sweeps_the_presented_nms_flavour():
+    """
+    ``regnms``, not ``benchmark_report.DEFAULT_NMS``.
+
+    The two are not the same thing and the difference is easy to get backwards:
+    ``DEFAULT_NMS`` is ``fastnms`` because that is what ``ave convert`` emits
+    unasked, but the analysis pins ``NMS = br.REGULAR_NMS`` and presents
+    per-class NMS throughout. Cost numbers measured at the other flavour would
+    join to none of the accuracy rungs.
+    """
+    patterns = power_sweep.PRESETS["res-ladder"]
+
+    assert all("regnms" in pattern for pattern in patterns)
+    assert not any("fastnms" in pattern for pattern in patterns)

@@ -62,6 +62,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -208,12 +209,17 @@ def probe_clock(remote: Remote, samples: int = 7) -> dict[str, Any]:
 #:   Leaving it open would confound the very axis this preset varies, since
 #:   input size and source size would move together.
 #:
-#: One post-processing flavour only (``fastnms``, what ``ave convert`` emits by
-#: default), because NMS mode is priced by ``ave benchmark`` against accuracy
-#: and does not need a power number per rung. That leaves 5 export schemes x 3
-#: sizes x 2 architectures = 30 runs, ~1.5 h of measured loop at the default
-#: ``--seconds 120`` before cooldowns. Halve ``--seconds`` if that is too long;
-#: 60 s is still far past the thermal settling point on both boards.
+#: One post-processing flavour only, and it is ``regnms`` -- the *presented*
+#: configuration, not the toolchain default. ``benchmark_report.DEFAULT_NMS``
+#: is ``fastnms`` because that is what ``ave convert`` emits unasked, but the
+#: analysis pins ``NMS = br.REGULAR_NMS`` (notebooks/benchmark_analysis.py) and
+#: every accuracy rung in the report is per-class NMS. A power sweep at the
+#: other flavour would produce cost numbers that join to none of them.
+#:
+#: That leaves 5 export schemes x 3 sizes x 2 architectures = 30 runs, ~1.5 h of
+#: measured loop at the default ``--seconds 120`` before cooldowns. Halve
+#: ``--seconds`` if that is too long; 60 s is still far past the thermal
+#: settling point on both boards.
 #:
 #: fp32 rungs need ``--cpu``: the Teflon delegate claims float convolutions and
 #: returns NaN, so a delegated fp32 power figure describes a computation that
@@ -225,12 +231,12 @@ PRESETS: dict[str, list[str]] = {
         "yolov7-tiny_*",
     ],
     "res-ladder": [
-        "ssd-mn2_mc_phenobench_320_*_fastnms*",
-        "ssd-mn2_mc_phenobench_512_*_fastnms*",
-        "ssd-mn2_mc_phenobench_1024_*_fastnms*",
-        "ssd-mn2-fpnlite_mc_phenobench_320_*_fastnms*",
-        "ssd-mn2-fpnlite_mc_phenobench_512_*_fastnms*",
-        "ssd-mn2-fpnlite_mc_phenobench_1024_*_fastnms*",
+        "ssd-mn2_mc_phenobench_320_*_regnms*",
+        "ssd-mn2_mc_phenobench_512_*_regnms*",
+        "ssd-mn2_mc_phenobench_1024_*_regnms*",
+        "ssd-mn2-fpnlite_mc_phenobench_320_*_regnms*",
+        "ssd-mn2-fpnlite_mc_phenobench_512_*_regnms*",
+        "ssd-mn2-fpnlite_mc_phenobench_1024_*_regnms*",
     ],
 }
 
@@ -308,6 +314,59 @@ def parse_variant(tokens: list[str], base_env: dict[str, str]) -> Variant:
         env[key] = value
 
     return Variant(name, env)
+
+
+#: Head-room over ``--max-seconds`` before the host gives up on a board run.
+#: The device's own budget excludes the closing gap + chirp (dropping those
+#: would leave the power trace unalignable), and ssh, NFS writes and the
+#: sampler's final flush all land after it too.
+RUN_TIMEOUT_SLACK = 120.0
+
+
+def kill_remote_run(device: Remote, run_name: str) -> None:
+    """
+    Stop a board run the host has given up waiting for.
+
+    Killing ssh locally leaves the remote process running, holding the CPU the
+    *next* model is about to be measured on -- which would quietly corrupt
+    every subsequent run in the sweep rather than just the abandoned one.
+    """
+
+    pattern = shlex.quote(run_name)
+
+    try:
+        device.run(
+            f"pkill -f {pattern} || true; sleep 2; pkill -9 -f {pattern} || true",
+            timeout=30.0,
+        )
+    except Exception as exc:
+        print(f"  [warning] could not kill {run_name} on the board: {exc}")
+
+
+def exclude_models(
+    models: list[Path], patterns: list[str]
+) -> tuple[list[Path], list[tuple[str, int]]]:
+    """
+    Drop models matching any of ``patterns``, reporting what each removed.
+
+    Subtractive selection, because the interesting exclusions are not
+    expressible as a glob over what remains: "everything except fp32" would
+    otherwise have to be spelled as a list of the four surviving schemes, which
+    silently stops being correct the next time a scheme is added.
+
+    The per-pattern counts are returned rather than discarded so a typo shows
+    up as ``-> 0 model(s)`` instead of quietly widening the sweep by hours.
+    """
+
+    counts: list[tuple[str, int]] = []
+    kept = list(models)
+
+    for pattern in patterns:
+        before = len(kept)
+        kept = [path for path in kept if not fnmatch(path.name, pattern)]
+        counts.append((pattern, before - len(kept)))
+
+    return kept, counts
 
 
 def collect_models(models_dir: Path, patterns: list[str] | None) -> list[Path]:
@@ -432,8 +491,24 @@ def main(argv=None) -> int:
             "measured not to affect resource cost. 'res-ladder' is the "
             "320/512/1024 input ladder, untiled-trained and untiled-evaluated "
             "(the only cell that spans it, and the only one in which input "
-            "size is not confounded with source size) — see PRESETS in this "
-            "file for both arguments"
+            "size is not confounded with source size), at per-class NMS to "
+            "match the presented configuration — see PRESETS in this file for "
+            "both arguments"
+        ),
+    )
+    selection.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help=(
+            "Drop models matching GLOB, after --models/--preset (repeatable). "
+            "Composes with both, and is how the expensive-but-uninformative "
+            "corners come out of a full sweep: '--exclude *_fp32_*' drops the "
+            "25 float exports, which the Teflon delegate cannot execute — it "
+            "claims the float convolutions and returns NaN, so those runs cost "
+            "the most wall time and measure a computation that did not happen "
+            "(use --cpu to price fp32 properly, in its own sweep)"
         ),
     )
     selection.add_argument(
@@ -454,6 +529,17 @@ def main(argv=None) -> int:
         ),
     )
     selection.add_argument(
+        "--suffix",
+        default="",
+        help=(
+            "Tag for a whole tree measured on the same board under a "
+            "different delegate build, exactly as benchmark_all.sh uses it: "
+            "--suffix unpatched -> resource_results/<host>_unpatched/. `_cpu` "
+            "stays last, so it names the unaccelerated variant of whichever "
+            "tree that is"
+        ),
+    )
+    selection.add_argument(
         "--skip-existing",
         action="store_true",
         help="skip runs whose run.json already exists",
@@ -470,6 +556,19 @@ def main(argv=None) -> int:
             "inferences, so a run overshoots by at most one -- 0.2 s even for "
             "the 1024 fp32 rung. Use --iterations for fixed work instead of "
             "fixed time"
+        ),
+    )
+    load.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Hard wall-clock budget per model, covering pool decode, model "
+            "load, warm-up and the loop (0 = unbounded). --seconds bounds only "
+            "the loop, which does not protect the case that costs hours: a "
+            "model the delegate rejects, running on the CPU at seconds per "
+            "inference. Runs stopped by this are marked truncated in run.json "
+            "and are not steady-state"
         ),
     )
     load.add_argument("--warmup", type=int, default=20)
@@ -576,6 +675,8 @@ def main(argv=None) -> int:
     models_dir = REPO_ROOT / "artifacts" / "tflite"
     patterns = PRESETS[args.preset] if args.preset else args.models
     models = collect_models(models_dir, patterns)
+    selected_count = len(models)
+    models, exclusions = exclude_models(models, args.exclude)
 
     if not models:
         print(f"no models selected in {models_dir}", file=sys.stderr)
@@ -600,12 +701,19 @@ def main(argv=None) -> int:
     if args.output:
         output_dir = Path(args.output).resolve()
     else:
-        suffix = "_cpu" if args.cpu else ""
+        platform = device_tag
+
+        if args.suffix:
+            platform = f"{platform}_{args.suffix.lstrip('_')}"
+
+        if args.cpu:
+            platform = f"{platform}_cpu"
+
         # Sibling of benchmark_results/, not a subtree of it: `ave resources`
         # is a separate measurement path (steady-state cost, not predictions)
         # and already defaults here, and a `power/` directory inside
         # benchmark_results/ gets scanned as if it were a platform.
-        output_dir = REPO_ROOT / "resource_results" / f"{device_tag}{suffix}" / stamp
+        output_dir = REPO_ROOT / "resource_results" / platform / stamp
 
     # The board reaches the results tree only through the NFS mount, so the
     # sweep directory has to be expressible as a repo-relative path.
@@ -661,22 +769,42 @@ def main(argv=None) -> int:
             and (output_dir / variant.run_name(model) / "run.json").exists()
         )
     ]
-    run_time = (
-        args.seconds
-        + 2 * args.gap_seconds
-        + 2 * args.chirp_seconds
-        + args.overhead_estimate
-    )
+    bracket_time = 2 * args.gap_seconds + 2 * args.chirp_seconds
+    run_time = args.seconds + bracket_time + args.overhead_estimate
     cooldown_time = args.cooldown * max(0, len(runs_to_execute) - 1)
     meter_time = 2 * args.meter_settle if runs_to_execute and not args.no_meter else 0.0
     estimated_time = run_time * len(runs_to_execute) + cooldown_time + meter_time
 
+    # With a budget the estimate above is the *typical* case -- what a model
+    # that keeps up costs. The number worth knowing before starting an
+    # overnight sweep is the other one: what it costs if every model hits its
+    # ceiling. On an unpatched delegate that is not a hypothetical.
+    if args.max_seconds > 0:
+        worst_run_time = args.max_seconds + bracket_time
+        worst_time = (
+            max(run_time, worst_run_time) * len(runs_to_execute)
+            + cooldown_time
+            + meter_time
+        )
+    else:
+        worst_time = None
+
+    # The host waits out the device's own budget plus the bracket it excludes.
+    run_timeout = args.max_seconds + RUN_TIMEOUT_SLACK if args.max_seconds > 0 else None
+
     print(
         f"models          : {len(models)} selected"
+        + (f" of {selected_count}" if len(models) != selected_count else "")
         + (f" x {len(variants)} variant(s)" if len(variants) > 1 else "")
         + f", {len(runs_to_execute)} run(s) to execute"
         + (f"  (preset {args.preset})" if args.preset else "")
     )
+
+    for pattern, removed in exclusions:
+        print(
+            f"excluded        : {pattern} -> {removed} model(s)"
+            + ("   [matched nothing — typo?]" if not removed else "")
+        )
 
     if len(variants) > 1 or base_env:
         for variant in variants:
@@ -695,6 +823,14 @@ def main(argv=None) -> int:
         f"estimated time  : {format_duration(estimated_time)} "
         f"({', '.join(estimate_parts)})"
     )
+
+    if worst_time is not None:
+        print(
+            f"worst case      : {format_duration(worst_time)} "
+            f"(every model hitting its {format_duration(args.max_seconds)} "
+            f"budget; host gives up at {format_duration(run_timeout)} per run)"
+        )
+
     print()
 
     device = Remote(args.device, args.ssh_option, args.device_python)
@@ -721,6 +857,17 @@ def main(argv=None) -> int:
         "variants": [
             {"name": variant.name, "env": variant.env} for variant in variants
         ],
+        # What was asked for and what was left out, both. A sweep that is
+        # missing a whole precision looks identical to one that was never asked
+        # for it, and "why is there no fp32 in this tree" is not a question the
+        # directory listing can answer six months later.
+        "selection": {
+            "preset": args.preset,
+            "patterns": patterns,
+            "exclude": args.exclude,
+            "excluded_counts": dict(exclusions),
+            "models": [model.name for model in models],
+        },
         "config": {
             "seconds": args.seconds,
             "warmup": args.warmup,
@@ -772,6 +919,8 @@ def main(argv=None) -> int:
                 run_name,
                 "--seconds",
                 str(args.seconds),
+                "--max-seconds",
+                str(args.max_seconds),
                 "--warmup",
                 str(args.warmup),
                 "--pool-size",
@@ -1031,12 +1180,52 @@ def main(argv=None) -> int:
             # ---- the run itself ----
             record["device_start_local_s"] = time.time()
 
-            result = subprocess.run(
-                [*device.ssh, command],
-                capture_output=True,
-                text=True,
-                timeout=None,
-            )
+            # `ave resources --max-seconds` bounds itself, so this timeout is
+            # only for the case where it *cannot*: a board that wedges, an ssh
+            # that hangs, an in-flight Invoke that never returns. Without a
+            # bound here one such model stalls the whole sweep -- and the
+            # meter keeps logging into a trace nobody is producing load for.
+            try:
+                result = subprocess.run(
+                    [*device.ssh, command],
+                    capture_output=True,
+                    text=True,
+                    timeout=run_timeout,
+                )
+            except subprocess.TimeoutExpired as expired:
+                print(
+                    f"  [error] no result after {run_timeout:.0f}s "
+                    f"(budget {args.max_seconds:.0f}s + {RUN_TIMEOUT_SLACK:.0f}s "
+                    "slack) — killing it on the board and moving on"
+                )
+
+                record["timed_out"] = True
+                record["timeout_s"] = run_timeout
+                record["device_end_local_s"] = time.time()
+                record["returncode"] = None
+
+                # ssh dying does not kill what it started. The run name is on
+                # the remote command line twice and is unique per (model,
+                # variant), which makes it a safe pattern to match.
+                kill_remote_run(device, run_name)
+
+                (run_dir / "console.log").write_text(
+                    f"$ ssh {args.device} {command}\n\n"
+                    f"[timed out after {run_timeout:.0f}s]\n"
+                    f"{expired.stdout or ''}\n{expired.stderr or ''}"
+                )
+
+                failed += 1
+                (run_dir / "sweep_run.json").write_text(
+                    json.dumps(record, indent=2) + "\n"
+                )
+                active_record = None
+
+                if not is_last and args.cooldown > 0:
+                    print(f"  cooldown {args.cooldown:.0f}s", flush=True)
+                    time.sleep(args.cooldown)
+
+                continue
 
             record["device_end_local_s"] = time.time()
             record["returncode"] = result.returncode
