@@ -5,7 +5,7 @@ An additional measurement path not part of ``ave benchmark``.
 
 ``ave resources`` asks **what does this model cost to run**.
 
-Images are decoded **once** into a small in-RAM pool and cycled.d
+Images are decoded **once** into a small in-RAM pool and cycled.
 
 The run is bracketed like this::
 
@@ -18,8 +18,10 @@ of the load, which is the local baseline the power analysis subtracts.
 Outputs, per run directory:
 
 ``resources.csv.gz``    periodic CPU / memory / thermal / frequency samples
-``iterations.csv.gz``   per-inference epoch timestamps, latency, detection count
-``run.json``            config, delegate state, phase boundaries, clock anchors
+``iterations.csv.gz``   per-inference epoch timestamps, latency, phase split,
+                        detection count
+``run.json``            config, delegate state, phase boundaries, latency
+                        breakdown, clock anchors
 ``resources_meta.json`` sampler health, peak RSS, clock anchors
 """
 
@@ -133,11 +135,22 @@ def latency_stats(latencies_ms: list[float]) -> dict[str, float]:
     }
 
 
+#: Phases a runtime may report, in execution order. ``postprocess`` is derived
+#: rather than measured -- it is whatever the call spent outside the three
+#: timed regions, which is exactly the detection decode -- and ``resize`` is a
+#: *part of* ``preprocess``, not a sibling of it. Both facts matter when
+#: reading the summary: the four do not sum to the total.
+PHASES = ("resize", "preprocess", "invoke", "postprocess")
+
+
 def write_iterations(path: Path, rows: list[tuple[Any, ...]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with gzip.open(str(path), "wt", newline="") as stream:
         writer = csv.writer(stream, lineterminator="\n")
+        # Phase columns are appended, never inserted: the first six are what
+        # every previously collected sweep has, and power_report.py reads them
+        # positionally.
         writer.writerow(
             (
                 "iteration",
@@ -146,9 +159,63 @@ def write_iterations(path: Path, rows: list[tuple[Any, ...]]) -> None:
                 "t_end_s",
                 "latency_ms",
                 "detections",
+                *(f"{phase}_ms" for phase in PHASES),
             )
         )
         writer.writerows(rows)
+
+
+def phase_breakdown(
+    latencies_ms: list[float],
+    phase_samples: dict[str, list[float]],
+) -> dict[str, Any]:
+    """
+    Per-phase order statistics, plus the latency net of the resize.
+
+    ``net_of_resize`` is computed per iteration and only then summarised, not
+    as a difference of two medians. The two are not the same number and the
+    per-iteration one is the honest one: a run whose resize happened to be slow
+    on the same iterations its inference was slow would otherwise have the
+    covariance quietly averaged away.
+    """
+
+    if not latencies_ms or not phase_samples.get("resize"):
+        return {}
+
+    resize = phase_samples["resize"]
+
+    net = [
+        latency - cost
+        for latency, cost in zip(latencies_ms, resize, strict=False)
+        # A negative net is not a slow resize, it is a mismatched pair; there
+        # is no iteration in which the resize is not part of the latency.
+        if latency >= cost
+    ]
+
+    breakdown = {}
+
+    for phase, samples in phase_samples.items():
+        if not samples:
+            continue
+
+        stats = latency_stats(samples)
+        # A phase has a duration, not a frame rate. "4144 fps" for the resize
+        # step is arithmetically true and means nothing anyone would want.
+        stats.pop("throughput_fps", None)
+        breakdown[phase] = stats
+
+    # This one keeps it: it is a rate the machine could actually sustain if the
+    # frames arrived at the model's input size, which is the question a camera
+    # pipeline with a hardware scaler in front of it is asking.
+    breakdown["net_of_resize"] = latency_stats(net)
+
+    if latencies_ms:
+        mean_total = statistics.mean(latencies_ms)
+        breakdown["resize_share"] = (
+            statistics.mean(resize) / mean_total if mean_total > 0 else None
+        )
+
+    return breakdown
 
 
 def main(argv=None):
@@ -166,6 +233,16 @@ def main(argv=None):
         "--output-prefix",
         default="",
         help="Prefix added to the run directory name inside --output-dir",
+    )
+    parser.add_argument(
+        "--output-name",
+        default=None,
+        help=(
+            "Run directory name inside --output-dir (default: the model stem). "
+            "Needed when the same model is run more than once in a sweep -- "
+            "under different delegate environments, say -- since the default "
+            "name would make the second run overwrite the first"
+        ),
     )
 
     parser.add_argument(
@@ -241,6 +318,17 @@ def main(argv=None):
         help="Free-form label copied into run.json",
     )
     parser.add_argument(
+        "--no-phases",
+        action="store_true",
+        help=(
+            "Do not break the latency down into resize / preprocess / invoke. "
+            "The breakdown costs a few sub-microsecond clock reads per "
+            "inference, which is nothing against a millisecond-scale one -- "
+            "use this only to prove that, or to reproduce a pre-breakdown run "
+            "exactly"
+        ),
+    )
+    parser.add_argument(
         "-e",
         "--env",
         metavar="KEY=VALUE",
@@ -261,7 +349,8 @@ def main(argv=None):
         delegate = None
 
     model_path = Path(args.model)
-    output_dir = Path(args.output_dir) / f"{args.output_prefix}{model_path.stem}"
+    run_name = args.output_name or model_path.stem
+    output_dir = Path(args.output_dir) / f"{args.output_prefix}{run_name}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     from agri_vision_edge.evaluation.resources import (
@@ -283,6 +372,7 @@ def main(argv=None):
     run: dict[str, Any] = {
         "schema": 1,
         "label": args.label,
+        "run_name": run_name,
         "model": model_path.name,
         "model_path": str(model_path),
         "model_bytes": model_path.stat().st_size if model_path.is_file() else None,
@@ -296,6 +386,7 @@ def main(argv=None):
             "sample_interval": args.sample_interval,
             "chirp_seconds": args.chirp_seconds,
             "gap_seconds": args.gap_seconds,
+            "phases": not args.no_phases,
         },
         "system": system_info(),
         "clock": {
@@ -336,6 +427,11 @@ def main(argv=None):
         )
 
         run["phases"]["model_load_end"] = time.time()
+
+        # Enabled before the warm-up, so the first *measured* iteration is not
+        # also the first one that ever took the timing branch.
+        if not args.no_phases:
+            runtime.enable_phase_timing()
 
         run["delegate_active"] = getattr(runtime, "active_delegate", None)
         run["backend"] = "delegate" if run["delegate_active"] else "cpu"
@@ -379,6 +475,7 @@ def main(argv=None):
 
         rows: list[tuple[Any, ...]] = []
         latencies_ms: list[float] = []
+        phase_samples: dict[str, list[float]] = {phase: [] for phase in PHASES}
 
         run["phases"]["measure_start"] = time.time()
         loop_start = time.perf_counter()
@@ -398,6 +495,31 @@ def main(argv=None):
             latency_ms = (end_perf - start_perf) * 1000.0
             latencies_ms.append(latency_ms)
 
+            # Read, not kept: the runtime overwrites this dict on the next
+            # call. Empty when --no-phases, or for a runtime that does not
+            # instrument itself (the SavedModel one has no cv2 resize to
+            # report), in which case the columns stay blank rather than zero --
+            # zero would read as "free".
+            timings = runtime.phase_timings_ms
+
+            resize_ms = timings.get("resize")
+            preprocess_ms = timings.get("preprocess")
+            invoke_ms = timings.get("invoke")
+
+            if preprocess_ms is not None and invoke_ms is not None:
+                postprocess_ms = max(0.0, latency_ms - preprocess_ms - invoke_ms)
+            else:
+                postprocess_ms = None
+
+            for phase, value in (
+                ("resize", resize_ms),
+                ("preprocess", preprocess_ms),
+                ("invoke", invoke_ms),
+                ("postprocess", postprocess_ms),
+            ):
+                if value is not None:
+                    phase_samples[phase].append(value)
+
             rows.append(
                 (
                     iteration,
@@ -406,6 +528,15 @@ def main(argv=None):
                     "%.6f" % (t_start + (end_perf - start_perf)),
                     f"{latency_ms:.4f}",
                     len(detections),
+                    *(
+                        "" if value is None else f"{value:.4f}"
+                        for value in (
+                            resize_ms,
+                            preprocess_ms,
+                            invoke_ms,
+                            postprocess_ms,
+                        )
+                    ),
                 )
             )
 
@@ -430,6 +561,7 @@ def main(argv=None):
             )
 
         run["latency"] = latency_stats(latencies_ms)
+        run["latency_phases"] = phase_breakdown(latencies_ms, phase_samples)
         run["detections_total"] = sum(row[5] for row in rows)
         run["detections_mean"] = run["detections_total"] / len(rows) if rows else 0.0
 
@@ -460,6 +592,27 @@ def main(argv=None):
         f"p95 {stats['p95_latency_ms']:.2f} ms  "
         f"{stats['throughput_fps']:.1f} fps"
     )
+
+    breakdown = run.get("latency_phases") or {}
+
+    if breakdown:
+        net = breakdown["net_of_resize"]
+        share = breakdown.get("resize_share")
+
+        print(
+            "  of which: "
+            + "  ".join(
+                f"{phase} {breakdown[phase]['mean_latency_ms']:.2f} ms"
+                for phase in PHASES
+                if phase in breakdown
+            )
+        )
+        print(
+            f"  net of resize: mean {net['mean_latency_ms']:.2f} ms  "
+            f"{net['throughput_fps']:.1f} fps"
+            + (f"  (resize is {share * 100:.1f} % of the call)" if share else "")
+        )
+
     print(f"artifacts: {output_dir}")
 
     cadence = run["sampler"].get("cadence", {})

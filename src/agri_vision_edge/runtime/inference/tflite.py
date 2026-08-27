@@ -194,6 +194,12 @@ class TFLiteRuntime(BaseRuntime):
         image,
     ):
 
+        # Timed separately from the rest of preprocessing because it is the one
+        # step whose cost is set by the *source* resolution rather than by the
+        # model: an untiled 1024px frame and a 512px tile reach this line with
+        # the same interpreter behind it. See BaseRuntime.enable_phase_timing.
+        resize_start = self._mark()
+
         image = cv2.resize(
             image,
             (
@@ -201,6 +207,8 @@ class TFLiteRuntime(BaseRuntime):
                 self.input_size,
             ),
         )
+
+        self._phase("resize", resize_start)
 
         input_detail = self.input_details[0]
 
@@ -270,6 +278,8 @@ class TFLiteRuntime(BaseRuntime):
         image,
     ):
 
+        preprocess_start = self._mark()
+
         input_tensor = self.preprocess(image)
 
         self.interpreter.set_tensor(
@@ -277,7 +287,17 @@ class TFLiteRuntime(BaseRuntime):
             input_tensor,
         )
 
+        # Includes set_tensor: the copy into the interpreter's input buffer is
+        # part of getting the frame in, not of decoding the result.
+        self._phase("preprocess", preprocess_start)
+
+        invoke_start = self._mark()
+
         self.interpreter.invoke()
+
+        # The only phase that is actually the model. On a delegated run this is
+        # the NPU; everything either side of it is the CPU regardless.
+        self._phase("invoke", invoke_start)
 
         raw_scores = self.interpreter.get_tensor(self.output_details[0]["index"])
 

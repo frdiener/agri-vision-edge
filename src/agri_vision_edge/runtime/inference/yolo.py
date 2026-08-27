@@ -163,17 +163,30 @@ class YoloTFLiteRuntime(BaseRuntime):
 
     def predict(self, image):
 
+        preprocess_start = self._mark()
+        resize_start = preprocess_start
+
+        # Split out for the same reason as in the SSD runtime: this is the one
+        # step priced by the *source* resolution rather than by the model.
         resized = cv2.resize(
             image,
             (self._input_size, self._input_size),
         )
+
+        self._phase("resize", resize_start)
 
         self.interpreter.set_tensor(
             self.input_details[0]["index"],
             self._quantize_input(resized)[None],
         )
 
+        self._phase("preprocess", preprocess_start)
+
+        invoke_start = self._mark()
+
         self.interpreter.invoke()
+
+        self._phase("invoke", invoke_start)
 
         floor = max(self.score_threshold, CANDIDATE_FLOOR)
 
