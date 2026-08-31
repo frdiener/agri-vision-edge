@@ -10,6 +10,15 @@ frame, then renders the figures and LaTeX tables used in the thesis.
 Layout consumed::
 
     benchmark_results/<platform>/<run>/{metrics,latency,runtime}.json
+    benchmark_results/<platform>/resize.json
+
+The second is not a run. It is the host's measured ``cv2.resize`` cost, written
+by ``scripts/benchmark_resize.py``, and it exists because every latency above
+contains one: ``predict()`` resizes the source frame to the model's input
+inside the timed region, by an amount that depends on both the evaluation
+regime and the input size. :func:`add_resize_cost` subtracts it, which is what
+makes the resolution ladder and the tiling study comparisons of the detector
+rather than of its preprocessing.
 
 The run name encodes the configuration and is decoded by :func:`parse_run_name`::
 
@@ -33,12 +42,14 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.ticker import FuncFormatter
 
 # Reuse the shared axis styling so benchmark figures match the training-curve
 # figures (despined, grid-below, consistent spines).
@@ -512,6 +523,248 @@ def select_nms(df: pd.DataFrame, nms: str | None = DEFAULT_NMS) -> pd.DataFrame:
     if df.empty or nms is None or "nms" not in df.columns:
         return df
     return df[df["nms"].isna() | (df["nms"] == nms)]
+
+
+# =========================================================
+# Preprocessing cost
+# =========================================================
+
+#: Written by ``scripts/benchmark_resize.py``, one per measurement host::
+#:
+#:     benchmark_results/<platform>/resize.json
+#:
+#: A file rather than a directory, deliberately: :func:`load_benchmark_results`
+#: walks directories only, so the artifact can sit beside the runs it corrects
+#: without being scanned as a run that has no metrics.
+RESIZE_ARTIFACT = "resize.json"
+
+#: Latency columns the correction is applied to, and the corrected name each
+#: gets. ``min``/``max`` are excluded on purpose: a run's fastest inference and
+#: its slowest did not both pay the median resize, and subtracting a central
+#: estimate from an extreme produces a number with no defensible meaning.
+_CORRECTED_LATENCY_COLUMNS = {
+    "median_latency_ms": "median_latency_ms_net",
+    "mean_latency_ms": "mean_latency_ms_net",
+    "p95_latency_ms": "p95_latency_ms_net",
+}
+
+
+def load_resize_costs(
+    root: str | Path = "benchmark_results",
+) -> pd.DataFrame:
+    """
+    Every host's measured ``cv2.resize`` cost, as one tidy frame.
+
+    One row per ``(platform, eval_tiling, size)``: the preprocessing every run
+    in that cell paid inside its timed region, measured in isolation on the
+    same host by ``scripts/benchmark_resize.py`` (which documents what the
+    number is and is not).
+
+    ``size`` is a string, matching :func:`parse_run_name`'s token rather than
+    the integer the artifact stores, so the frame joins straight onto a run
+    frame without a cast at every call site.
+    """
+    root = Path(root)
+
+    if not root.is_dir():
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+
+    for platform_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        artifact = _read_json(platform_dir / RESIZE_ARTIFACT)
+
+        if not artifact:
+            continue
+
+        opencv = artifact.get("opencv") or {}
+
+        for entry in artifact.get("resizes") or []:
+            latency = entry.get("latency") or {}
+
+            rows.append(
+                {
+                    "platform": platform_dir.name,
+                    "eval_tiling": entry.get("eval_tiling"),
+                    "source_px": entry.get("source_px"),
+                    "target_px": entry.get("target_px"),
+                    "size": str(entry.get("target_px")),
+                    "identity": entry.get("identity"),
+                    "resize_median_ms": latency.get("median_latency_ms"),
+                    "resize_mean_ms": latency.get("mean_latency_ms"),
+                    "resize_p95_ms": latency.get("p95_latency_ms"),
+                    "resize_n": latency.get("count"),
+                    "opencv_version": opencv.get("version"),
+                    "opencv_threads": opencv.get("threads"),
+                    "measured": artifact.get("created"),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def _resize_platform_candidates(platform: str) -> list[str]:
+    """
+    The trees a run's platform may find its resize measurement filed under.
+
+    Resize runs on the CPU whatever the delegate is doing and whatever delegate
+    *build* is installed, so ``frdm-imx93``, ``frdm-imx93_cpu`` and
+    ``frdm-imx93_unpatched`` all pay the same preprocessing -- one measurement
+    per board, not per results tree. Suffixes are joined with ``_`` and board
+    hostnames use ``-``, so the leading token is the board.
+
+    Exact match first regardless, so a tree that does have its own artifact is
+    never overridden by the board's.
+    """
+    candidates = [platform, platform.removesuffix("_cpu"), platform.split("_")[0]]
+
+    seen: list[str] = []
+
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+
+    return seen
+
+
+def add_resize_cost(
+    df: pd.DataFrame,
+    costs: pd.DataFrame | str | Path = "benchmark_results",
+    *,
+    statistic: str = "resize_median_ms",
+) -> pd.DataFrame:
+    """
+    Attach the preprocessing cost of each run, and the latency net of it.
+
+    Every latency in this frame is the wall time of ``runtime.predict()``, and
+    that call begins by resizing the source frame to the model's input. The
+    resize is genuine deployment work, so the uncorrected figure is the right
+    one to quote for "what does this cost to run" -- but it is *not* model
+    compute, and its size is set by the pair (source resolution, input size),
+    which the sweep varies on two axes at once::
+
+        untiled runs feed a 1024x1024 frame; tiled runs feed a 512x512 tile,
+        and the input size ranges over 320 / 512 / 1024.
+
+    So a 320 model evaluated untiled is charged a 1024->320 downscale that the
+    1024 model evaluated on the same frames does not pay, and the tiling
+    comparison moves the source resolution underneath everything in it. The
+    ``*_net`` columns take that term out, which is what makes the resolution
+    ladder and the tiling study comparisons of the detector rather than of the
+    preprocessing.
+
+    Runs with no measurement for their host get ``NaN``, never the uncorrected
+    value: a silently uncorrected row in a corrected column is a wrong number,
+    whereas a missing one is a missing measurement and says so.
+
+    The ``tf-savedmodel*`` trees stay ``NaN`` for a second, better reason, and
+    it is not an omission to be fixed: those graphs carry a
+    ``fixed_shape_resizer`` and are fed at native resolution, so they contain
+    no ``cv2.resize`` to subtract at all (see
+    :mod:`agri_vision_edge.runtime.inference.saved_model`). Filing a resize
+    artifact under them would subtract work that never happened.
+
+    Args:
+        df: run frame from :func:`load_benchmark_results`.
+        costs: frame from :func:`load_resize_costs`, or the results root to
+            load it from.
+        statistic: which order statistic to subtract. The median matches the
+            column the report quotes latency from; ``resize_mean_ms`` pairs
+            with ``mean_latency_ms`` if a caller wants like for like.
+    """
+    if df.empty:
+        return df
+
+    if not isinstance(costs, pd.DataFrame):
+        costs = load_resize_costs(costs)
+
+    out = df.copy()
+
+    for column in ("resize_ms", "resize_source_px", "resize_platform"):
+        out[column] = np.nan
+
+    for column in _CORRECTED_LATENCY_COLUMNS.values():
+        out[column] = np.nan
+
+    if costs.empty or "platform" not in out.columns:
+        return out
+
+    indexed = costs[
+        ~costs.duplicated(subset=["platform", "eval_tiling", "size"], keep="first")
+    ].set_index(["platform", "eval_tiling", "size"])
+
+    def _lookup(row):
+        for candidate in _resize_platform_candidates(str(row.get("platform", ""))):
+            key = (candidate, row.get("eval_tiling"), str(row.get("size")))
+
+            if key in indexed.index:
+                entry = indexed.loc[key]
+                return candidate, entry.get("source_px"), entry.get(statistic)
+
+        return None, np.nan, np.nan
+
+    resolved = out.apply(_lookup, axis=1, result_type="expand")
+    out["resize_platform"] = resolved[0]
+    out["resize_source_px"] = resolved[1]
+    out["resize_ms"] = pd.to_numeric(resolved[2], errors="coerce")
+
+    for column, corrected in _CORRECTED_LATENCY_COLUMNS.items():
+        if column not in out.columns:
+            continue
+
+        # Clipped at zero rather than allowed negative. A negative "compute
+        # time" is nonsense to print, and the only way to reach one is a resize
+        # measured under different conditions than the run -- which the
+        # magnitude of the clip makes obvious in the frame.
+        out[corrected] = (
+            pd.to_numeric(out[column], errors="coerce") - out["resize_ms"]
+        ).clip(lower=0.0)
+
+    net = out["median_latency_ms_net"]
+    out["fps_net"] = np.where(net > 0, 1000.0 / net, np.nan)
+
+    # What fraction of the measured latency was preprocessing. This is the
+    # number that decides whether the correction is worth quoting at all: a few
+    # percent on a 1024 model, far more on a 320 model fed full frames.
+    if "median_latency_ms" in out.columns:
+        measured = pd.to_numeric(out["median_latency_ms"], errors="coerce")
+        out["resize_share"] = out["resize_ms"] / measured.where(measured > 0)
+
+    return out
+
+
+def resize_cost_table(
+    costs: pd.DataFrame | str | Path = "benchmark_results",
+) -> pd.DataFrame:
+    """
+    The measured preprocessing cost per host, as a table for the appendix.
+
+    One row per host and source resolution, one column per model input size --
+    the shape the correction is applied in, so a reader can check any ``*_net``
+    figure against it by hand.
+    """
+    if not isinstance(costs, pd.DataFrame):
+        costs = load_resize_costs(costs)
+
+    if costs.empty:
+        return pd.DataFrame()
+
+    table = costs.copy()
+    table["Host"] = table["platform"]
+    table["Source"] = table["source_px"].map(lambda px: f"{px}x{px}")
+    table["Input"] = table["target_px"]
+    table["ms"] = table["resize_median_ms"].round(3)
+
+    wide = table.pivot_table(
+        index=["Host", "Source"],
+        columns="Input",
+        values="ms",
+        aggfunc="first",
+    )
+
+    wide.columns = [f"-> {int(column)} (ms)" for column in wide.columns]
+
+    return wide.reset_index()
 
 
 # =========================================================
@@ -2588,7 +2841,9 @@ def deployability_matrix(
             went. Omit it and those cells read as never-run.
         platforms: Columns to show. The reference is always used for scoring
             even when it is not shown, so narrowing to the boards does not turn
-            every cell into an unjudged ``ok``.
+            every cell into an unjudged ``ok``. Note this holds for *this*
+            argument only -- filtering ``runs_df`` by platform upstream does
+            remove the reference from scoring, and warns.
     """
     if runs_df.empty:
         return pd.DataFrame()
@@ -2600,6 +2855,22 @@ def deployability_matrix(
     keys = ["arch_label", "classes", "dataset", "size", "scheme"]
     if any(k not in sel.columns for k in keys):
         return pd.DataFrame()
+
+    # A configuration with no baseline is scored `ok` (see `_verdict`), which
+    # is the right default for a genuinely unjudgeable cell but catastrophic
+    # when the *whole* reference tree is missing: every verdict then reads `ok`
+    # and the table reports that nothing ever broke. Narrowing `runs_df` by
+    # platform is the usual way to arrive here -- `platforms=` selects columns
+    # without removing the reference, and is what callers want instead.
+    if reference not in set(sel["platform"].unique()):
+        warnings.warn(
+            f"deployability_matrix: reference platform {reference!r} is absent "
+            "from the frame, so no cell can be scored against it and every "
+            "verdict falls back to 'ok'. Keep the reference tree in scope "
+            "(it need not be a column -- use `platforms=` to choose those).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     ref = sel[sel["platform"] == reference].set_index(keys)["AP"]
     ref = ref[~ref.index.duplicated(keep="first")]
@@ -2707,6 +2978,9 @@ def delegate_build_table(
     nms: str | None = DEFAULT_NMS,
     suffix: str = "_unpatched",
     reference: str = CPU_REFERENCE_PLATFORM,
+    by_arch: bool = True,
+    latency_scope: str = "ok-both",
+    show_board_column=True,
 ) -> pd.DataFrame:
     """
     What rebuilding the delegate changed -- in verdicts, and in latency.
@@ -2716,15 +2990,32 @@ def delegate_build_table(
     that matter: configurations that changed verdict, and what the ones that
     already worked now cost.
 
-    .. warning::
+    Rows are resolved **per architecture** by default (``by_arch``). The plain
+    head and FPNLite do not respond to a delegate rebuild alike -- measured
+    here, the same rebuild moved per-tensor 320 by -30.6 % on ``ssd-mn2`` and
+    -60.6 % on FPNLite -- so pooling them reports a median belonging to neither.
 
-       Latency is quoted **only over configurations both builds executed
-       correctly** (``ok both``). A collapsed run still produces perfectly real
-       timings, and fast ones -- the work it skipped is exactly the work it got
-       wrong -- so differencing against it reports a speedup for breaking the
-       model. Where ``ok both`` is 0 the latency columns are empty on purpose:
-       the rebuild's contribution there is correctness, and there is no
-       honest speed number to give.
+    ``latency_scope`` picks what the latency columns cover:
+
+    ``"ok-both"`` (default)
+        Only configurations both builds executed correctly. A collapsed run
+        still produces perfectly real timings, and fast ones -- the work it
+        skipped is exactly the work it got wrong -- so differencing against it
+        reports a speedup for breaking the model.
+
+    ``"paired"``
+        Every configuration both trees *timed*, whatever the verdict. A
+        collapsed run's wall clock is still a real measurement of dispatch and
+        CPU<->NPU tensor movement, which is the cost a delegate rebuild is
+        meant to shift, so this is the scope to read when the question is about
+        sync overhead rather than about compute. Read it against ``Before`` /
+        ``After``: the two medians describe runs of different correctness.
+
+    Either way the pairing is per configuration and the width is reported as
+    ``timed``. Empty latency columns mean the two trees share no timed
+    configuration at all -- which, note, includes the case where the older tree
+    never ran them, not only the case where the gate rejected them. Check
+    ``timed`` against ``Configs`` before reading a difference.
     """
     if runs_df.empty:
         return pd.DataFrame()
@@ -2750,27 +3041,54 @@ def delegate_build_table(
     if eval_tiling is not None and "eval_tiling" in lat.columns:
         lat = lat[lat["eval_tiling"] == eval_tiling]
 
-    def _median(platform, subset):
+    def _timed(platform, subset):
+        """Median latency per config, indexed by ``keys``, timed runs only."""
         if subset.empty:
-            return None
+            return pd.Series(dtype=float)
         rows = lat[lat["platform"] == platform].merge(subset[keys], on=keys)
-        value = rows["median_latency_ms"].median()
-        return None if pd.isna(value) else round(float(value), 1)
+        rows = rows.dropna(subset=["median_latency_ms"])
+        if rows.empty:
+            return pd.Series(dtype=float)
+        return rows.groupby(keys)["median_latency_ms"].median()
+
+    def _paired(older, board, subset):
+        """
+        The two medians over configs *both* trees actually timed.
+
+        Returned as a triple with the pairing width, because a latency
+        difference whose support is one configuration is a different claim
+        from one over six, and the table has to be able to say which.
+        """
+        was_all, now_all = _timed(older, subset), _timed(board, subset)
+        common = was_all.index.intersection(now_all.index)
+        if len(common) == 0:
+            return None, None, 0
+        return (
+            round(float(was_all[common].median()), 1),
+            round(float(now_all[common].median()), 1),
+            len(common),
+        )
+
+    group_keys = ["scheme"]
+    if by_arch and "arch_label" in matrix.columns:
+        group_keys.insert(0, "arch_label")
 
     rows = []
     for board, older in pairs:
         if board not in matrix.columns or older not in matrix.columns:
             continue
 
-        for scheme, group in matrix.groupby("scheme", dropna=False):
+        for label, group in matrix.groupby(group_keys, dropna=False):
+            label = label if isinstance(label, tuple) else (label,)
             before, after = group[older], group[board]
             both_ok = group[(before == "ok") & (after == "ok")]
-            was, now = _median(older, both_ok), _median(board, both_ok)
+            scope = both_ok if latency_scope == "ok-both" else group
+            was, now, timed = _paired(older, board, scope)
 
-            rows.append(
+            row = {"Board": board} if show_board_column else {}
+            row.update(dict(zip(group_keys, label, strict=True)))
+            row.update(
                 {
-                    "Board": board,
-                    "Scheme": scheme,
                     "Configs": len(group),
                     "Before": before.value_counts().idxmax()
                     if before.notna().any()
@@ -2781,6 +3099,7 @@ def delegate_build_table(
                     "Fixed": int(((before != "ok") & (after == "ok")).sum()),
                     "Broken": int(((before == "ok") & (after != "ok")).sum()),
                     "ok both": len(both_ok),
+                    "timed": timed,
                     "ms before": was,
                     "ms after": now,
                     "d ms %": (
@@ -2790,8 +3109,10 @@ def delegate_build_table(
                     ),
                 }
             )
+            rows.append(row)
 
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    return out.rename(columns={"arch_label": "Arch", "scheme": "Scheme"})
 
 
 def deployability_summary(matrix: pd.DataFrame) -> pd.DataFrame:
@@ -2981,7 +3302,9 @@ def nms_substitution_summary(
     return (summary.round(4) + 0.0).reset_index()
 
 
-def nms_latency_tradeoff_table(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+def nms_latency_tradeoff_table(
+    df: pd.DataFrame, *, precision: str | None = "int8", **kwargs
+) -> pd.DataFrame:
     """
     What the substitution *buys*, estimated against its own null control.
 
@@ -3002,12 +3325,31 @@ def nms_latency_tradeoff_table(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     paired timings are simply not reliable at this resolution, and the row
     should be read as an upper bound rather than a measurement.
 
+    The estimate carries its own uncertainty, because a difference of two noisy
+    means is itself noisy. ``SE`` combines the standard errors of both arms,
+    ``sigma`` is the estimate in units of that, and ``95% CI`` spans it. A row
+    whose interval contains zero has not resolved a saving from drift, however
+    large its point estimate looks -- which is the difference between a small
+    effect and no measured effect, and the two are not interchangeable in a
+    trade-off argument.
+
+    Restricted to ``precision`` -- INT8 by default, the only precision that
+    ships. The quantity being estimated is a roughly fixed millisecond cost, so
+    pooling a 340 ms fp32 regime with a 33 ms INT8 one adds variance without
+    adding signal: measured here, the fp32 pairs carry some forty times the
+    absolute timing noise (single-class drift sd 4.7 ms against 0.02-0.12 ms),
+    and four such pairs in twenty set the width of every interval. Pass
+    ``precision=None`` to pool them again.
+
     Resolved **per architecture as well as per platform**. A latency figure
     without the detector it belongs to is not interpretable -- the two
     architectures differ by roughly 20 % in inference cost here -- and the
     quantity being estimated is a fixed post-processing cost, so expressing it
     as a share of the wrong total would misstate it.
     """
+    if precision is not None and "precision" in df.columns:
+        df = df[df["precision"] == precision]
+
     pairs = nms_substitution_table(df, **kwargs)
     if pairs.empty or "dLatency (ms)" not in pairs.columns:
         return pd.DataFrame()
@@ -3027,6 +3369,20 @@ def nms_latency_tradeoff_table(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
             continue
 
         drift = float(sc.mean())
+        saving = float(mc.mean()) - drift
+
+        # Standard error of a difference of independent means. Needs two
+        # samples per arm; with fewer, the interval is undefined rather than
+        # zero-width, so it is left empty instead of implying certainty.
+        if len(mc) > 1 and len(sc) > 1:
+            standard_error = float(
+                np.sqrt(mc.var(ddof=1) / len(mc) + sc.var(ddof=1) / len(sc))
+            )
+        else:
+            standard_error = float("nan")
+
+        half_width = 1.96 * standard_error
+
         rows.append(
             {
                 **dict(zip(("Platform", "Architecture"), key, strict=False)),
@@ -3034,7 +3390,23 @@ def nms_latency_tradeoff_table(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
                 "sc pairs": int(len(sc)),
                 "dLatency mc (ms)": round(float(mc.mean()), 3),
                 "sc drift (ms)": round(drift, 3),
-                "NMS saving (ms)": round(float(mc.mean()) - drift, 3),
+                "NMS saving (ms)": round(saving, 3),
+                "SE (ms)": None
+                if np.isnan(standard_error)
+                else round(standard_error, 3),
+                "sigma": (
+                    None
+                    if np.isnan(standard_error) or not standard_error
+                    else round(abs(saving) / standard_error, 1)
+                ),
+                "95% CI (ms)": (
+                    None
+                    if np.isnan(half_width)
+                    else f"[{saving - half_width:+.2f}, {saving + half_width:+.2f}]"
+                ),
+                "resolved": (
+                    None if np.isnan(half_width) else bool(abs(saving) > half_width)
+                ),
                 "sc |drift| worst (ms)": round(float(sc.abs().max()), 3),
             }
         )
@@ -3134,6 +3506,7 @@ def resolution_ladder_table(
     nms: str | None = DEFAULT_NMS,
     classes: str | None = "mc",
     dataset: str | None = "phenobench",
+    latency_platforms: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     """
     Accuracy and latency against input resolution, one row per (arch, size,
@@ -3149,6 +3522,14 @@ def resolution_ladder_table(
     Scoped to one class regime, training set, platform and input regime,
     because resolution is the axis under study and everything else has to be
     held fixed for the comparison to mean anything.
+
+    ``latency_platforms`` adds one median-latency column per target, joined on
+    the same rows. Accuracy is measured once on the CPU reference, but the
+    question a higher rung has to survive is what it costs **on the device**,
+    and a rung can only be disqualified by a number from the board it would
+    ship on. A target with no run at some resolution leaves the cell empty
+    rather than falling back to the reference host, whose milliseconds answer a
+    different question.
 
     Empty until the 512/1024 rungs are benchmarked; the shape is fixed now so
     the section lights up on its own when they land.
@@ -3179,13 +3560,48 @@ def resolution_ladder_table(
         ("APS", "APS"),
         ("crop_AP", "Crop AP"),
         ("weed_AP", "Weed AP"),
-        ("median_latency_ms", "Lat med (ms)"),
-        ("fps", "FPS"),
+        ("median_latency_ms", "x86 (ms)"),
     ]
     cols = [(c, n) for c, n in cols if c in sel.columns]
 
     out = sel[[c for c, _ in cols]].copy()
     out.columns = [n for _, n in cols]
+
+    if latency_platforms:
+        # Latency comes from the *unscoped* frame: `sel` is pinned to the
+        # accuracy platform, so the boards were filtered out several lines ago.
+        wide = add_scheme(select_nms(df, nms))
+        for column, value in (
+            ("eval_tiling", eval_tiling),
+            ("classes", classes),
+            ("dataset", dataset),
+        ):
+            if value is not None and column in wide.columns:
+                wide = wide[wide[column] == value]
+
+        for target in latency_platforms:
+            median = (
+                wide[wide["platform"] == target]
+                .groupby(["arch_label", "size", "scheme"])["median_latency_ms"]
+                .median()
+            )
+            latency = [
+                median.get((a, s, c))
+                for a, s, c in zip(
+                    sel["arch_label"], sel["size"], sel["scheme"], strict=False
+                )
+            ]
+            label = platform_label(target)
+            out[f"{label} (ms)"] = [
+                None if v is None or pd.isna(v) else round(float(v), 1) for v in latency
+            ]
+            # Throughput on the target, not on the reference host: the whole
+            # point of the column is what the board sustains.
+            out[f"{label} FPS"] = [
+                None if v is None or pd.isna(v) or not v else round(1000.0 / v, 1)
+                for v in latency
+            ]
+
     out["Input"] = pd.to_numeric(out["Input"], errors="coerce")
 
     order = {name: i for i, name in enumerate(SCHEME_ORDER)}
@@ -3201,8 +3617,7 @@ def resolution_ladder_table(
                 "APS": 4,
                 "Crop AP": 4,
                 "Weed AP": 4,
-                "Lat med (ms)": 2,
-                "FPS": 1,
+                "x86 (ms)": 2,
             }
         )
         .reset_index(drop=True)
@@ -3456,7 +3871,7 @@ def baseline_table(
         rows.append(
             {
                 "Detector": r["arch_label"],
-                "Input": f"{size}x{size}",
+                "Input": "full" if int(size) == 1024 else f"{size}x{size}",
                 "AP": _round_pct(r.get("faithful_mAP")),
                 "AP50": _round_pct(r.get("faithful_mAP50")),
                 "AP75": _round_pct(r.get("faithful_mAP75")),
@@ -3871,7 +4286,102 @@ ABLATION_AXES = (
     ("Single-class", {"classes": "sc"}),
     ("Trained tiled", {"dataset": "phenobench-tiled"}),
     ("Evaluated tiled", {"eval_tiling": "tiled"}),
+    ("Tiled end to end", {"dataset": "phenobench-tiled", "eval_tiling": "tiled"}),
 )
+
+#: The tiling square. Training tiling and evaluation tiling are *not* two
+#: independent one-axis deviations, and reporting them that way is misleading:
+#: each alone costs about 4 AP, while doing both gains 8.6 (MNv2, fp32, CPU
+#: reference). The matched cell is a different pipeline, not the sum of two
+#: perturbations, so :func:`tiling_cross_table` reports all four.
+TILING_CELLS = (
+    ("trained full / eval full", "phenobench", "untiled"),
+    ("trained full / eval tiled", "phenobench", "tiled"),
+    ("trained tiled / eval full", "phenobench-tiled", "untiled"),
+    ("trained tiled / eval tiled", "phenobench-tiled", "tiled"),
+)
+
+
+def tiling_cross_table(
+    df: pd.DataFrame,
+    *,
+    platform: str = CPU_REFERENCE_PLATFORM,
+    classes: str | None = "mc",
+    size: str | None = "320",
+    precision: str = "fp32",
+    quant: str = "ptq",
+    nms: str | None = DEFAULT_NMS,
+    metrics: Iterable[tuple[str, str]] = (
+        ("AP", "AP"),
+        ("crop_AP", "Crop AP"),
+        ("weed_AP", "Weed AP"),
+    ),
+    percent: bool = True,
+) -> pd.DataFrame:
+    """
+    All four training x evaluation tiling combinations, per architecture.
+
+    The two axes interact, so the one-at-a-time ablation cannot describe them.
+    Each cell answers a different question:
+
+    ==========================  =========================================
+    cell                        question
+    ==========================  =========================================
+    trained full / eval full    the reference
+    trained full / eval tiled   does tiling only at inference help?
+    trained tiled / eval full   does tile-training transfer to full frames?
+    trained tiled / eval tiled  the matched tiled pipeline
+    ==========================  =========================================
+
+    ``d`` is against the reference cell of the same architecture, so a
+    mismatched pair and the matched pipeline can be read off directly rather
+    than inferred from two separate deltas that do not add up.
+    """
+    if df.empty or "dataset" not in df.columns:
+        return pd.DataFrame()
+
+    sel = select_nms(df, nms)
+    sel = sel[sel["platform"] == platform] if platform else sel
+    sel = sel[sel["precision"] == precision]
+    if quant and "quant" in sel.columns:
+        sel = sel[sel["quant"] == quant]
+    if classes:
+        sel = sel[sel["classes"] == classes]
+    if size:
+        sel = sel[sel["size"] == size]
+    sel = sel[sel["arch"].isin(PRIMARY_ARCHS)] if "arch" in sel.columns else sel
+    if sel.empty:
+        return pd.DataFrame()
+
+    scale = 100.0 if percent else 1.0
+    rows = []
+
+    for arch, group in sel.groupby("arch_label"):
+        reference = {}
+        for label, dataset, tiling in TILING_CELLS:
+            cell = group[
+                (group["dataset"] == dataset) & (group["eval_tiling"] == tiling)
+            ]
+            row = {"Architecture": _arch_short(arch), "Tiling": label}
+
+            for col, name in metrics:
+                value = (
+                    None
+                    if cell.empty or cell[col].isna().all()
+                    else scale * float(cell[col].mean())
+                )
+                row[name] = None if value is None else round(value, 2)
+
+                if label == TILING_CELLS[0][0]:
+                    reference[name] = value
+                base = reference.get(name)
+                row[f"d {name}"] = (
+                    None if value is None or base is None else round(value - base, 2)
+                )
+
+            rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def story_ablation_table(
@@ -4128,6 +4638,18 @@ def discover_model_variants(
     return pd.DataFrame(rows)
 
 
+#: Trees that are not part of the conversion matrix at all. The SavedModel rung
+#: is the checkpoint's own TensorFlow graph: every export scheme in
+#: `DEFAULT_SCHEMES` is produced by `ave convert` *downstream* of it, so none of
+#: them is a thing that tree can be missing -- not the INT8 ones, and not
+#: `fp32_ptq` either, whose `ptq` token records which training path emitted the
+#: float graph rather than any quantization applied to it. Crossed with the
+#: schemes anyway, the tree reported 22 of 110 cells done (20 %) when it was
+#: complete for everything it can hold. It is produced by
+#: `scripts/benchmark_reference_models.py`, not by the sweep this matrix counts.
+NON_MATRIX_PLATFORMS = (REFERENCE_PLATFORM, "tf-savedmodel-nms0")
+
+
 def build_coverage(
     runs_df: pd.DataFrame,
     variants_df: pd.DataFrame,
@@ -4135,6 +4657,7 @@ def build_coverage(
     platforms: Iterable[str] = DEFAULT_EXPECTED_PLATFORMS,
     eval_tilings: Iterable[str] = DEFAULT_EVAL_TILINGS,
     nms: str | None = DEFAULT_NMS,
+    exclude_platforms: Iterable[str] = NON_MATRIX_PLATFORMS,
 ) -> pd.DataFrame:
     """
     Cross variants × schemes × eval regimes × platforms into a long coverage
@@ -4155,8 +4678,14 @@ def build_coverage(
     a per-class run stand in for the default export. The NMS axis therefore
     gets its own completeness view rather than a column here.
 
-    Platforms already present in ``runs_df`` are always included, so unexpected
-    platforms still surface. Matching ignores the split token.
+    ``exclude_platforms`` drops trees the conversion matrix does not describe.
+    No export scheme is a thing the SavedModel rung can be missing -- it holds
+    the pre-conversion graph, and every scheme is produced downstream of it --
+    so crossing it with them reported phantom gaps and understated its coverage
+    fivefold. It still appears in §8's per-platform tables, where it belongs.
+
+    Other platforms present in ``runs_df`` are always included, so unexpected
+    ones still surface. Matching ignores the split token.
     """
     if variants_df.empty:
         return pd.DataFrame()
@@ -4184,11 +4713,14 @@ def build_coverage(
                 )
             )
 
-    platform_list = list(
-        dict.fromkeys(
+    skip = set(exclude_platforms)
+    platform_list = [
+        p
+        for p in dict.fromkeys(
             [*platforms, *(runs_df["platform"].unique() if not runs_df.empty else [])]
         )
-    )
+        if p not in skip
+    ]
 
     rows = []
     for platform in platform_list:
@@ -4399,6 +4931,281 @@ def plot_resource_summary(
     return fig
 
 
+def plot_class_regime_quantization(
+    df: pd.DataFrame,
+    *,
+    platform: str | None = CPU_REFERENCE_PLATFORM,
+    nms: str | None = DEFAULT_NMS,
+    percent: bool = True,
+):
+    """
+    Per-class AP across export schemes, multi-class beside single-class.
+
+    Three series per scheme: the two classes a multi-class model reports, and
+    the weed AP of the single-class model trained on the same data. Read across
+    a panel, the question is whether quantization-aware training helps the same
+    amount in both class regimes -- and it does not. The single-class weed bar
+    is *not* a slice of the multi-class one; it is a different model, which is
+    why it needs its own series rather than a facet.
+
+    One panel per architecture, because the two detectors answer this
+    differently and pooling them would average an effect that reverses sign.
+    """
+    if df.empty or "weed_AP" not in df.columns:
+        return None
+
+    sel = add_scheme(select_nms(df, nms))
+    if platform:
+        sel = sel[sel["platform"] == platform]
+    sel = sel[sel["arch"].isin(PRIMARY_ARCHS)]
+    if sel.empty:
+        return None
+
+    schemes = [s for s in SCHEME_ORDER if s in set(sel["scheme"])]
+    archs = sorted(sel["arch_label"].unique())
+    if not schemes or not archs:
+        return None
+
+    series = (
+        ("crop AP (multi-class)", "mc", "crop_AP"),
+        ("weed AP (multi-class)", "mc", "weed_AP"),
+        ("weed AP (single-class)", "sc", "weed_AP"),
+    )
+
+    fig, axes = plt.subplots(len(archs), 1, figsize=(9, 3.4 * len(archs)), sharex=True)
+    axes = np.atleast_1d(axes)
+    labels = [scheme_label(s) for s in schemes]
+
+    for index, (ax, arch) in enumerate(zip(axes, archs, strict=False)):
+        rows = sel[sel["arch_label"] == arch]
+        values = {}
+        for label, classes, column in series:
+            cells = rows[rows["classes"] == classes]
+            values[label] = [
+                (
+                    None
+                    if cells[cells["scheme"] == s][column].isna().all()
+                    else cells[cells["scheme"] == s][column].mean()
+                )
+                for s in schemes
+            ]
+
+        _grouped_bars(
+            ax,
+            labels,
+            [label for label, _, _ in series],
+            values,
+            PALETTE,
+            ylabel="AP" if index == len(archs) - 1 else "",
+            title="",
+            fmt="{:.1f}",
+            percent=percent,
+            rotation=15 if index == len(archs) - 1 else 0,
+        )
+        ax.set_title(_short(pd.Series([arch])).iloc[0], fontsize=10)
+
+    fig.suptitle("Quantization by class regime")
+    fig.tight_layout()
+    _legend_outside(fig, axes[0], title="metric")
+    return fig
+
+
+def plot_resolution_tradeoff(
+    df: pd.DataFrame,
+    *,
+    platforms: Iterable[str] = ("frdm-imx8mp", "frdm-imx93"),
+    scheme: str = "int8_qat_per-tensor",
+    nms: str | None = DEFAULT_NMS,
+    metric: str = "AP",
+    percent: bool = True,
+    latency_ticks: Iterable[float] = (30, 50, 100, 200, 500),
+):
+    """
+    What a resolution rung buys against what it costs, on the target.
+
+    Accuracy against **device** latency, with the resolution rungs of one
+    detector on one board joined into a line. A rung is worth taking only if
+    its step up the y axis justifies its step along x, and that is a question
+    about the board -- the CPU reference answers a different one, so it is not
+    drawn here.
+
+    Latency is log-scaled: the ladder spans 30 ms to several seconds, and on a
+    linear axis every rung below 1024 collapses onto the origin.
+
+    Pinned to one ``scheme``. Granularity alone moves latency eightfold on the
+    Vivante NPU, so a line mixing schemes would trace that rather than
+    resolution. Points are labelled with their input size; a rung not yet
+    benchmarked on a board simply does not appear.
+    """
+    if df.empty or metric not in df.columns:
+        return None
+
+    sel = add_scheme(select_nms(df, nms))
+    sel = sel[
+        sel["platform"].isin(set(platforms))
+        & (sel["scheme"] == scheme)
+        & sel["arch"].isin(PRIMARY_ARCHS)
+        & (sel["classes"] == "mc")
+        & (sel["dataset"] == "phenobench")
+        & (sel["eval_tiling"] == "untiled")
+    ]
+    sel = sel[sel[metric].notna() & sel["median_latency_ms"].notna()].copy()
+    if sel.empty:
+        return None
+
+    sel["px"] = pd.to_numeric(sel["size"], errors="coerce")
+    sel = sel[sel["px"].notna()]
+    if sel.empty:
+        return None
+
+    scale = 100.0 if percent else 1.0
+    targets = sorted(sel["platform"].unique())
+    archs = sorted(sel["arch_label"].unique())
+    colors = {p: PALETTE[i % len(PALETTE)] for i, p in enumerate(targets)}
+    markers = dict(zip(archs, ("o", "s", "^"), strict=False))
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    for target in targets:
+        for arch in archs:
+            rows = sel[
+                (sel["platform"] == target) & (sel["arch_label"] == arch)
+            ].sort_values("px")
+            if rows.empty:
+                continue
+            grouped = rows.groupby("px").agg(
+                lat=("median_latency_ms", "median"), ap=(metric, "mean")
+            )
+            ax.plot(
+                grouped["lat"],
+                grouped["ap"] * scale,
+                marker=markers.get(arch, "o"),
+                markersize=9,
+                linewidth=1.5,
+                color=colors[target],
+                markeredgecolor="black",
+                markeredgewidth=0.4,
+                label=f"{platform_label(target)} · {_short(pd.Series([arch])).iloc[0]}",
+                zorder=3,
+            )
+            for px, row in grouped.iterrows():
+                ax.annotate(
+                    f"  {int(px)}",
+                    (row["lat"], row["ap"] * scale),
+                    fontsize=7,
+                    va="center",
+                )
+
+    ax.set_xscale("log")
+    ax.set_xticks(list(latency_ticks))
+    ax.xaxis.set_major_formatter(
+        FuncFormatter(lambda x, _: f"{x:g}" if x < 1000 else f"{x / 1000:g}k")
+    )
+
+    ax.set_xlabel("median latency on device (ms, log scale)")
+    ax.set_ylabel(f"{metric} (%)" if percent else metric)
+    ax.set_title(f"Resolution trade-off on device — {scheme_label(scheme)}")
+    _prepare_axis(ax)
+
+    fig.tight_layout()
+    _legend_outside(fig, ax, title="device · detector")
+    return fig
+
+
+def plot_resolution_ap(
+    df: pd.DataFrame,
+    *,
+    platform: str | None = CPU_REFERENCE_PLATFORM,
+    nms: str | None = DEFAULT_NMS,
+    metric: str = "AP",
+    schemes: Iterable[str] = (
+        "fp32_ptq",
+        "int8_ptq_per-channel",
+        "int8_ptq_per-tensor",
+    ),
+    percent: bool = True,
+):
+    """
+    AP against input resolution, one line per detector.
+
+    Colour is the architecture and the line is its ladder, so the question the
+    figure answers -- does more input resolution buy accuracy, and does it buy
+    the same for both detectors -- is read off the slopes.
+
+    ``schemes`` are drawn as separate line styles, and are listed rather than
+    summarised by precision on purpose. An earlier version drew one "INT8" line
+    per detector, which averaged per-tensor with per-channel and so hid up to
+    2.4 AP (FPNLite at 320) of the granularity effect §2 exists to report --
+    the same silent collapse this figure is meant to rule out for resolution.
+    QAT is omitted by default to keep the line count readable; the table beside
+    the figure carries every scheme.
+
+    A detector with no run at some resolution simply ends early; the ladder is
+    ragged while rungs are still training.
+    """
+    if df.empty or metric not in df.columns:
+        return None
+
+    sel = add_scheme(select_nms(df, nms))
+    if platform:
+        sel = sel[sel["platform"] == platform]
+    sel = sel[sel["arch"].isin(PRIMARY_ARCHS)]
+    sel = sel[
+        (sel["classes"] == "mc")
+        & (sel["dataset"] == "phenobench")
+        & (sel["eval_tiling"] == "untiled")
+    ]
+    wanted = list(schemes)
+    sel = sel[sel["scheme"].isin(wanted)]
+    sel = sel[sel[metric].notna() & sel["size"].notna()].copy()
+    if sel.empty:
+        return None
+
+    sel["px"] = pd.to_numeric(sel["size"], errors="coerce")
+    sel = sel[sel["px"].notna()]
+    if sel.empty:
+        return None
+
+    scale = 100.0 if percent else 1.0
+    archs = sorted(sel["arch_label"].unique())
+    colors = {a: PALETTE[i % len(PALETTE)] for i, a in enumerate(archs)}
+    dashes = ("-", "--", ":", "-.", (0, (3, 1, 1, 1)))
+    styles = {s: dashes[i % len(dashes)] for i, s in enumerate(wanted)}
+
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+
+    for arch in archs:
+        for scheme in wanted:
+            rows = sel[(sel["arch_label"] == arch) & (sel["scheme"] == scheme)]
+            if rows.empty:
+                continue
+            ladder = rows.groupby("px")[metric].mean().mul(scale).sort_index()
+            ax.plot(
+                ladder.index,
+                ladder.to_numpy(),
+                marker="*",
+                markersize=14,
+                linewidth=1.6,
+                linestyle=styles[scheme],
+                color=colors[arch],
+                markeredgecolor="black",
+                markeredgewidth=0.4,
+                label=f"{_short(pd.Series([arch])).iloc[0]} · {scheme_label(scheme)}",
+                zorder=3,
+            )
+
+    ax.set_xlabel("input resolution (px)")
+    ax.set_ylabel(f"{metric} (%)" if percent else metric)
+    ax.set_title("Accuracy against input resolution")
+    ax.set_xticks(sorted(sel["px"].unique()))
+    ax.set_xticklabels([f"{int(p)}" for p in sorted(sel["px"].unique())])
+    _prepare_axis(ax)
+
+    fig.tight_layout()
+    _legend_outside(fig, ax, title="detector · scheme")
+    return fig
+
+
 def plot_coverage(coverage_long: pd.DataFrame):
     """Heatmap of benchmark coverage: rows = variant, cols = platform/scheme."""
     if coverage_long.empty:
@@ -4534,9 +5341,23 @@ def save_latex_table(
 
     if caption:
         label = label or path.stem
+        # `max width` scales the tabular only when it would overrun the text
+        # block, so narrow tables keep the body font while the wide sweeps
+        # (device_latency at 11 columns, nms_substitution_summary at 15) fit
+        # instead of running into the margin. Unconditional \resizebox would
+        # shrink every table, including the ones that already fit.
         body = (
-            "\\begin{table}[t]\n\\centering\n"
+            # [htbp] rather than [t]: top-only placement cannot satisfy a
+            # chapter carrying ~19 floats over ~18 pages, because a table that
+            # misses the top of the current page defers to the next one and the
+            # backlog cascades for the rest of the chapter. Allowing `h` lets a
+            # table set in the prose that discusses it, and `p` gives the wide
+            # sweeps somewhere to go instead of displacing body text.
+            "\\begin{table}[htbp]\n\\centering\n"
             f"\\caption{{{_ascii(caption)}}}\n\\label{{tab:{label}}}\n"
-            f"{body}\\end{{table}}\n"
+            "\\begin{adjustbox}{max width=\\linewidth}\n"
+            f"{body}"
+            "\\end{adjustbox}\n"
+            "\\end{table}\n"
         )
     path.write_text(body)
