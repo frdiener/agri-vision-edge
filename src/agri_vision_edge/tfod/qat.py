@@ -169,11 +169,6 @@ have to be re-evaluated as part of the fully-QDQ (never-calibrate) scheme
 sketched above, where the two no longer meet. `per_channel` therefore changes
 export-time pin placement and permits converter-side per-channel weight
 emission; it does not request per-channel fake-quant during training.
-
-With a representative dataset normalized to `[-1, 1]`, plain PTQ can already
-remain close to floating-point accuracy. QAT is used here chiefly to make the
-exported int8 graph and its activation ranges more stable and deployment-safe,
-rather than as a prerequisite for recovering baseline accuracy.
 """
 
 import collections
@@ -461,9 +456,7 @@ class PerChannelWeightQuantizer(tfmot.quantization.keras.quantizers.Quantizer):
         # Narrow range, as TFLite uses for int8 weights: [-127, 127].
         limit = float(2 ** (self.num_bits - 1) - 1)
 
-        abs_max = tf.reduce_max(
-            tf.abs(inputs), axis=self._reduce_axes, keepdims=True
-        )
+        abs_max = tf.reduce_max(tf.abs(inputs), axis=self._reduce_axes, keepdims=True)
         # An all-zero channel would divide by zero; its scale is arbitrary.
         scale = tf.maximum(abs_max, 1e-8) / limit
 
@@ -944,7 +937,9 @@ def _ssd_bp_body(box_predictor, feature_tensors, conv_sink):
     box_out, cls_out = [], []
     for i, x0 in enumerate(feature_tensors):
         x = x0
-        for layer in box_predictor._shared_nets[i]:  # empty unless a tower is configured
+        for layer in box_predictor._shared_nets[
+            i
+        ]:  # empty unless a tower is configured
             if isinstance(layer, _CONV):
                 conv_sink.add(layer.name)
             x = layer(x)
@@ -1008,9 +1003,7 @@ def _build_combined_ssd_functional(detection_model, image_size):
     padded = od_ops.pad_to_multiple(pp, fe._pad_to_multiple)
     # Concrete run to recover the fmg output key order.
     feats = backbone(padded)
-    out_keys = list(
-        fmg({k: feats[i] for i, k in enumerate(tap_keys)}).keys()
-    )
+    out_keys = list(fmg({k: feats[i] for i, k in enumerate(tap_keys)}).keys())
 
     # Inline the raw backbone into the combined graph (single image input).
     image_input = tf.keras.Input(
@@ -1345,7 +1338,9 @@ def _bp_body(box_predictor, feature_tensors, counter, conv_sink):
         ]._class_predictor_layers:
             c = _apply(layer, c, counter, conv_sink)
         cls_out.append(
-            tf.keras.layers.Reshape((-1, num_class_slots), name=f"ws_cls_reshape_{i}")(c)
+            tf.keras.layers.Reshape((-1, num_class_slots), name=f"ws_cls_reshape_{i}")(
+                c
+            )
         )
     return box_out, cls_out
 
