@@ -4,6 +4,10 @@
 tmp/
 
 attic/
+datasets/
+
+# never track large intermediate results
+predictions.json
 
 *.tern-port
 node_modules/
