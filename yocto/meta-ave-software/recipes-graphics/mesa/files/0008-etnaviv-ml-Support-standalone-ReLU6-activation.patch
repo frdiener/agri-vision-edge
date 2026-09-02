@@ -1,0 +1,199 @@
+From a0cff2a123d4bb928fe26f2307a3ef67b900b4f4 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Wed, 20 May 2026 14:57:16 +0200
+Subject: [PATCH 08/37] etnaviv/ml: Support standalone ReLU6 activation
+
+Use the TP for standalone ReLU6 operations.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c    |  8 ++
+ src/gallium/drivers/etnaviv/etnaviv_ml.h    |  1 +
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.c | 82 ++++++++++++++++++++-
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.h |  5 ++
+ src/gallium/frontends/teflon/tfl_device.c   |  1 +
+ 5 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 7901997d75b..bb82ac1e38d 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -431,6 +431,13 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+             list_addtail(&operation->link, etna_operations);
+             break;
+          }
++         case PIPE_ML_OPERATION_TYPE_RELU6: {
++            etna_ml_lower_relu6(subgraph, poperation, operation);
++            operation->input_tensors[0] = input_tensors[0];
++            operation->output_tensors[0] = poperation->output_tensors[0]->index;
++            list_addtail(&operation->link, etna_operations);
++            break;
++         }
+          case PIPE_ML_OPERATION_TYPE_SUBTRACT: {
+             struct etna_operation *operation = calloc(1, sizeof(*operation));
+             etna_ml_lower_add(subgraph, poperation, operation);
+@@ -570,6 +577,7 @@ count_tensors(const struct pipe_ml_operation *poperations,
+       case PIPE_ML_OPERATION_TYPE_RELU:
+       case PIPE_ML_OPERATION_TYPE_ABSOLUTE:
+       case PIPE_ML_OPERATION_TYPE_LOGISTIC:
++      case PIPE_ML_OPERATION_TYPE_RELU6:
+       case PIPE_ML_OPERATION_TYPE_TRANSPOSE:
+          break;
+       default:
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.h b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+index f78661257f1..dbced87fbc8 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+@@ -59,6 +59,7 @@ enum etna_ml_tp_type {
+    ETNA_ML_TP_RELU,
+    ETNA_ML_TP_ABSOLUTE,
+    ETNA_ML_TP_LOGISTIC,
++   ETNA_ML_TP_RELU6,
+ };
+ 
+ enum etna_ml_tensor_layout {
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+index cc6aca1f9c6..02f8d968ef4 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+@@ -805,7 +805,8 @@ create_pwl_lut_config(struct etna_ml_subgraph *subgraph, const struct etna_opera
+ 
+    uint32_t scale;
+ 
+-   if (operation->tp_type == ETNA_ML_TP_LOGISTIC)
++   if (operation->tp_type == ETNA_ML_TP_LOGISTIC ||
++       operation->tp_type == ETNA_ML_TP_RELU6)
+       scale = fui(1.0 / operation->output_scale);
+    else
+       scale = fui(operation->input_scale / operation->output_scale);
+@@ -1064,6 +1065,36 @@ etna_ml_lower_logistic(struct etna_ml_subgraph *subgraph,
+                                        operation->output_channels;
+ }
+ 
++void
++etna_ml_lower_relu6(struct etna_ml_subgraph *subgraph,
++                    const struct pipe_ml_operation *relu6,
++                    struct etna_operation *operation)
++{
++   operation->type = ETNA_JOB_TYPE_TP;
++   operation->tp_type = ETNA_ML_TP_RELU6;
++   operation->stride = 1;
++
++   operation->input_count = 1;
++   operation->input_width = relu6->input_tensors[0]->dims[1];
++   operation->input_height = relu6->input_tensors[0]->dims[2];
++   operation->input_channels = relu6->input_tensors[0]->dims[3];
++   operation->input_tensor_sizes[0] = operation->input_width *
++                                      operation->input_height *
++                                      operation->input_channels;
++   operation->input_zero_point = etna_tensor_zero_point(relu6->input_tensors[0]);
++   operation->input_scale = relu6->input_tensors[0]->scale;
++
++   operation->output_count = 1;
++   operation->output_width = relu6->output_tensors[0]->dims[1];
++   operation->output_height = relu6->output_tensors[0]->dims[2];
++   operation->output_channels = relu6->output_tensors[0]->dims[3];
++   operation->output_zero_point = etna_tensor_zero_point(relu6->output_tensors[0]);
++   operation->output_scale = relu6->output_tensors[0]->scale;
++   operation->output_tensor_sizes[0] = operation->output_width *
++                                       operation->output_height *
++                                       operation->output_channels;
++}
++
+ static void *
+ create_relu_lut(struct etna_ml_subgraph *subgraph,
+                const struct etna_operation *operation,
+@@ -1246,6 +1277,40 @@ create_log_lut(struct etna_ml_subgraph *subgraph,
+    return map;
+ }
+ 
++static void *
++create_relu6_lut(struct etna_ml_subgraph *subgraph,
++                 const struct etna_operation *operation,
++                 unsigned *out_size)
++{
++   unsigned lut_table_len = 1024;
++   *out_size = lut_table_len * sizeof(uint32_t);
++
++   uint32_t *map = calloc(lut_table_len, sizeof(uint32_t));
++   unsigned pos = 0;
++
++   uint32_t initial_val = fp21(0.0);
++   for (int i = 0; i < 16; i++)
++         map[pos++] = initial_val;
++
++   for (int cur_val = 0x8000; cur_val < 0xf8000; cur_val += 0x800) {
++      float val = fp32(cur_val);
++      val *= operation->input_scale;
++      if (val >= 6.0)
++         val = 6.0;
++      map[pos++] = fp21(val);
++   }
++
++   uint32_t middle_val = fp21(6.0);
++   for (int i = 0; i < 16; i++)
++         map[pos++] = middle_val;
++
++   uint32_t final_val = fp21(0.0);
++   for (int i = 0; i < 512; i++)
++      map[pos++] = final_val;
++
++   return map;
++}
++
+ void
+ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+                              const struct etna_operation *operation,
+@@ -1342,6 +1407,21 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+       num_configs = tp_cores_used;
+       break;
+    }
++   case ETNA_ML_TP_RELU6: {
++      unsigned tp_cores_used = etna_ml_dev(subgraph)->info->npu.tp_core_count;
++
++      if (operation->input_width < 6)
++         tp_cores_used = 1;
++
++      ML_DBG("relu6: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
++      instruction->pwl_lut_data = create_relu6_lut(subgraph, operation, &instruction->pwl_lut_size);
++      for (unsigned i = 0; i < tp_cores_used; i++) {
++         instruction->config_data[i] = create_pwl_lut_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_sizes[i] = sizeof(struct etna_tp_params);
++      }
++      num_configs = tp_cores_used;
++      break;
++   }
+    }
+    instruction->type = ETNA_JOB_TYPE_TP;
+    instruction->tp_type = operation->tp_type;
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
+index 30756e7cfc5..f75bfd680dd 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
+@@ -41,6 +41,11 @@ etna_ml_lower_logistic(struct etna_ml_subgraph *subgraph,
+                        const struct pipe_ml_operation *pad,
+                        struct etna_operation *operation);
+ 
++void
++etna_ml_lower_relu6(struct etna_ml_subgraph *subgraph,
++                    const struct pipe_ml_operation *relu6,
++                    struct etna_operation *operation);
++
+ void
+ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+                              const struct etna_operation *operation,
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 3cf16a21776..6ef8c17bdff 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -273,6 +273,7 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
+       break;
+    case kTfLiteBuiltinHardSwish:
+       operation->type = PIPE_ML_OPERATION_TYPE_HSWISH;
++      break;
+    case kTfLiteBuiltinRelu6:
+       operation->type = PIPE_ML_OPERATION_TYPE_RELU6;
+       break;
+-- 
+2.55.0
+

@@ -1,0 +1,49 @@
+From 16a548b29dc28c08f68eb866e48b38c1236b8e31 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Tue, 26 May 2026 14:39:32 +0200
+Subject: [PATCH 09/37] teflon: Support tensor stacking pack operation
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/frontends/teflon/tfl_device.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 6ef8c17bdff..2b335b8c6a7 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -307,6 +307,22 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
+       operation->type = PIPE_ML_OPERATION_TYPE_QUANTIZE;
+       break;
+    }
++   case kTfLiteBuiltinPack: {
++      TfLitePackParams *params = node->builtin_data;
++
++      if (params->values_count == 1) {
++         operation->type = PIPE_ML_OPERATION_TYPE_RESHAPE;
++         operation->reshape.shape[0] = operation->input_tensors[0]->dims[0];
++         operation->reshape.shape[1] = operation->input_tensors[0]->dims[1];
++         operation->reshape.shape[2] = operation->input_tensors[0]->dims[2];
++         operation->reshape.shape[3] = operation->input_tensors[0]->dims[3];
++         return false;
++      } else {
++         operation->type = PIPE_ML_OPERATION_TYPE_CONCATENATION;
++         operation->conc.axis = params->axis;
++      }
++      break;
++   }
+    default:
+       return false;
+    }
+@@ -780,6 +796,8 @@ tflite_builtin_op_name(TfLiteBuiltinOperator op)
+       return "TRANSPOSE";
+    case kTfLiteBuiltinLeakyRelu:
+       return "LEAKY_RELU";
++   case kTfLiteBuiltinPack:
++      return "PACK";
+    default:
+       return "unknown";
+    }
+-- 
+2.55.0
+

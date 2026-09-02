@@ -1,0 +1,28 @@
+From 8af3620e416bb68a1e51d525041e39048788bcd1 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Thu, 28 May 2026 10:32:42 +0200
+Subject: [PATCH 17/37] debug: etnaviv/ml: list tensors on output read
+
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index a688e795a17..84f5a66a067 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -1108,6 +1108,11 @@ etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgr
+    unsigned operation_count = util_dynarray_num_elements(&subgraph->operations, struct etna_vip_instruction);
+    bool use_neon = getenv("ETNA_NPU_NEON") != NULL;
+ 
++   ML_DBG("etnaviv: read %u output tensors:\n", outputs_count);
++   for (unsigned i = 0; i < outputs_count; i++) {
++      ML_DBG("  - %u\n", output_idxs[i]);
++   }
++
+    if (operation_count > 0) {
+       if (DBG_ENABLED(ETNA_DBG_ML_MSGS)) {
+          long start, end;
+-- 
+2.55.0
+

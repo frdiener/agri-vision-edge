@@ -1,0 +1,33 @@
+From c56541df9058d892ac75ee07dc516cc8721dd90a Mon Sep 17 00:00:00 2001
+From: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Date: Thu, 26 Mar 2026 17:37:15 +0100
+Subject: [PATCH 05/37] etnaviv/ml: handle NULL bias tensor data in convolution
+ lowering
+
+Use calloc instead of malloc and guard the memcpy with a NULL check on
+bias_tensor->data. This matches the approach taken in commit 79d2d52184b0
+for ethosu, where PyTorch Conv2d without explicit bias produces a bias_tensor
+with valid quantization parameters but NULL data.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml_nn.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+index a226b0f700c..972d8f88e99 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+@@ -597,8 +597,9 @@ etna_ml_lower_convolution(struct etna_ml_subgraph *subgraph,
+                         poperation->conv.bias_tensor->dims[2] *
+                         poperation->conv.bias_tensor->dims[3] *
+                         sizeof(int32_t);
+-   operation->bias_tensor = malloc(bias_size);
+-   memcpy(operation->bias_tensor, poperation->conv.bias_tensor->data, bias_size);
++   operation->bias_tensor = calloc(1, bias_size);
++   if (poperation->conv.bias_tensor->data)
++      memcpy(operation->bias_tensor, poperation->conv.bias_tensor->data, bias_size);
+    operation->bias_tensor_size = bias_size;
+ 
+    if (operation->pointwise && operation->input_channels == 1)
+-- 
+2.55.0
+

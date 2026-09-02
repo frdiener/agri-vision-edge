@@ -1,0 +1,8 @@
+systemd-timesync:x:992:992
+systemd-resolve:x:993:993
+systemd-network:x:994:994
+systemd-coredump:x:995:995
+sshd:x:998:998
+messagebus:x:999:999
+nobody:x:65534:65534
+weston:x:235:235:Weston:/var/lib/weston:/sbin/nologin

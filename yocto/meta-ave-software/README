@@ -1,0 +1,4 @@
+The meta-ave-software layer should contain all project-specific recipes,
+adaptions and configuration for non-proprietary components.
+
+In conf/distro/ you can find DISTRO configurations.

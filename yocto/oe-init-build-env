@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+if [ -z "$TEMPLATECONF" ]; then
+     TEMPLATECONF=`pwd`/meta-ave-bsp/conf/templates/default
+fi
+. openembedded-core/oe-init-build-env $1

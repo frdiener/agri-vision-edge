@@ -1,0 +1,367 @@
+From 670e59ce3dbb7e5f13962fcf8e60552a51181ec8 Mon Sep 17 00:00:00 2001
+From: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Date: Wed, 25 Mar 2026 11:56:42 +0100
+Subject: [PATCH 01/37] etnaviv/ml: use a single arena resource instead of
+ per-tensor resources
+
+Replace per-tensor pipe_resource allocations with a single arena
+(io_rsrc) that all tensors share, matching the approach used in the
+ethosu driver. Each tensor now stores just an offset and size within
+the arena, tracked via an alloc_id for group management during
+concat/split/bypass operations.
+
+This reduces the number of GEM buffer object allocations from one per
+tensor to a single allocation for the entire subgraph's feature map
+data. The serialization format is updated to version 2 to reflect the
+simplified resource management (no resource table needed).
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c    | 79 +++++++--------------
+ src/gallium/drivers/etnaviv/etnaviv_ml.h    |  5 +-
+ src/gallium/drivers/etnaviv/etnaviv_ml_nn.c |  8 +--
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.c | 24 +++----
+ 4 files changed, 43 insertions(+), 73 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 4060a1c93e1..cc248e772b1 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -27,12 +27,6 @@ etna_ml_get_tensor(struct etna_ml_subgraph *subgraph, unsigned idx)
+    return *tensor;
+ }
+ 
+-struct pipe_resource *
+-etna_ml_get_resource(struct etna_ml_subgraph *subgraph, unsigned idx)
+-{
+-   return etna_ml_get_tensor(subgraph, idx)->resource;
+-}
+-
+ unsigned
+ etna_ml_get_offset(struct etna_ml_subgraph *subgraph, unsigned idx)
+ {
+@@ -59,7 +53,6 @@ etna_ml_allocate_tensor(struct etna_ml_subgraph *subgraph)
+ {
+    struct etna_ml_tensor **tensors = util_dynarray_grow(&subgraph->tensors, struct etna_ml_tensor *, 1);
+    tensors[0] = calloc(1, sizeof(*tensors[0]));
+-   tensors[0]->resource = NULL;
+    tensors[0]->offset = 0;
+    tensors[0]->size = 0;
+ 
+@@ -74,18 +67,16 @@ etna_ml_create_tensor(struct etna_ml_subgraph *subgraph, unsigned idx, unsigned
+    assert(idx < util_dynarray_num_elements(&subgraph->tensors, struct etna_ml_tensor *));
+    assert(size > 0);
+ 
+-   struct pipe_resource *res = tensor->resource;
+-
+-   if (res != NULL) {
++   if (tensor->size > 0) {
+       assert(size == tensor->size);
+       return;
+    }
+ 
+-   res = etna_ml_create_resource(&subgraph->screen->base, size);
+-   tensor->resource = res;
++   tensor->offset = subgraph->io_used;
+    tensor->size = size;
++   subgraph->io_used += ALIGN_POT(size, 64);
+ 
+-   ML_DBG("created resource %p for tensor %d with size %d\n", res, idx, size);
++   ML_DBG("allocated tensor %d at offset %d with size %d\n", idx, tensor->offset, size);
+ }
+ 
+ static void
+@@ -93,7 +84,6 @@ etna_ml_destroy_tensor(struct etna_ml_subgraph *subgraph, unsigned idx)
+ {
+    struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, idx);
+ 
+-   pipe_resource_reference(&tensor->resource, NULL);
+    tensor->offset = 0;
+    tensor->size = 0;
+ }
+@@ -204,45 +194,16 @@ reference_tensor_with_offset(struct etna_ml_subgraph *subgraph,
+ {
+    struct etna_ml_tensor *src = etna_ml_get_tensor(subgraph, src_tensor);
+    struct etna_ml_tensor *dst = etna_ml_get_tensor(subgraph, dst_tensor);
+-   struct pipe_resource *old_res = dst->resource;
+-   struct etna_ml_tensor **tensors = util_dynarray_begin(&subgraph->tensors);
+-   unsigned num_tensors = util_dynarray_num_elements(&subgraph->tensors, struct etna_ml_tensor *);
+-   ML_DBG("src_tensor %d (%x) dst_tensor %d offset %d size %d\n", src_tensor, etna_bo_gpu_va(etna_buffer_resource(src->resource)->bo), dst_tensor, offset, size);
+-   pipe_resource_reference(&dst->resource, src->resource);
+-   dst->offset = offset;
++   ML_DBG("src_tensor %d dst_tensor %d offset %d size %d\n", src_tensor, dst_tensor, offset, size);
++   dst->offset = src->offset + offset;
+    dst->size = size;
+-
+-   if (old_res) {
+-      for (int i = 0; i < num_tensors; i++) {
+-         if (etna_ml_get_resource(subgraph, i) == old_res) {
+-            pipe_resource_reference(&tensors[i]->resource, src->resource);
+-            tensors[i]->size = size;
+-            tensors[i]->offset = offset;
+-         }
+-      }
+-   }
+ }
+ 
+ static void
+ recreate_tensor(struct etna_ml_subgraph *subgraph, unsigned idx, unsigned size)
+ {
+-   struct pipe_resource *old_res = etna_ml_get_resource(subgraph, idx);
+-   struct etna_ml_tensor **tensors = util_dynarray_begin(&subgraph->tensors);
+-   unsigned num_tensors = util_dynarray_num_elements(&subgraph->tensors, struct etna_ml_tensor *);
+-   struct pipe_resource *new_res;
+-
+    etna_ml_destroy_tensor(subgraph, idx);
+    etna_ml_create_tensor(subgraph, idx, size);
+-   new_res = etna_ml_get_resource(subgraph, idx);
+-
+-   if (old_res) {
+-      for (int i = 0; i < num_tensors; i++) {
+-         if (etna_ml_get_resource(subgraph, i) == old_res) {
+-            pipe_resource_reference(&tensors[i]->resource, new_res);
+-            tensors[i]->size = size;
+-         }
+-      }
+-   }
+ }
+ 
+ static void
+@@ -582,8 +543,8 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+     */
+    ML_DBG("Ensuring all output tensors have their memory backing.\n");
+    list_for_each_entry(struct etna_operation, operation, etna_operations, link) {
+-      struct pipe_resource *res = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
+-      if (res != NULL)
++      struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, operation->output_tensors[0]);
++      if (tensor->size > 0)
+          continue;
+ 
+       etna_ml_create_tensor(subgraph, operation->output_tensors[0], operation->output_tensor_sizes[0]);
+@@ -768,8 +729,14 @@ etna_ml_subgraph_create(struct pipe_ml_device *pdevice,
+       return NULL;
+    memset(util_dynarray_begin(&subgraph->tensors), 0, subgraph->tensors.size);
+ 
++   subgraph->io_used = 0;
++
+    lower_operations(subgraph, poperations, count, &operations);
+ 
++   /* Create the single arena resource for all tensors */
++   if (subgraph->io_used > 0)
++      subgraph->io_rsrc = etna_ml_create_resource(&subgraph->screen->base, subgraph->io_used);
++
+    list_for_each_entry(struct etna_operation, operation, &operations, link) {
+       struct etna_vip_instruction instruction = {0};
+ 
+@@ -905,14 +872,14 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+          struct pipe_transfer *dst_transfer;
+          const uint8_t *src = inputs[i];
+          uint8_t *dst_map;
+-         dst_map = pipe_buffer_map_range(pctx, tensor->resource, tensor->offset, tensor->size, PIPE_MAP_WRITE, &dst_transfer);
++         dst_map = pipe_buffer_map_range(pctx, subgraph->io_rsrc, tensor->offset, tensor->size, PIPE_MAP_WRITE, &dst_transfer);
+          assert(dst_map);
+          for (unsigned k = 0; k < tensor->size; k++) {
+             dst_map[k] = src[k] + 128;
+          }
+          pipe_buffer_unmap(pctx, dst_transfer);
+       } else {
+-         pipe_buffer_write(pctx, tensor->resource, tensor->offset, tensor->size, inputs[i]);
++         pipe_buffer_write(pctx, subgraph->io_rsrc, tensor->offset, tensor->size, inputs[i]);
+       }
+    }
+ 
+@@ -1039,22 +1006,23 @@ etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgr
+    }
+ 
+    for (int i = 0; i < outputs_count; i++) {
+-      struct pipe_resource *res = etna_ml_get_resource(subgraph, output_idxs[i]);
++      unsigned offset = etna_ml_get_offset(subgraph, output_idxs[i]);
++      unsigned size = etna_ml_get_size(subgraph, output_idxs[i]);
+       if (is_signed[i]) {
+          struct pipe_transfer *src_transfer;
+          uint8_t *src_map;
+          src_map = (uint8_t *) pipe_buffer_map_range(context,
+-                                                     res,
+-                                                     0, pipe_buffer_size(res),
++                                                     subgraph->io_rsrc,
++                                                     offset, size,
+                                                      PIPE_MAP_READ,
+                                                      &src_transfer);
+          assert(src_map);
+-         for (unsigned k = 0; k < etna_ml_get_size(subgraph, output_idxs[i]); k++) {
++         for (unsigned k = 0; k < size; k++) {
+             ((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;
+          }
+          pipe_buffer_unmap(context, src_transfer);
+       } else {
+-         pipe_buffer_read(context, res, 0, etna_ml_get_size(subgraph, output_idxs[i]), outputs[i]);
++         pipe_buffer_read(context, subgraph->io_rsrc, offset, size, outputs[i]);
+       }
+    }
+ }
+@@ -1077,10 +1045,11 @@ etna_ml_subgraph_destroy(struct pipe_ml_device *pdevice, struct pipe_ml_subgraph
+    util_dynarray_foreach(&subgraph->tensors, struct etna_ml_tensor*, tensor) {
+       if (!*tensor)
+          continue;
+-      pipe_resource_reference(&(*tensor)->resource, NULL);
+       free(*tensor);
+    }
+    util_dynarray_fini(&subgraph->tensors);
+ 
++   pipe_resource_reference(&subgraph->io_rsrc, NULL);
++
+    free(subgraph);
+ }
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.h b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+index 718765ba694..de6b543734f 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+@@ -48,7 +48,6 @@ enum etna_ml_tensor_layout {
+ };
+ 
+ struct etna_ml_tensor {
+-   struct pipe_resource *resource;
+    unsigned offset;
+    unsigned size;
+    enum etna_ml_tensor_layout exp_layout; /* expected */
+@@ -63,6 +62,9 @@ struct etna_ml_subgraph {
+ 
+    /* Indexed by tensor index */
+    struct util_dynarray tensors; /* Contains struct etna_ml_tensor */
++
++   struct pipe_resource *io_rsrc;
++   unsigned io_used;
+ };
+ 
+ struct etna_vip_instruction {
+@@ -149,7 +151,6 @@ struct etna_operation {
+ unsigned etna_ml_allocate_tensor(struct etna_ml_subgraph *subgraph);
+ void etna_ml_create_tensor(struct etna_ml_subgraph *subgraph, unsigned idx, unsigned size);
+ struct etna_ml_tensor *etna_ml_get_tensor(struct etna_ml_subgraph *subgraph, unsigned idx);
+-struct pipe_resource *etna_ml_get_resource(struct etna_ml_subgraph *subgraph, unsigned idx);
+ unsigned etna_ml_get_offset(struct etna_ml_subgraph *subgraph, unsigned idx);
+ unsigned etna_ml_get_size(struct etna_ml_subgraph *subgraph, unsigned idx);
+ 
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+index ebace70684b..589552ceb58 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+@@ -1072,7 +1072,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+    map->further7 = 0x0;
+    map->further8 = 0x0;
+ 
+-   struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
++   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+    map->in_image_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
+    map->in_image_x_size = input_width;
+@@ -1122,7 +1122,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+       }
+    }
+ 
+-   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
++   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+    map->out_image_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
+    map->out_image_x_size = output_width;
+@@ -1292,11 +1292,11 @@ etna_ml_compile_operation_nn(struct etna_ml_subgraph *subgraph, const struct etn
+    else
+       instruction->coefficients = etna_ml_create_coeffs_v8(subgraph, operation, &coef_cache_size);
+ 
+-   struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
++   struct pipe_resource *input = subgraph->io_rsrc;
+    assert(input);
+    pipe_resource_reference(&instruction->input, input);
+ 
+-   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
++   struct pipe_resource *output = subgraph->io_rsrc;
+    assert(output);
+    pipe_resource_reference(&instruction->output, output);
+ 
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+index 2e97a328fc9..ddc42a0c6a4 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+@@ -265,11 +265,11 @@ create_transpose_config(struct etna_ml_subgraph *subgraph, const struct etna_ope
+    map->in_tile_y_size = operation->input_height;
+    map->in_tile_y_inc = operation->input_height;
+ 
+-   struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
++   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+    map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
+ 
+-   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
++   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+    map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
+ 
+@@ -315,11 +315,11 @@ create_detranspose_config(struct etna_ml_subgraph *subgraph, const struct etna_o
+    map->in_tile_y_size = 0x1;
+    map->in_tile_y_inc = 0x1;
+ 
+-   struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
++   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+    map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
+ 
+-   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
++   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+    map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
+ 
+@@ -457,11 +457,11 @@ create_reshuffle_config(struct etna_ml_subgraph *subgraph, const struct etna_ope
+    map->in_tile_y_size = out_dims[1] * 2;
+    map->in_tile_y_inc = out_dims[1] * 2;
+ 
+-   struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
++   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+    map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
+ 
+-   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
++   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+    map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
+ 
+@@ -634,9 +634,9 @@ create_pad_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+    map->in_tile_y_inc = out_dims[1];
+ 
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+-   map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input->resource)->bo) + offset;
++   map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(subgraph->io_rsrc)->bo) + offset;
+ 
+-   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
++   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+    map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
+ 
+@@ -789,11 +789,11 @@ create_pwl_lut_config(struct etna_ml_subgraph *subgraph, const struct etna_opera
+    map->alu_load_pwl_lut_address = etna_bo_gpu_va(pwl_lut);
+    map->alu_pwl_sign_support = 0x1;
+ 
+-   struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
++   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+    map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
+ 
+-   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
++   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+    map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
+ 
+@@ -1308,11 +1308,11 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+                              const struct etna_operation *operation,
+                              struct etna_vip_instruction *instruction)
+ {
+-   struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
++   struct pipe_resource *input = subgraph->io_rsrc;
+    assert(input);
+    pipe_resource_reference(&instruction->input, input);
+ 
+-   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
++   struct pipe_resource *output = subgraph->io_rsrc;
+    assert(output);
+    pipe_resource_reference(&instruction->output, output);
+ 
+-- 
+2.55.0
+

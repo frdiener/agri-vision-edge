@@ -1,0 +1,275 @@
+From e936d47c539b4f968ca9e5e6ed56a4a9eea53bf1 Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Sat, 27 Jun 2026 14:37:20 +0200
+Subject: [PATCH 32/37] etnaviv/ml: support 2x nearest neighbor resize
+
+Support the limited RESIZE_NEAREST_NEIGHBOR case used by quantized TFLite graphs: 2x spatial upscale, unchanged channels, identical 8-bit input/output quantization, and default resize coordinates.\n\nLower resize to four TP scatter passes, one for each output position in the 2x2 replicated block. Each pass writes one output sub-lattice, avoiding arithmetic in the TP datapath and preserving tensor bytes exactly.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c    |  45 ++++++++-
+ src/gallium/drivers/etnaviv/etnaviv_ml.h    |   7 ++
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.c | 102 ++++++++++++++++++++
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.h |   7 +-
+ 4 files changed, 158 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index fb335aa35c3..91404466996 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -201,6 +201,7 @@ etna_tp_type_name(enum etna_ml_tp_type type)
+    case ETNA_ML_TP_LOGISTIC:    return "logistic";
+    case ETNA_ML_TP_RELU6:       return "relu6";
+    case ETNA_ML_TP_LEAKY_RELU:  return "leaky_relu";
++   case ETNA_ML_TP_RESIZE:      return "resize";
+    }
+    return "???";
+ }
+@@ -334,7 +335,8 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+ 
+          if (poperation->type == PIPE_ML_OPERATION_TYPE_CONVOLUTION ||
+              poperation->type == PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED ||
+-             poperation->type == PIPE_ML_OPERATION_TYPE_CONCATENATION)
++             poperation->type == PIPE_ML_OPERATION_TYPE_CONCATENATION ||
++             poperation->type == PIPE_ML_OPERATION_TYPE_RESIZE)
+             operation_layout = ETNA_ML_LAYOUT_NCHW;
+ 
+          if (!etna_ml_find_producer(poperations, count, poperation->input_tensors[i]->index)) {
+@@ -458,6 +460,23 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+             list_addtail(&operation->link, etna_operations);
+             break;
+          }
++         case PIPE_ML_OPERATION_TYPE_RESIZE: {
++            /* A single TP job scatters exactly one output element per input
++             * element. Emit the 2x nearest-neighbour resize as four scatter
++             * passes, one per output position in the 2x2 replicated block.
++             */
++            for (unsigned phase = 0; phase < 4; phase++) {
++               struct etna_operation *resize = phase == 0 ? operation
++                                                          : calloc(1, sizeof(*resize));
++
++               etna_ml_lower_resize(subgraph, poperation, resize);
++               resize->resize_phase = phase;
++               resize->input_tensors[0] = input_tensors[0];
++               resize->output_tensors[0] = poperation->output_tensors[0]->index;
++               list_addtail(&resize->link, etna_operations);
++            }
++            break;
++         }
+       case PIPE_ML_OPERATION_TYPE_RESHAPE: {
+          struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, input_tensors[0]);
+          if (
+@@ -674,6 +693,7 @@ count_tensors(const struct pipe_ml_operation *poperations,
+       case PIPE_ML_OPERATION_TYPE_RELU6:
+       case PIPE_ML_OPERATION_TYPE_LEAKY_RELU:
+       case PIPE_ML_OPERATION_TYPE_TRANSPOSE:
++      case PIPE_ML_OPERATION_TYPE_RESIZE:
+          break;
+       default:
+          UNREACHABLE("Unsupported ML operation type");
+@@ -810,6 +830,28 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+       case PIPE_ML_OPERATION_TYPE_LEAKY_RELU:
+          supported = true;
+          break;
++      case PIPE_ML_OPERATION_TYPE_RESIZE: {
++         struct pipe_tensor *input = operation->input_tensors[0];
++         struct pipe_tensor *output = operation->output_tensors[0];
++         unsigned nn_core_version = etna_ml_device(pdevice)->specs->nn_core_version;
++         bool is_2x_height = output->dims[1] == 2 * input->dims[1];
++         bool is_2x_width = output->dims[2] == 2 * input->dims[2];
++
++         supported = nn_core_version >= 8 &&
++                     !operation->resize.align_corners &&
++                     !operation->resize.half_pixel_centers &&
++                     tensor_quantization_supported(input) &&
++                     tensor_quantization_supported(output) &&
++                     input->type_size == 1 &&
++                     output->type_size == 1 &&
++                     is_2x_height &&
++                     is_2x_width &&
++                     output->dims[3] == input->dims[3] &&
++                     input->scale == output->scale &&
++                     input->zero_point == output->zero_point &&
++                     input->is_signed == output->is_signed;
++         break;
++      }
+       default:
+          return false;
+    }
+@@ -1108,7 +1150,6 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+ 
+    static unsigned i = 0;
+    util_dynarray_foreach(&subgraph->operations, struct etna_vip_instruction, operation) {
+-
+       if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS)) {
+          struct pipe_transfer *transfer = NULL;
+          pipe_buffer_map(pctx, subgraph->io_rsrc, PIPE_MAP_READ, &transfer);
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.h b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+index 6d5119637b5..cfeda7b8781 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+@@ -61,6 +61,7 @@ enum etna_ml_tp_type {
+    ETNA_ML_TP_LOGISTIC,
+    ETNA_ML_TP_RELU6,
+    ETNA_ML_TP_LEAKY_RELU,
++   ETNA_ML_TP_RESIZE,
+ };
+ 
+ enum etna_ml_tensor_layout {
+@@ -177,6 +178,12 @@ struct etna_operation {
+    unsigned pad_after_z;
+ 
+    float leaky_relu_alpha;
++
++   /* 2x nearest-neighbour resize is emitted as 4 TP scatter passes, one per
++    * 2x2 output sub-lattice. This selects which phase (0..3) this job writes:
++    * dx = resize_phase & 1, dy = (resize_phase >> 1) & 1.
++    */
++   unsigned resize_phase;
+ };
+ 
+ struct etna_idx_replacement {
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+index 4f9bf1fcd6c..0c6a34984dd 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+@@ -1127,6 +1127,103 @@ etna_ml_lower_leaky_relu(struct etna_ml_subgraph *subgraph,
+    operation->leaky_relu_alpha = leaky_relu->leakyrelu.alpha;
+ }
+ 
++void
++etna_ml_lower_resize(struct etna_ml_subgraph *subgraph,
++                     const struct pipe_ml_operation *resize,
++                     struct etna_operation *operation)
++{
++   assert(resize->type == PIPE_ML_OPERATION_TYPE_RESIZE);
++
++   operation->type = ETNA_JOB_TYPE_TP;
++   operation->tp_type = ETNA_ML_TP_RESIZE;
++
++   operation->input_count = 1;
++   operation->input_width = resize->input_tensors[0]->dims[1];
++   operation->input_height = resize->input_tensors[0]->dims[2];
++   operation->input_channels = resize->input_tensors[0]->dims[3];
++   operation->input_tensor_sizes[0] = operation->input_width *
++                                      operation->input_height *
++                                      operation->input_channels;
++   operation->input_zero_point = etna_tensor_zero_point(resize->input_tensors[0]);
++   operation->input_scale = resize->input_tensors[0]->scale;
++
++   operation->output_count = 1;
++   operation->output_width = resize->output_tensors[0]->dims[1];
++   operation->output_height = resize->output_tensors[0]->dims[2];
++   operation->output_channels = resize->output_tensors[0]->dims[3];
++   operation->output_zero_point = etna_tensor_zero_point(resize->output_tensors[0]);
++   operation->output_scale = resize->output_tensors[0]->scale;
++   operation->output_tensor_sizes[0] = operation->output_width *
++                                       operation->output_height *
++                                       operation->output_channels;
++}
++
++static void *
++create_resize_config(struct etna_ml_subgraph *subgraph,
++                     const struct etna_operation *operation)
++{
++   struct etna_tp_params *map = calloc(1, sizeof(struct etna_tp_params));
++   unsigned input_width = operation->input_width;
++   unsigned input_height = operation->input_height;
++   unsigned input_channels = operation->input_channels;
++   unsigned output_width = operation->output_width;
++   unsigned output_height = operation->output_height;
++   /* dx/dy select the 2x2 output sub-lattice this pass writes. */
++   unsigned dx = operation->resize_phase & 0x1;
++   unsigned dy = (operation->resize_phase >> 1) & 0x1;
++
++   set_default_tp_config(map);
++
++   SWAP(input_width, input_height);
++   SWAP(output_width, output_height);
++
++   map->in_image_x_size = input_width;
++   map->in_image_y_size = input_height;
++   map->in_image_z_size = input_channels;
++   map->in_image_stride = input_width;
++   map->in_image_slice = input_width * input_height;
++
++   map->in_window_x_start = 0x0;
++   map->in_window_y_start = 0x0;
++   map->in_window_x_end = input_width - 1;
++   map->in_window_y_end = input_height - 1;
++   map->in_tile_x_size = input_width;
++   map->in_tile_x_inc = input_width;
++   map->in_tile_y_size = input_height;
++   map->in_tile_y_inc = input_height;
++
++   unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
++   map->in_image_base_address = offset;
++
++   offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
++   map->out_image_base_address = offset + dy * output_width + dx;
++
++   /* One output element is written per input element, in a single nested
++    * scatter that mirrors the proven transpose path (loops 0/1/2, no resets):
++    *   loop 0 walks the input row    -> output x stride 2
++    *   loop 1 walks the input column -> output y stride 2 (2 * output_width)
++    *   loop 2 walks the channels     -> output plane stride
++    * The input scan (x, then y, then z) pairs with these loops, so each input
++    * pixel lands at its 2x2 block origin shifted by this phase's (dy, dx). The
++    * four phases together fill the whole output (2x nearest-neighbour).
++    */
++   map->out_loop_0_inc = 0x2;
++   map->out_loop_1_inc = output_width * 2;
++   map->out_loop_2_inc = output_width * output_height;
++   map->out_loop_0_count = input_width;
++   map->out_loop_1_count = input_height;
++   map->out_loop_2_count = input_channels;
++
++   map->in_zp = operation->input_zero_point;
++   map->out_zp = operation->output_zero_point;
++   map->in_image_circular_buf_size = 0x0;
++   map->in_image_circular_buf_end_address_plus_1 = 0xFFFFFFFF >> 6;
++   map->out_image_circular_buf_size = 0x0;
++   map->out_image_circular_buf_end_address_plus_1 = 0xFFFFFFFF >> 6;
++
++   return map;
++}
++
+ static void *
+ create_relu_lut(struct etna_ml_subgraph *subgraph,
+                const struct etna_operation *operation,
+@@ -1502,6 +1599,11 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+       num_configs = tp_cores_used;
+       break;
+    }
++   case ETNA_ML_TP_RESIZE:
++      instruction->config_data[0] = create_resize_config(subgraph, operation);
++      instruction->config_sizes[0] = sizeof(struct etna_tp_params);
++      num_configs = 1;
++      break;
+    }
+    instruction->type = ETNA_JOB_TYPE_TP;
+    instruction->tp_type = operation->tp_type;
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
+index e0ee192aa26..ecdc05282fe 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
+@@ -51,6 +51,11 @@ etna_ml_lower_leaky_relu(struct etna_ml_subgraph *subgraph,
+                          const struct pipe_ml_operation *leaky_relu,
+                          struct etna_operation *operation);
+ 
++void
++etna_ml_lower_resize(struct etna_ml_subgraph *subgraph,
++                     const struct pipe_ml_operation *resize,
++                     struct etna_operation *operation);
++
+ void
+ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+                              const struct etna_operation *operation,
+@@ -60,4 +65,4 @@ void
+ etna_ml_emit_operation_tp(struct pipe_context *pctx,
+                           struct etna_ml_subgraph *subgraph,
+                           struct etna_vip_instruction *operation,
+-                          unsigned idx);
+\ No newline at end of file
++                          unsigned idx);
+-- 
+2.55.0
+

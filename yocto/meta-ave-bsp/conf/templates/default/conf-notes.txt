@@ -1,0 +1,23 @@
+
+### Shell environment set up for builds. ###
+
+You can now run 'bitbake <target>'.
+
+Available MACHINEs:
+    MACHINE=frdm-imx8mp
+    MACHINE=frdm-imx93
+
+RAUC bundle targets are:
+    reference-base-bundle
+
+Disk image targets are:
+    fdi-frdm-imx8mp-disk-image
+    fdi-frdm-imx93-disk-image
+
+Rootfs targets are:
+    ave-base-image
+
+Other commonly useful commands are:
+ - 'devtool' and 'recipetool' handle common recipe tasks
+ - 'bitbake-layers' handles common layer tasks
+ - 'oe-pkgdata-util' handles common target package tasks

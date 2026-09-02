@@ -1,0 +1,65 @@
+From 21da3071795d07023adf607f714f1acd996a94b4 Mon Sep 17 00:00:00 2001
+From: Freimut Diener <mail@f-diener.dev>
+Date: Thu, 13 Aug 2026 11:08:14 +0200
+Subject: [PATCH 33/37] gallium/ml: add pipe_tensor::rank
+
+teflon's fill_tensor() left-pads shapes to 4 dims, but axis arguments such
+as pipe_ml_operation::conc.axis stay relative to the original rank. Drivers
+comparing such an axis against a dims[] index are off by (4 - rank), and
+cannot tell a left-padded [1, 85, 3549] from a genuine [1, 1, 85, 3549].
+
+Record the rank next to dims[]. Zero means the frontend did not provide it
+and should be read as 4.
+
+No functional change.
+---
+ src/gallium/frontends/teflon/tfl_device.c |  5 +++++
+ src/gallium/include/pipe/p_state.h        | 14 +++++++++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index a06ef761b82..9ca61fa4477 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -418,6 +418,11 @@ fill_tensor(struct teflon_delegate *delegate, TfLiteContext *tf_context, struct
+ 
+    tensor->type_size = tf_format_to_size(tf_tensor.type);
+    tensor->index = index;
++   /* Left-pad the shape to 4 dims so drivers can index it uniformly, and keep
++    * the original rank around: axis arguments coming from TFLite are relative
++    * to it, not to the padded shape.
++    */
++   tensor->rank = tf_tensor.dims->size;
+    for (int out_dim = 0; out_dim < 4; out_dim++) {
+       int in_dim = tf_tensor.dims->size - 4 + out_dim;
+       if (in_dim >= 0)
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+index f6cd0d34b82..61f7645a11e 100644
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -1021,9 +1021,21 @@ struct pipe_tensor {
+     */
+    unsigned index;
+    /**
+-    * Dimensions of this tensor.
++    * Dimensions of this tensor, left-padded with ones to 4 entries.
++    *
++    * A tensor of logical rank N occupies dims[4 - N .. 3], so dims[3] is
++    * always the innermost (channel) axis.
+     */
+    unsigned dims[4];
++   /**
++    * Logical rank of this tensor, before dims[] was left-padded to 4.
++    *
++    * Frontends express axis arguments (e.g. pipe_ml_operation::conc.axis) in
++    * terms of this rank, so a driver comparing an axis against a dims[] index
++    * has to shift it by (4 - rank). Zero when the frontend does not provide
++    * it; treat that as 4.
++    */
++   unsigned rank;
+    /**
+     * Scale used to quantize this tensor, per-tensor quantization.
+     */
+-- 
+2.55.0
+

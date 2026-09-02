@@ -1,0 +1,139 @@
+#!/usr/bin/env ash
+# SPDX-License-Identifier: MIT
+#
+# Copyright Pengutronix <yocto@pengutronix.de>
+#
+# Silence warnings SC3040 & SC3043
+# shellcheck shell=dash
+#
+
+set -e -o pipefail
+
+LUKS_NBLOCKS=2048	# 512B * LUKS_NBLOCKS = 1.0 MByte
+KEY_TYPE=trusted
+KEY_SZ=32
+#
+# The sealed TEE blob is aes-gcm protect as well (see: struct tk_blob_hdr in
+# ta/trusted_keys/entry.c) and the final userspace blob is bin2hex converted
+# e.g. multiplied by 2.
+#
+KEY_BLOB_SZ=130
+
+SCRIPT=$(basename "${0}")
+
+print_help() {
+	echo "Usage: ${SCRIPT} <action> <action args>"
+	echo ""
+	echo "ACTIONS"
+	echo ""
+	echo "ATTACH"
+	echo "    ${SCRIPT} attach <VOLUME> <SOURCE-DEVICE>"
+	echo ""
+	echo "DETACH"
+	echo "    ${SCRIPT} detach <VOLUME>"
+	exit 1
+}
+
+
+device_create() {
+	local volume="${1}"
+	local device="${2}"
+	local key="${3}"
+	local fullsize
+	local cryptsize
+	local remainder
+	local table
+
+	# The effective size of the encrypted virtual block device needs to be a
+	# multiple of its sector size (4096 = 8 * 512), so round it down:
+	fullsize=$(blockdev --getsz "${device}")
+	cryptsize=$(( fullsize - LUKS_NBLOCKS ))
+	remainder=$(( cryptsize % 8 ))
+	cryptsize=$(( cryptsize - remainder ))
+
+	# <start_sector> <size> <target name> <cipher> <key> <iv_offset> <device path> <offset> [<#opt_params> <opt_params>]
+	table="0 ${cryptsize} crypt aes-xts-plain64 ${key} 0 ${device} ${LUKS_NBLOCKS} 1 sector_size:4096"
+	dmsetup create "${volume}" --table "${table}"
+}
+
+
+device_remove() {
+	local volume="${1}"
+
+	dmsetup remove --retry "${volume}"
+}
+
+
+device_attach() {
+	local volume="${1}"
+	local device="${2}"
+	local keydesc="dmcrypt:${volume}"
+	local key=":${KEY_SZ}:${KEY_TYPE}:${keydesc}"
+	local keyid
+	local blob
+
+	# setup only for backing device starting with zeros
+	if cmp --bytes="${KEY_BLOB_SZ}" --quiet "${device}" /dev/zero; then
+		# Create key and store it on the device
+		keyid="$(keyctl add ${KEY_TYPE} "${keydesc}" "new ${KEY_SZ}" @s)"
+		keyctl pipe "${keyid}" | dd of="${device}"
+
+		# Load dm table to create the dm-crypt device.
+		device_create "${volume}" "${device}" "${key}"
+
+		# Although the virtual volume is decrypted with a newly
+		# generated trusted key and should not carry any (file-
+		# system) signatures preventing systemd-makefs@.service
+		# to do its job, be paranoid and play it safe:
+		wipefs --lock --all /dev/mapper/"${volume}"
+	else
+		# Make sure the blob only contains hex digits,
+		# since keyctl accepts a list of space-separated extra
+		# arguments.
+		blob="$(dd if="${device}" bs=${KEY_BLOB_SZ} count=1 | grep '^[0-9A-Fa-f]\{'${KEY_BLOB_SZ}'\}$')"
+		keyid="$(keyctl add ${KEY_TYPE} "${keydesc}" "load ${blob}" @s)"
+
+		# Load dm table to create the dm-crypt device.
+		device_create "${volume}" "${device}" "${key}"
+	fi
+
+	# Unlink key from keyring (the key itself is still referenced by the
+	# device mapper and will therefore not be removed from the kernel).
+	keyctl unlink "${keyid}" @s
+}
+
+
+if [ $# -lt 1 ]; then
+	print_help
+fi
+
+ACTION="${1}"
+shift
+
+if [ "${ACTION}" = "attach" ]; then
+	while [ $# -gt 0 ]; do
+		case "${1}" in
+			-*) print_help ;;
+			*) break ;;
+		esac
+		shift
+	done
+
+	if [ "${1}" = "" ] || [ ! -b "${2}" ] ; then
+		print_help
+	fi
+
+	set -u
+
+	device_attach "${1}" "${2}"
+elif [ "${ACTION}" = "detach" ]; then
+	if [ "${1}" = "" ]; then
+		print_help
+	fi
+
+	set -u
+
+	device_remove "${1}"
+else
+	print_help
+fi

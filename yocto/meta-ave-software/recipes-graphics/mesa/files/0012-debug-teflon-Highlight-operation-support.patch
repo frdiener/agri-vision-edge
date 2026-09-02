@@ -1,0 +1,34 @@
+From 920f9917b0da98459c2cdd0b9071c47f7168b457 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Thu, 28 Nov 2024 10:24:39 +0100
+Subject: [PATCH 12/37] debug: teflon: Highlight operation support
+
+---
+ src/gallium/frontends/teflon/tfl_device.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 012e3c8fbe9..160dae5dbc9 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -907,7 +907,7 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+       teflon_debug("limiting delegate to first %lu nodes in execution plan\n", max_supported);
+    }
+ 
+-   teflon_debug("%3s %-15s %3s %-11s %s\n", "idx", "type", "ver", "support", "inputs");
++   teflon_debug("%3s %-15s %3s %-14s %s\n", "idx", "type", "ver", "support", "inputs");
+    teflon_debug("================================================================================================\n");
+ 
+    // Get a list of supported nodes.
+@@ -928,7 +928,7 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+       teflon_debug("%3d %-15s v%-2d %-11s in:", node_index,
+                    tflite_builtin_op_name(registration->builtin_code),
+                    registration->version,
+-                   supported ? "supported" : "unsupported");
++                   supported ? "🟢 supported" : "🔴 unsupported");
+       for (int j = 0; j < node->inputs->size; j++) {
+          teflon_debug(" %d(%s)", node->inputs->data[j],
+                       tflite_type_name(tf_context->tensors[node->inputs->data[j]].type));
+-- 
+2.55.0
+

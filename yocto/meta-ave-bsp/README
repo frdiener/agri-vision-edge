@@ -1,0 +1,8 @@
+The meta-ave-bsp layer should contain all hardware-specific recipes and
+adaptions.
+
+In conf/machine/ you can find MACHINE configurations for the boards supported
+by this BSP layer.
+
+In recipes-core/images you should find recipes for disk images specific to the
+supported machines.

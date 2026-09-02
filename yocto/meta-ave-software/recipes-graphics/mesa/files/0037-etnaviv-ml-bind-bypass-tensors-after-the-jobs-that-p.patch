@@ -1,0 +1,132 @@
+From 9eac8b223509c3e9ba5b71ff3ec4c3bd714428fb Mon Sep 17 00:00:00 2001
+From: Freimut Diener <mail@f-diener.dev>
+Date: Sat, 29 Aug 2026 19:35:42 +0200
+Subject: [PATCH 37/37] etnaviv/ml: bind bypass tensors after the jobs that
+ place them
+
+A bypass moves no data, it only relabels a tensor, so its two tensors have to
+end up at the same address. It is bound while walking the job list, which is
+too early: a CONCAT further down re-homes its operands into the concatenated
+buffer, and an operand a bypass had already bound to its own input leaves that
+input stranded at an address nothing writes.
+
+This stays invisible while the concatenation is interior to a larger subgraph.
+There the operand is produced by a TP or NN job whose configuration is emitted
+after lowering, so it picks up the re-homed offset. It only bites once the
+operands are subgraph inputs, because the host writes those by tensor index
+before any job runs, and so writes to the stale address. That is exactly the
+shape of a partition with per-channel weights, where every convolution falls
+back to the CPU and the detection head is delegated as reshapes and
+concatenations with no arithmetic at all.
+
+The stranded operands read back as the zero the arena was cleared to, so the
+anchors they carry never produce a detection and a contiguous band of the
+concatenated axis goes missing. Which band depends on how many operands sit
+behind a bypass: an ssd-mn2 head partition bypasses all but the first operand
+of each concatenation and loses everything but the finest SSD level, while an
+fpnlite one bypasses only the first and loses just P3.
+
+Defer the binding until the jobs that do dictate placement have run, then
+follow whichever side is already placed.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 71 ++++++++++++++++++++++--
+ 1 file changed, 65 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index b37712eefa2..0a097bcc022 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -681,6 +681,7 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+                                        operation->input_tensor_sizes[i]);
+             offset += operation->input_tensor_sizes[i];
+          }
++         assert(offset == operation->output_tensor_sizes[0]);
+       } else if (operation->type == ETNA_JOB_TYPE_SPLIT) {
+          etna_ml_create_tensor(subgraph, operation->input_tensors[0], operation->input_tensor_sizes[0]);
+ 
+@@ -702,18 +703,76 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+                                       operation->input_tensor_sizes[0],
+                                       operation->input_tensor_sizes[1]);
+       } else if (operation->type == ETNA_JOB_TYPE_BYPASS) {
+-         etna_ml_create_tensor(subgraph, operation->input_tensors[0], operation->input_tensor_sizes[0]);
+-         reference_tensor_with_offset(subgraph,
+-                                      operation->input_tensors[0],
+-                                      operation->output_tensors[0],
+-                                      0,
+-                                      operation->output_tensor_sizes[0]);
++         /* Deferred to the passes below: a bypass does not decide where its
++          * tensors live, it only requires that they live in the same place. */
+       } else {
+          for (int i = 0; i < operation->input_count; i++)
+             etna_ml_create_tensor(subgraph, operation->input_tensors[i], operation->input_tensor_sizes[i]);
+       }
+    }
+ 
++   /* Tie up the bypasses now that the jobs that do dictate placement have run.
++    *
++    * A bypass moves no data, it only relabels a tensor, so both of its tensors
++    * have to end up at the same address. Binding them while walking the list
++    * above is too early: a CONCAT further down re-homes its operands into the
++    * concatenated buffer, and an operand that a bypass had already bound to
++    * its own input leaves that input behind at an address nothing writes.
++    *
++    * That is invisible while the concatenation is interior to a larger
++    * subgraph, because the operand is produced by a job whose configuration is
++    * generated after lowering and therefore picks up the re-homed offset. It
++    * is fatal once the operands are subgraph inputs: the host writes them by
++    * tensor index, before any job runs, and writes to the stale address.
++    *
++    * So follow whichever side has already been placed, and repeat for chains.
++    */
++   bool progress;
++   do {
++      progress = false;
++
++      list_for_each_entry(struct etna_operation, operation, etna_operations, link) {
++         if (operation->type != ETNA_JOB_TYPE_BYPASS)
++            continue;
++
++         bool has_input = etna_ml_get_size(subgraph, operation->input_tensors[0]) > 0;
++         bool has_output = etna_ml_get_size(subgraph, operation->output_tensors[0]) > 0;
++
++         if (has_input == has_output)
++            continue;
++
++         if (has_input)
++            reference_tensor_with_offset(subgraph,
++                                         operation->input_tensors[0],
++                                         operation->output_tensors[0],
++                                         0,
++                                         operation->output_tensor_sizes[0]);
++         else
++            reference_tensor_with_offset(subgraph,
++                                         operation->output_tensors[0],
++                                         operation->input_tensors[0],
++                                         0,
++                                         operation->input_tensor_sizes[0]);
++
++         progress = true;
++      }
++   } while (progress);
++
++   /* Whatever is left is a bypass no CONCAT or SPLIT reaches, so it is free to
++    * pick its own address. */
++   list_for_each_entry(struct etna_operation, operation, etna_operations, link) {
++      if (operation->type != ETNA_JOB_TYPE_BYPASS ||
++          etna_ml_get_size(subgraph, operation->input_tensors[0]) > 0)
++         continue;
++
++      etna_ml_create_tensor(subgraph, operation->input_tensors[0], operation->input_tensor_sizes[0]);
++      reference_tensor_with_offset(subgraph,
++                                   operation->input_tensors[0],
++                                   operation->output_tensors[0],
++                                   0,
++                                   operation->output_tensor_sizes[0]);
++   }
++
+    /* Create any output tensors that aren't inputs to other operations, these
+     * are the outputs of the graph.
+     */
+-- 
+2.55.0
+

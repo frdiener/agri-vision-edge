@@ -1,0 +1,619 @@
+From c346fb8c7b6f1c6e2421a54c12aecf3566335bef Mon Sep 17 00:00:00 2001
+From: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Date: Thu, 26 Mar 2026 08:19:43 +0100
+Subject: [PATCH 03/37] etnaviv/ml: remove screen references from compilation
+ path
+
+Move hardware description from etna_screen into etna_ml_device by
+storing pointers to etna_core_info and etna_specs. This removes all
+references to etna_screen from the compilation path, keeping screen
+usage only in runtime paths (BO creation, job submission).
+
+This follows the same pattern as the ethosu driver, enabling
+ahead-of-time compilation without a pipe_screen.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c      | 29 +++++-------
+ src/gallium/drivers/etnaviv/etnaviv_ml.h      | 13 +++--
+ src/gallium/drivers/etnaviv/etnaviv_ml_nn.c   | 28 +++++------
+ src/gallium/drivers/etnaviv/etnaviv_ml_nn.h   |  4 +-
+ .../drivers/etnaviv/etnaviv_ml_nn_v7.c        | 47 +++++++++----------
+ .../drivers/etnaviv/etnaviv_ml_nn_v8.c        | 32 ++++++-------
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.c   | 12 ++---
+ src/gallium/drivers/etnaviv/etnaviv_screen.c  |  4 ++
+ src/gallium/drivers/etnaviv/etnaviv_screen.h  |  7 ---
+ 9 files changed, 85 insertions(+), 91 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index b14f0faa615..b87fda28a5c 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -103,17 +103,10 @@ etna_ml_create_bo(struct etna_screen *screen, size_t size)
+    return bo;
+ }
+ 
+-struct etna_core_npu_info *
+-etna_ml_get_core_info(struct etna_screen *screen)
+-{
+-   struct etna_core_info *info = etna_gpu_get_core_info(screen->npu);
+-   return &info->npu;
+-}
+-
+ static bool
+ needs_reshuffle(struct etna_ml_subgraph *subgraph, const struct pipe_ml_operation *poperation)
+ {
+-   unsigned nn_core_version = subgraph->screen->specs.nn_core_version;
++   unsigned nn_core_version = etna_ml_dev(subgraph)->specs->nn_core_version;
+    bool has_stride = poperation->conv.stride_x > 1 || poperation->conv.stride_y > 1;
+    bool pointwise = poperation->conv.pointwise;
+    bool has_padding = poperation->conv.padding_top > 0 ||
+@@ -694,8 +687,8 @@ etna_ml_subgraph_create(struct pipe_ml_device *pdevice,
+                         const struct pipe_ml_operation *poperations,
+                         unsigned count)
+ {
+-   struct etna_screen *screen = etna_ml_device_screen(pdevice);
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   struct etna_ml_device *device = etna_ml_device(pdevice);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    struct etna_ml_subgraph *subgraph;
+    struct list_head operations;
+    unsigned tensor_count;
+@@ -711,7 +704,6 @@ etna_ml_subgraph_create(struct pipe_ml_device *pdevice,
+    list_inithead(&operations);
+ 
+    subgraph->base.device = pdevice;
+-   subgraph->screen = screen;
+    subgraph->operations = UTIL_DYNARRAY_INIT;
+ 
+    subgraph->tensors = UTIL_DYNARRAY_INIT;
+@@ -790,9 +782,9 @@ etna_ml_apply_relocations(struct etna_ml_subgraph *subgraph,
+ }
+ 
+ static void
+-prepare_submission(struct etna_ml_subgraph *subgraph)
++prepare_submission(struct etna_ml_subgraph *subgraph, struct etna_screen *screen)
+ {
+-   struct pipe_screen *pscreen = &subgraph->screen->base;
++   struct pipe_screen *pscreen = &screen->base;
+ 
+    /* Create the IO arena resource */
+    subgraph->io_rsrc = pipe_buffer_create(pscreen, 0, PIPE_USAGE_DEFAULT, subgraph->io_used);
+@@ -803,7 +795,7 @@ prepare_submission(struct etna_ml_subgraph *subgraph)
+    util_dynarray_foreach(&subgraph->operations, struct etna_vip_instruction, instr) {
+       /* Upload coefficients to BO */
+       if (instr->coefficients_data) {
+-         instr->coefficients = etna_ml_create_bo(subgraph->screen, instr->coefficients_size);
++         instr->coefficients = etna_ml_create_bo(screen, instr->coefficients_size);
+          etna_bo_cpu_prep(instr->coefficients, DRM_ETNA_PREP_WRITE);
+          memcpy(etna_bo_map(instr->coefficients), instr->coefficients_data, instr->coefficients_size);
+          etna_bo_cpu_fini(instr->coefficients);
+@@ -811,7 +803,7 @@ prepare_submission(struct etna_ml_subgraph *subgraph)
+ 
+       /* Upload PWL LUT to BO */
+       if (instr->pwl_lut_data) {
+-         instr->pwl_lut = etna_ml_create_bo(subgraph->screen, instr->pwl_lut_size);
++         instr->pwl_lut = etna_ml_create_bo(screen, instr->pwl_lut_size);
+          etna_bo_cpu_prep(instr->pwl_lut, DRM_ETNA_PREP_WRITE);
+          memcpy(etna_bo_map(instr->pwl_lut), instr->pwl_lut_data, instr->pwl_lut_size);
+          etna_bo_cpu_fini(instr->pwl_lut);
+@@ -822,7 +814,7 @@ prepare_submission(struct etna_ml_subgraph *subgraph)
+ 
+       /* Upload config data to BOs */
+       for (unsigned j = 0; j < MAX_CONFIG_BOS && instr->config_data[j]; j++) {
+-         instr->configs[j] = etna_ml_create_bo(subgraph->screen, instr->config_sizes[j]);
++         instr->configs[j] = etna_ml_create_bo(screen, instr->config_sizes[j]);
+          etna_bo_cpu_prep(instr->configs[j], DRM_ETNA_PREP_WRITE);
+          memcpy(etna_bo_map(instr->configs[j]), instr->config_data[j], instr->config_sizes[j]);
+          etna_bo_cpu_fini(instr->configs[j]);
+@@ -918,7 +910,8 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+                         bool is_signed[])
+ {
+    struct etna_context *ctx = etna_context(pctx);
+-   unsigned tp_core_count = etna_ml_get_core_info(ctx->screen)->tp_core_count;
++   struct etna_ml_device *device = etna_ml_device(psubgraph->device);
++   unsigned tp_core_count = device->info->npu.tp_core_count;
+    struct etna_ml_subgraph *subgraph = (struct etna_ml_subgraph *)(psubgraph);
+    struct etna_cmd_stream *stream = ctx->stream;
+    static bool is_initialized = false;
+@@ -929,7 +922,7 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+    }
+ 
+    if (subgraph->io_rsrc == NULL)
+-      prepare_submission(subgraph);
++      prepare_submission(subgraph, ctx->screen);
+ 
+    if (!DBG_ENABLED(ETNA_DBG_NPU_NO_BATCHING)) {
+       /* These zeroes match the blob's cmdstream. They are here to make diff'ing easier.*/
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.h b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+index 51486d2af43..f78661257f1 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+@@ -10,6 +10,7 @@
+ #include "util/u_dynarray.h"
+ #include "util/macros.h"
+ #include "etnaviv_context.h"
++#include "common/etna_core_info.h"
+ 
+ enum etna_ml_reloc_type {
+    ETNA_ML_RELOC_INPUT,
+@@ -31,6 +32,9 @@ struct etna_ml_relocation {
+ 
+ struct etna_ml_device {
+    struct pipe_ml_device base;
++
++   const struct etna_core_info *info;
++   const struct etna_specs *specs;
+ };
+ 
+ static inline struct etna_ml_device *
+@@ -72,7 +76,6 @@ struct etna_ml_tensor {
+ 
+ struct etna_ml_subgraph {
+    struct pipe_ml_subgraph base;
+-   struct etna_screen *screen;
+ 
+    struct util_dynarray operations;
+ 
+@@ -83,6 +86,12 @@ struct etna_ml_subgraph {
+    unsigned io_used;
+ };
+ 
++static inline struct etna_ml_device *
++etna_ml_dev(struct etna_ml_subgraph *subgraph)
++{
++   return etna_ml_device(subgraph->base.device);
++}
++
+ struct etna_vip_instruction {
+    enum etna_job_type type;
+    enum etna_ml_tp_type tp_type;
+@@ -180,8 +189,6 @@ unsigned etna_ml_get_size(struct etna_ml_subgraph *subgraph, unsigned idx);
+ 
+ struct etna_bo *etna_ml_create_bo(struct etna_screen *screen, size_t size);
+ 
+-struct etna_core_npu_info *etna_ml_get_core_info(struct etna_screen *screen);
+-
+ bool
+ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+                             const struct pipe_ml_operation *operation);
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+index 2934995c1e2..a226b0f700c 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+@@ -376,7 +376,7 @@ reorder_for_hw_depthwise(struct etna_ml_subgraph *subgraph, struct etna_operatio
+ static void
+ transpose(struct etna_ml_subgraph *subgraph, struct etna_operation *operation)
+ {
+-   unsigned nn_core_version = subgraph->screen->specs.nn_core_version;
++   unsigned nn_core_version = etna_ml_dev(subgraph)->specs->nn_core_version;
+    void *map = operation->weight_tensor;
+    unsigned new_size;
+    uint8_t *output;
+@@ -497,7 +497,7 @@ static bool
+ calc_pooling_first_pixel(struct etna_ml_subgraph *subgraph,
+                          const struct pipe_ml_operation *poperation)
+ {
+-   unsigned nn_core_version = subgraph->screen->specs.nn_core_version;
++   unsigned nn_core_version = etna_ml_dev(subgraph)->specs->nn_core_version;
+    unsigned input_width = poperation->input_tensors[0]->dims[1];
+    unsigned input_channels = poperation->input_tensors[0]->dims[3];
+ 
+@@ -547,7 +547,7 @@ etna_ml_lower_convolution(struct etna_ml_subgraph *subgraph,
+                           const struct pipe_ml_operation *poperation,
+                           struct etna_operation *operation)
+ {
+-   unsigned nn_core_version = subgraph->screen->specs.nn_core_version;
++   unsigned nn_core_version = etna_ml_dev(subgraph)->specs->nn_core_version;
+ 
+    /* TODO: Support stride_x != stride_y */
+    assert(poperation->conv.stride_x == poperation->conv.stride_y);
+@@ -877,7 +877,7 @@ etna_ml_lower_add(struct etna_ml_subgraph *subgraph,
+                   const struct pipe_ml_operation *poperation,
+                   struct etna_operation *operation)
+ {
+-   unsigned nn_core_version = subgraph->screen->specs.nn_core_version;
++   unsigned nn_core_version = etna_ml_dev(subgraph)->specs->nn_core_version;
+ 
+    if (nn_core_version < 8)
+       etna_ml_lower_add_v7(subgraph, poperation, operation);
+@@ -977,22 +977,22 @@ etna_ml_calc_addition_sizes(unsigned *input_width, unsigned *input_height, unsig
+ }
+ 
+ static unsigned
+-etna_ml_calculate_tiling(struct etna_screen *screen, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out)
++etna_ml_calculate_tiling(struct etna_ml_device *device, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out)
+ {
+-   unsigned nn_core_version = screen->specs.nn_core_version;
++   unsigned nn_core_version = device->specs->nn_core_version;
+    if (nn_core_version == 7)
+-      return etna_ml_calculate_tiling_v7(screen, operation, tile_width_out, tile_height_out);
++      return etna_ml_calculate_tiling_v7(device, operation, tile_width_out, tile_height_out);
+    else
+-      return etna_ml_calculate_tiling_v8(screen, operation, tile_width_out, tile_height_out);
++      return etna_ml_calculate_tiling_v8(device, operation, tile_width_out, tile_height_out);
+ }
+ 
+ static void *
+ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned coef_cache_size)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
+-   unsigned nn_core_version = screen->specs.nn_core_version;
+-   unsigned oc_sram_size = etna_ml_get_core_info(screen)->on_chip_sram_size;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
++   unsigned nn_core_version = device->specs->nn_core_version;
++   unsigned oc_sram_size = device->info->npu.on_chip_sram_size;
+    struct etna_nn_params *map = calloc(1, sizeof(struct etna_nn_params));
+    unsigned input_width = operation->input_width;
+    unsigned input_height = operation->input_height;
+@@ -1145,7 +1145,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+    }
+ 
+    unsigned tile_x, tile_y;
+-   unsigned superblocks = etna_ml_calculate_tiling(screen, operation, &tile_x, &tile_y);
++   unsigned superblocks = etna_ml_calculate_tiling(device, operation, &tile_x, &tile_y);
+    map->out_image_tile_x_size = tile_x;
+    map->out_image_tile_y_size = tile_y;
+ 
+@@ -1275,7 +1275,7 @@ void
+ etna_ml_compile_operation_nn(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation,
+                              struct etna_vip_instruction *instruction)
+ {
+-   unsigned nn_core_version = subgraph->screen->specs.nn_core_version;
++   unsigned nn_core_version = etna_ml_dev(subgraph)->specs->nn_core_version;
+    unsigned coef_cache_size;
+ 
+    instruction->type = ETNA_JOB_TYPE_NN;
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.h b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.h
+index a416e9f8250..a73aff56b85 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.h
+@@ -11,13 +11,13 @@ etna_ml_calc_addition_sizes(unsigned *input_width, unsigned *input_height, unsig
+                             unsigned *output_width, unsigned *output_height, unsigned *output_channels);
+ 
+ unsigned
+-etna_ml_calculate_tiling_v7(struct etna_screen *screen, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out);
++etna_ml_calculate_tiling_v7(struct etna_ml_device *device, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out);
+ 
+ void *
+ etna_ml_create_coeffs_v7(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size, unsigned *out_size);
+ 
+ unsigned
+-etna_ml_calculate_tiling_v8(struct etna_screen *screen, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out);
++etna_ml_calculate_tiling_v8(struct etna_ml_device *device, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out);
+ 
+ void *
+ etna_ml_create_coeffs_v8(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size, unsigned *out_size);
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
+index f62bf96b543..b97cf5c4e29 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
+@@ -6,7 +6,6 @@
+ #include "etnaviv_context.h"
+ #include "etnaviv_debug.h"
+ #include "etnaviv_ml_nn.h"
+-#include "etnaviv_screen.h"
+ 
+ static void *
+ map_resource(struct pipe_resource *resource)
+@@ -17,10 +16,10 @@ map_resource(struct pipe_resource *resource)
+ #define MAX_TILE_WIDTH 64
+ 
+ static unsigned
+-calc_superblocks(struct etna_screen *screen, const struct etna_operation *operation, unsigned tile_y, unsigned interleave_mode)
++calc_superblocks(struct etna_ml_device *device, const struct etna_operation *operation, unsigned tile_y, unsigned interleave_mode)
+ {
+-   unsigned nn_core_count = screen->info->npu.nn_core_count;
+-   unsigned nn_accum_buffer_depth = screen->info->npu.nn_accum_buffer_depth;
++   unsigned nn_core_count = device->info->npu.nn_core_count;
++   unsigned nn_accum_buffer_depth = device->info->npu.nn_accum_buffer_depth;
+    unsigned output_channels = operation->addition ? 1 : operation->output_channels;
+    unsigned kernels_per_core = DIV_ROUND_UP(output_channels, nn_core_count);
+    unsigned foo = (nn_accum_buffer_depth * interleave_mode) / tile_y;
+@@ -60,10 +59,10 @@ calc_interleave_mode(unsigned tile_width, unsigned weight_height)
+ }
+ 
+ unsigned
+-etna_ml_calculate_tiling_v7(struct etna_screen *screen, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out)
++etna_ml_calculate_tiling_v7(struct etna_ml_device *device, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out)
+ {
+-   unsigned nn_input_buffer_depth = screen->info->npu.nn_input_buffer_depth;
+-   unsigned nn_accum_buffer_depth = screen->info->npu.nn_accum_buffer_depth;
++   unsigned nn_input_buffer_depth = device->info->npu.nn_input_buffer_depth;
++   unsigned nn_accum_buffer_depth = device->info->npu.nn_accum_buffer_depth;
+    unsigned input_width = operation->input_width;
+    unsigned input_height = operation->input_height;
+    unsigned input_channels = operation->input_channels;
+@@ -95,7 +94,7 @@ etna_ml_calculate_tiling_v7(struct etna_screen *screen, const struct etna_operat
+       tile_height -= 1;
+ 
+    tile_height = MAX2(tile_height, 1);
+-   superblocks = calc_superblocks(screen, operation, tile_height, interleave_mode);
++   superblocks = calc_superblocks(device, operation, tile_height, interleave_mode);
+ 
+    if (tile_width_out)
+       *tile_width_out = tile_width;
+@@ -185,8 +184,8 @@ wb_stream_write(struct wb_stream *wb_stream, unsigned value)
+ static unsigned
+ write_core_6(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, const struct etna_operation *operation, unsigned zrl_bits)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    unsigned input_channels = operation->addition ? 1 : operation->input_channels;
+    unsigned output_channels = operation->addition ? 1 : operation->output_channels;
+    unsigned cores_used = MIN2(output_channels, nn_core_count);
+@@ -195,7 +194,7 @@ write_core_6(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, co
+    uint32_t *biases = (uint32_t *)operation->bias_tensor;
+    unsigned out_values_per_channel = operation->output_width * operation->output_height;
+    unsigned stride = MIN2(input_channels, 6);
+-   unsigned superblocks = etna_ml_calculate_tiling_v7(screen, operation, NULL, NULL);
++   unsigned superblocks = etna_ml_calculate_tiling_v7(device, operation, NULL, NULL);
+    uint8_t *weights_maps[DIV_ROUND_UP(kernels_per_core, superblocks)];
+    uint32_t *initial_ptr = map;
+    bool do_write = initial_ptr != NULL;
+@@ -265,8 +264,8 @@ write_core_6(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, co
+ static unsigned
+ write_core_interleaved(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, const struct etna_operation *operation, unsigned zrl_bits)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    unsigned input_channels = operation->addition ? 1 : operation->input_channels;
+    unsigned output_channels = operation->addition ? 1 : operation->output_channels;
+    unsigned cores_used = MIN2(output_channels, nn_core_count);
+@@ -274,7 +273,7 @@ write_core_interleaved(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigne
+    uint8_t *input = operation->weight_tensor;
+    uint32_t *biases = (uint32_t *)operation->bias_tensor;
+    unsigned out_values_per_channel = operation->output_width * operation->output_height;
+-   unsigned superblocks = etna_ml_calculate_tiling_v7(screen, operation, NULL, NULL);
++   unsigned superblocks = etna_ml_calculate_tiling_v7(device, operation, NULL, NULL);
+    uint8_t (*weights_map)[input_channels][operation->weight_width][operation->weight_height] = (void *)input;
+    uint32_t *initial_ptr = map;
+    bool do_write = initial_ptr != NULL;
+@@ -352,15 +351,15 @@ write_core_interleaved(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigne
+ static unsigned
+ write_core_sequential(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned core, const struct etna_operation *operation, unsigned zrl_bits)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    unsigned output_channels = operation->addition ? 1 : operation->output_channels;
+    unsigned cores_used = MIN2(output_channels, nn_core_count);
+    unsigned kernels_per_core = DIV_ROUND_UP(output_channels, cores_used);
+    uint8_t *input = operation->weight_tensor;
+    uint32_t *biases = (uint32_t *)operation->bias_tensor;
+    unsigned out_values_per_channel = operation->output_width * operation->output_height;
+-   unsigned superblocks = etna_ml_calculate_tiling_v7(screen, operation, NULL, NULL);
++   unsigned superblocks = etna_ml_calculate_tiling_v7(device, operation, NULL, NULL);
+    uint32_t *initial_ptr = map;
+    bool do_write = initial_ptr != NULL;
+    uint64_t buffer = 0;
+@@ -438,8 +437,8 @@ write_core_sequential(struct etna_ml_subgraph *subgraph, uint32_t *map, unsigned
+ static unsigned
+ calculate_weight_bo_size(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    unsigned header_size = align(nn_core_count * 4, 64);
+    unsigned input_channels = operation->addition ? 1 : operation->input_channels;
+    unsigned output_channels = operation->addition ? 1 : operation->output_channels;
+@@ -461,9 +460,9 @@ calculate_weight_bo_size(struct etna_ml_subgraph *subgraph, const struct etna_op
+ static unsigned
+ calculate_zrl_bits(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
+-   unsigned max_zrl_bits = etna_ml_get_core_info(screen)->nn_zrl_bits;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
++   unsigned max_zrl_bits = device->info->npu.nn_zrl_bits;
+    unsigned header_size = align(nn_core_count * 4, 64);
+    unsigned input_channels = operation->addition ? 1 : operation->input_channels;
+    unsigned output_channels = operation->addition ? 1 : operation->output_channels;
+@@ -513,8 +512,8 @@ calculate_zrl_bits(struct etna_ml_subgraph *subgraph, const struct etna_operatio
+ void *
+ etna_ml_create_coeffs_v7(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size, unsigned *out_size)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    unsigned header_size = align(nn_core_count * 4, 64);
+    unsigned input_channels = operation->addition ? 1 : operation->input_channels;
+    unsigned output_channels = operation->addition ? 1 : operation->output_channels;
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
+index 6f7a45b1924..642a95ee1f4 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
+@@ -11,7 +11,6 @@
+ #include "etnaviv_debug.h"
+ #include "etnaviv_ml.h"
+ #include "etnaviv_ml_nn.h"
+-#include "etnaviv_screen.h"
+ 
+ static void *
+ map_resource(struct pipe_resource *resource)
+@@ -39,11 +38,10 @@ struct etna_nn_header_v8 {
+ #define MAX_TILE_WIDTH 64
+ 
+ static unsigned
+-calc_superblocks(struct etna_screen *screen, const struct etna_operation *operation, unsigned tile_x, unsigned tile_y, unsigned interleave_mode)
++calc_superblocks(struct etna_ml_device *device, const struct etna_operation *operation, unsigned tile_x, unsigned tile_y, unsigned interleave_mode)
+ {
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
+-   struct etna_core_info *info = etna_gpu_get_core_info(screen->npu);
+-   unsigned nn_accum_buffer_depth = info->npu.nn_accum_buffer_depth;
++   unsigned nn_core_count = device->info->npu.nn_core_count;
++   unsigned nn_accum_buffer_depth = device->info->npu.nn_accum_buffer_depth;
+    unsigned output_channels = operation->output_channels;
+    unsigned kernels_per_core = DIV_ROUND_UP(output_channels, nn_core_count);
+    unsigned tiles_per_core;
+@@ -103,10 +101,10 @@ calc_interleave_mode(unsigned tile_width, unsigned weight_height)
+ }
+ 
+ unsigned
+-etna_ml_calculate_tiling_v8(struct etna_screen *screen, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out)
++etna_ml_calculate_tiling_v8(struct etna_ml_device *device, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out)
+ {
+-   unsigned nn_input_buffer_depth = etna_ml_get_core_info(screen)->nn_input_buffer_depth;
+-   unsigned nn_accum_buffer_depth = etna_ml_get_core_info(screen)->nn_accum_buffer_depth;
++   unsigned nn_input_buffer_depth = device->info->npu.nn_input_buffer_depth;
++   unsigned nn_accum_buffer_depth = device->info->npu.nn_accum_buffer_depth;
+    unsigned input_width = operation->input_width;
+    unsigned input_height = operation->input_height;
+    unsigned input_channels = operation->input_channels;
+@@ -143,7 +141,7 @@ etna_ml_calculate_tiling_v8(struct etna_screen *screen, const struct etna_operat
+ 
+    tile_height = MAX2(tile_height, 1);
+ 
+-   superblocks = calc_superblocks(screen, operation, tile_width, tile_height, interleave_mode);
++   superblocks = calc_superblocks(device, operation, tile_width, tile_height, interleave_mode);
+ 
+    if (tile_width_out)
+       *tile_width_out = tile_width;
+@@ -437,7 +435,7 @@ static void encode_byte(struct encoder *encoder, uint8_t byte)
+ static void
+ encode_value(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, struct encoder *encoder, uint8_t value)
+ {
+-   unsigned customer_id = subgraph->screen->info->customer_id;
++   unsigned customer_id = etna_ml_dev(subgraph)->info->customer_id;
+    uint8_t zero_point = operation->weight_zero_point;
+ 
+    value -= encoder->avg_bias;
+@@ -598,8 +596,8 @@ static void encoder_reset(struct etna_ml_subgraph *subgraph, const struct etna_o
+ 
+ static void encode_superblock(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, struct encoder *encoder, unsigned kernels_in_superblock, unsigned first_channel)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    unsigned input_channels = operation->input_channels;
+    unsigned output_channels = operation->output_channels;
+    unsigned kernel_size;
+@@ -668,8 +666,8 @@ static uint32_t pack_symbol_map(uint8_t map[8])
+ static void *
+ create_buf(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *buf_size)
+ {
+-   struct etna_screen *screen = subgraph->screen;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    unsigned input_channels = operation->input_channels;
+    unsigned output_channels = operation->output_channels;
+    unsigned cores_used = MIN2(output_channels, nn_core_count);
+@@ -715,11 +713,11 @@ calculate_symbol_map(struct etna_ml_subgraph *subgraph, const struct etna_operat
+ static void
+ fill_weights(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, struct encoder *encoder, struct etna_nn_header_v8 *header)
+ {
+-   struct etna_screen *screen = subgraph->screen;
++   struct etna_ml_device *device = etna_ml_dev(subgraph);
+    unsigned output_channels = operation->output_channels;
+-   unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
++   unsigned nn_core_count = device->info->npu.nn_core_count;
+    unsigned cores_used = MIN2(output_channels, nn_core_count);
+-   unsigned superblocks = etna_ml_calculate_tiling_v8(screen, operation, NULL, NULL);
++   unsigned superblocks = etna_ml_calculate_tiling_v8(device, operation, NULL, NULL);
+    unsigned full_superblock = DIV_ROUND_UP(output_channels, nn_core_count * superblocks);
+ 
+    unsigned channel_per_superblock[superblocks];
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+index 6091b978bf9..cc6aca1f9c6 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+@@ -1268,7 +1268,7 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+       num_configs = 1;
+       break;
+    case ETNA_ML_TP_RESHUFFLE: {
+-      unsigned tp_core_count = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
++      unsigned tp_core_count = etna_ml_dev(subgraph)->info->npu.tp_core_count;
+       unsigned tp_cores_used;
+ 
+       tp_cores_used = (operation->input_width > 8 || operation->input_channels > 1) ? tp_core_count : 1;
+@@ -1287,7 +1287,7 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+       break;
+    }
+    case ETNA_ML_TP_PAD: {
+-      unsigned tp_cores_used = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
++      unsigned tp_cores_used = etna_ml_dev(subgraph)->info->npu.tp_core_count;
+ 
+       if (operation->input_width == 1)
+          tp_cores_used = 1;
+@@ -1301,7 +1301,7 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+       break;
+    }
+    case ETNA_ML_TP_RELU: {
+-      unsigned tp_cores_used = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
++      unsigned tp_cores_used = etna_ml_dev(subgraph)->info->npu.tp_core_count;
+ 
+       if (operation->input_width < 6)
+          tp_cores_used = 1;
+@@ -1316,7 +1316,7 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+       break;
+    }
+    case ETNA_ML_TP_ABSOLUTE: {
+-      unsigned tp_cores_used = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
++      unsigned tp_cores_used = etna_ml_dev(subgraph)->info->npu.tp_core_count;
+ 
+       ML_DBG("absolute: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
+       instruction->pwl_lut_data = create_abs_lut(subgraph, operation, &instruction->pwl_lut_size);
+@@ -1328,7 +1328,7 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+       break;
+    }
+    case ETNA_ML_TP_LOGISTIC: {
+-      unsigned tp_cores_used = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
++      unsigned tp_cores_used = etna_ml_dev(subgraph)->info->npu.tp_core_count;
+ 
+       if (operation->input_width < 6)
+          tp_cores_used = 1;
+@@ -1387,7 +1387,7 @@ etna_ml_emit_operation_tp(struct pipe_context *pctx,
+                           unsigned idx)
+ {
+    struct etna_context *ctx = etna_context(pctx);
+-   unsigned tp_core_count = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
++   unsigned tp_core_count = etna_ml_dev(subgraph)->info->npu.tp_core_count;
+    struct etna_cmd_stream *stream = ctx->stream;
+    bool more_than_one_tp_job = operation->configs[1] != NULL;
+    bool parallel = DBG_ENABLED(ETNA_DBG_NPU_PARALLEL);
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_screen.c b/src/gallium/drivers/etnaviv/etnaviv_screen.c
+index afc11ad92f0..4f2181fa7c3 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_screen.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_screen.c
+@@ -1116,6 +1116,10 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
+    pscreen->get_dmabuf_modifier_planes = etna_screen_get_dmabuf_modifier_planes;
+ 
+    if (npu) {
++      screen->ml_device.info = etna_gpu_get_core_info(npu);
++      screen->ml_device.specs = &screen->specs;
++
++      screen->ml_device.base.id = "etnaviv-vipnano-si-plus";
+       screen->ml_device.base.ml_operation_supported = etna_ml_operation_supported;
+       screen->ml_device.base.ml_subgraph_create = etna_ml_subgraph_create;
+       screen->ml_device.base.ml_subgraph_destroy = etna_ml_subgraph_destroy;
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_screen.h b/src/gallium/drivers/etnaviv/etnaviv_screen.h
+index 3aa48b71b91..17778c31b07 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_screen.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_screen.h
+@@ -94,13 +94,6 @@ etna_screen(struct pipe_screen *pscreen)
+    return (struct etna_screen *)pscreen;
+ }
+ 
+-static inline struct etna_screen *
+-etna_ml_device_screen(struct pipe_ml_device *pdevice)
+-{
+-   struct etna_ml_device *dev = etna_ml_device(pdevice);
+-   return container_of(dev, struct etna_screen, ml_device);
+-}
+-
+ struct etna_bo *
+ etna_screen_bo_from_handle(struct pipe_screen *pscreen,
+                            struct winsys_handle *whandle);
+-- 
+2.55.0
+

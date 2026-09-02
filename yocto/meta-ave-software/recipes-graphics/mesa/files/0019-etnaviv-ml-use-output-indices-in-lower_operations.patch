@@ -1,0 +1,136 @@
+From 3886adc84416741829d36137ab2ba26d891655a0 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Thu, 28 May 2026 16:13:40 +0200
+Subject: [PATCH 19/37] etnaviv/ml: use output indices in lower_operations
+
+Add detranspose if needed for all output tensors, not only for
+tensors that don't have any consuming operations.
+
+If there are any consumers, rewrite their input tensor to the
+newly inserted still-transposed tensor.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 46 ++++++++++++++----------
+ src/gallium/drivers/etnaviv/etnaviv_ml.h |  6 ++++
+ 2 files changed, 34 insertions(+), 18 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index a1351031b7a..e522434aebc 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -154,22 +154,6 @@ etna_ml_find_producer(const struct pipe_ml_operation *poperations,
+    return NULL;
+ }
+ 
+-static const struct pipe_ml_operation *
+-etna_ml_find_consumer(const struct pipe_ml_operation *poperations,
+-                      unsigned count,
+-                      unsigned tensor_idx)
+-{
+-   for (unsigned i = 0; i < count; i++) {
+-      const struct pipe_ml_operation *poperation = &poperations[i];
+-
+-      for (unsigned j = 0; j < poperation->input_count; j++)
+-         if (poperation->input_tensors[j]->index == tensor_idx)
+-            return poperation;
+-   }
+-
+-   return NULL;
+-}
+-
+ static void
+ reference_tensor_with_offset(struct etna_ml_subgraph *subgraph,
+                              unsigned src_tensor,
+@@ -270,8 +254,13 @@ static void
+ lower_operations(struct etna_ml_subgraph *subgraph,
+                  const struct pipe_ml_operation *poperations,
+                  unsigned count,
++                 unsigned outputs_count, unsigned output_idxs[],
+                  struct list_head *etna_operations)
+ {
++   struct list_head input_replacements;
++
++   list_inithead(&input_replacements);
++
+    for (unsigned i = 0; i < count; i++) {
+       const struct pipe_ml_operation *poperation = &poperations[i];
+       struct etna_operation *operation = calloc(1, sizeof(*operation));
+@@ -470,7 +459,14 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+          }
+ 
+          ML_DBG("type %d i %d tensor %d layout %d == %d\n", poperation->type, i, poperation->output_tensors[i]->index, tensor->exp_layout, tensor->act_layout);
+-         if (!etna_ml_find_consumer(poperations, count, poperation->output_tensors[i]->index) &&
++         bool is_output = false;
++         for (int j = 0; j < outputs_count; j++) {
++            if (poperation->output_tensors[i]->index == output_idxs[j]) {
++               is_output = true;
++               break;
++            }
++         }
++         if (is_output &&
+              is_3d(poperation->output_tensors[i]) &&
+              tensor->exp_layout != tensor->act_layout) {
+             ML_DBG("Adding detranspose.\n");
+@@ -480,11 +476,22 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+             detranspose->input_tensors[0] = operation->output_tensors[i];
+             detranspose->output_tensors[0] = poperation->output_tensors[i]->index;
+             list_addtail(&detranspose->link, etna_operations);
++
++            struct etna_idx_replacement *replacement = calloc(1, sizeof(*replacement));
++            replacement->idx_old = poperation->output_tensors[i]->index;
++            replacement->idx_new = operation->output_tensors[i];
++            list_addtail(&replacement->link, &input_replacements);
+          }
+       }
+    }
+ 
+    list_for_each_entry(struct etna_operation, operation, etna_operations, link) {
++      list_for_each_entry(struct etna_idx_replacement, replacement, &input_replacements, link) {
++         for (int i = 0; i < operation->input_count; i++) {
++            if (operation->input_tensors[i] == replacement->idx_old)
++               operation->input_tensors[i] = replacement->idx_new;
++         }
++      }
+       if (operation->type == ETNA_JOB_TYPE_CONCAT) {
+          etna_ml_create_tensor(subgraph, operation->output_tensors[0], operation->output_tensor_sizes[0]);
+ 
+@@ -542,6 +549,9 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+       etna_ml_create_tensor(subgraph, operation->output_tensors[0], operation->output_tensor_sizes[0]);
+    }
+ 
++   list_for_each_entry_safe(struct etna_idx_replacement, replacement, &input_replacements, link)
++      free(replacement);
++
+    if (DBG_ENABLED(ETNA_DBG_ML_MSGS))
+       dump_graph(etna_operations);
+ }
+@@ -755,7 +765,7 @@ etna_ml_subgraph_create(struct pipe_ml_device *pdevice,
+ 
+    subgraph->io_used = 0;
+ 
+-   lower_operations(subgraph, poperations, count, &operations);
++   lower_operations(subgraph, poperations, count, outputs_count, output_idxs, &operations);
+ 
+    list_for_each_entry(struct etna_operation, operation, &operations, link) {
+       struct etna_vip_instruction instruction = {0};
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.h b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+index dcc93ee1c91..74793a55845 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+@@ -176,6 +176,12 @@ struct etna_operation {
+    unsigned pad_after_z;
+ };
+ 
++struct etna_idx_replacement {
++   struct list_head link;
++   unsigned idx_old;
++   unsigned idx_new;
++};
++
+ #define ML_DBG(fmt, ...)                                  \
+    do {                                                   \
+       if (DBG_ENABLED(ETNA_DBG_ML_MSGS))                  \
+-- 
+2.55.0
+

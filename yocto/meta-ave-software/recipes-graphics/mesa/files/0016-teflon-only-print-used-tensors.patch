@@ -1,0 +1,48 @@
+From 7d586f154546310f8c3d32f9768aba1977e2b5b4 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Tue, 26 May 2026 17:36:24 +0200
+Subject: [PATCH 16/37] teflon: only print used tensors
+
+When dumping the graph, filter out all tensors that are not used
+as input or output tensor by any operation.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/frontends/teflon/tfl_device.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 160dae5dbc9..197954d1c78 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -474,6 +474,27 @@ dump_graph(struct pipe_tensor *tensors, unsigned tensor_count, struct pipe_ml_op
+    teflon_debug("%3s %-8s %3s %s %-12s\n", "idx", "scale", "zp", "has_data", "size");
+    teflon_debug("=======================================\n");
+    for (int i = 0; i < tensor_count; i++) {
++      /* Filter out tensors that are not used by operations in this graph. */
++      bool used = false;
++      for (int j = 0; j < operation_count; j++) {
++         for (int k = 0; k < operations[j].input_count; k++) {
++            if (operations[j].input_tensors[k]->index == i) {
++               used = true;
++               break;
++            }
++         }
++         for (int k = 0; k < operations[j].output_count; k++) {
++            if (operations[j].output_tensors[k]->index == i) {
++               used = true;
++               break;
++            }
++         }
++         if (used)
++            break;
++      }
++      if (!used)
++         continue;
++
+       teflon_debug("%3d %6f %3x %-8s %dx%dx%dx%d\n",
+                    tensors[i].index,
+                    tensors[i].scale,
+-- 
+2.55.0
+

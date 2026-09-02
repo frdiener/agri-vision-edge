@@ -1,0 +1,68 @@
+From b7d8bccf3f9061d4dcd9ea015dc4a43075bcbe96 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Thu, 28 May 2026 16:12:55 +0200
+Subject: [PATCH 20/37] debug: etnaviv/ml: debug tensor layout
+
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index e522434aebc..28f6fcb62bd 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -261,6 +261,12 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+ 
+    list_inithead(&input_replacements);
+ 
++   const char *layout[] = {
++      [ETNA_ML_LAYOUT_ANY] = "any",
++      [ETNA_ML_LAYOUT_NHWC] = "NHWC",
++      [ETNA_ML_LAYOUT_NCHW] = "NCHW",
++   };
++
+    for (unsigned i = 0; i < count; i++) {
+       const struct pipe_ml_operation *poperation = &poperations[i];
+       struct etna_operation *operation = calloc(1, sizeof(*operation));
+@@ -289,7 +295,7 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+ 
+          if (operation_layout != ETNA_ML_LAYOUT_ANY &&
+              tensor->act_layout != operation_layout) {
+-            ML_DBG("Adding transpose.\n");
++            ML_DBG("Adding transpose %s -> %s.\n", layout[tensor->act_layout], layout[operation_layout]);
+             struct etna_operation *transpose = calloc(1, sizeof(*transpose));
+             etna_ml_lower_transpose(subgraph, poperation->input_tensors[i], transpose);
+             transpose->input_tensors[0] = input_tensors[i];
+@@ -303,7 +309,7 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+          }
+ 
+          struct etna_ml_tensor *tensor2 = etna_ml_get_tensor(subgraph, input_tensors[i]);
+-         ML_DBG("operation %d input tensor %d layouts %d %d.\n", poperation->type, input_tensors[i], tensor2->exp_layout, tensor2->act_layout);
++         ML_DBG("operation %d input tensor %d layouts %s %s.\n", poperation->type, input_tensors[i], layout[tensor2->exp_layout], layout[tensor2->act_layout]);
+       }
+ 
+       switch(poperation->type) {
+@@ -458,7 +464,6 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+             etna_ml_copy_layout(subgraph, poperation->output_tensors[i]->index, operation->input_tensors[0]);
+          }
+ 
+-         ML_DBG("type %d i %d tensor %d layout %d == %d\n", poperation->type, i, poperation->output_tensors[i]->index, tensor->exp_layout, tensor->act_layout);
+          bool is_output = false;
+          for (int j = 0; j < outputs_count; j++) {
+             if (poperation->output_tensors[i]->index == output_idxs[j]) {
+@@ -466,10 +471,11 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+                break;
+             }
+          }
++         ML_DBG("type %d i %d tensor %d layout %s == %s%s%s\n", poperation->type, i, poperation->output_tensors[i]->index, layout[tensor->exp_layout], layout[tensor->act_layout], is_output ? " (out)" : "", is_3d(poperation->output_tensors[i]) ? " (3d)" : "");
+          if (is_output &&
+              is_3d(poperation->output_tensors[i]) &&
+              tensor->exp_layout != tensor->act_layout) {
+-            ML_DBG("Adding detranspose.\n");
++            ML_DBG("Adding detranspose %s -> %s.\n", layout[tensor->act_layout], layout[tensor->exp_layout]);
+             struct etna_operation *detranspose = calloc(1, sizeof(*detranspose));
+             etna_ml_lower_detranspose(subgraph, poperation->output_tensors[i], detranspose);
+             operation->output_tensors[i] = etna_ml_allocate_tensor(subgraph);
+-- 
+2.55.0
+

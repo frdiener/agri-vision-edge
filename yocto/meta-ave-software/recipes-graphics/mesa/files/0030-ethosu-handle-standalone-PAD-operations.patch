@@ -1,0 +1,42 @@
+From 51696af04e68d51adf87a88569edc7b1933eace0 Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Mon, 22 Jun 2026 10:26:21 +0200
+Subject: [PATCH 30/37] ethosu: handle standalone PAD operations
+
+If a PAD operation has no convolution consumer in the subgraph, allocate
+the input tensor backing and alias the output to it. This avoids a NULL
+resource dereference in prepare_for_submission for degenerate partitions.
+---
+ src/gallium/drivers/ethosu/ethosu_lower.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/ethosu/ethosu_lower.c b/src/gallium/drivers/ethosu/ethosu_lower.c
+index 9555dd7ddbb..f42f3726b0f 100644
+--- a/src/gallium/drivers/ethosu/ethosu_lower.c
++++ b/src/gallium/drivers/ethosu/ethosu_lower.c
+@@ -1008,7 +1008,21 @@ ethosu_lower_graph(struct ethosu_subgraph *subgraph,
+       }
+ 
+       case PIPE_ML_OPERATION_TYPE_PAD: {
+-         // Just ignore the pad operation for now, as it will be handled by its consumers
++         /* Normally absorbed by a consumer convolution. If there is no conv
++          * consumer in this subgraph (degenerate partition), allocate the
++          * tensors so that io_rsrc is non-NULL, and alias the output to the
++          * input to avoid a crash. The data will be wrong (no zero-padding),
++          * but this avoids a NULL-deref in prepare_for_submission. */
++         const struct pipe_ml_operation *consumer =
++            ethosu_find_first_consumer(poperations, count,
++                                       poperations[i].output_tensors[0]->index);
++         if (!consumer || consumer->type != PIPE_ML_OPERATION_TYPE_CONVOLUTION) {
++            struct ethosu_tensor *in_t = ethosu_find_tensor(subgraph, poperations[i].input_tensors[0]->index);
++            struct ethosu_tensor *out_t = ethosu_find_tensor(subgraph, poperations[i].output_tensors[0]->index);
++            ethosu_allocate_feature_map(subgraph, in_t);
++            out_t->offset = in_t->offset;
++            out_t->size = in_t->size;
++         }
+          break;
+       }
+ 
+-- 
+2.55.0
+

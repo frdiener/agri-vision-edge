@@ -1,0 +1,39 @@
+From c21102d6b3fffe370ed852508f33e1a09f1f57d8 Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Fri, 29 May 2026 12:46:00 +0200
+Subject: [PATCH 22/37] debug: etnaviv/ml: log reshape detranspose insertion
+
+Include the layout transition in the ML debug output when reshape
+lowering inserts a detranspose. This makes it easier to understand why a
+reshape is emitted as a TP operation instead of a bypass.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 9 +++------
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 0a8fd06c67e..ef5409681ea 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -406,16 +406,13 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+       case PIPE_ML_OPERATION_TYPE_RESHAPE: {
+          struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, input_tensors[0]);
+          if (
+-             /* # input tensor is NCHW */
+              tensor->act_layout == ETNA_ML_LAYOUT_NCHW &&
+-             /* input tensor is 3d */
+              is_3d(poperation->input_tensors[0]) &&
+-             /* output tensor is 2d */
+              !is_3d(poperation->output_tensors[0])
+              ){
+-            /* add detranspose */
+-            etna_ml_lower_detranspose(subgraph, poperation->output_tensors[0], operation);
+-            operation->input_tensors[0] = input_tensors[0];
++            ML_DBG("3d->2d reshape detected:\n");
++            ML_DBG("Adding detranspose %s -> %s.\n", layout[tensor->act_layout], layout[tensor->exp_layout]);
++            etna_ml_lower_detranspose(subgraph, poperation->input_tensors[0], operation);
+             operation->output_tensors[0] = poperation->output_tensors[0]->index;
+             list_addtail(&operation->link, etna_operations);
+          }
+-- 
+2.55.0
+

@@ -1,0 +1,46 @@
+From a40b6281a75ad41a1d4bb037c7a46b2c2212830d Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Sat, 27 Jun 2026 14:37:08 +0200
+Subject: [PATCH 31/37] gallium/ml: propagate nearest resize options
+
+Carry align_corners and half_pixel_centers from TFLite RESIZE_NEAREST_NEIGHBOR into pipe_ml_operation so drivers can reject variants they do not implement exactly.
+---
+ src/gallium/frontends/teflon/tfl_device.c | 4 ++++
+ src/gallium/include/pipe/p_state.h        | 5 +++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 3678ce598bc..a06ef761b82 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -300,7 +300,11 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
+       break;
+    }
+    case kTfLiteBuiltinResizeNearestNeighbor: {
++      TfLiteResizeNearestNeighborParams *params = node->builtin_data;
++
+       operation->type = PIPE_ML_OPERATION_TYPE_RESIZE;
++      operation->resize.align_corners = params->align_corners;
++      operation->resize.half_pixel_centers = params->half_pixel_centers;
+       break;
+    }
+    case kTfLiteBuiltinQuantize: {
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+index eb78062dcfd..f6cd0d34b82 100644
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -1278,6 +1278,11 @@ struct pipe_ml_operation
+       struct {
+          float alpha;
+       } leakyrelu;
++
++      struct {
++         bool align_corners;
++         bool half_pixel_centers;
++      } resize;
+    };
+ };
+ 
+-- 
+2.55.0
+

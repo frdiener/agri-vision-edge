@@ -1,0 +1,148 @@
+From 8f59aa53d9d26528f841128257c5a3d6b4ee2f84 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Thu, 28 May 2026 16:13:40 +0200
+Subject: [PATCH 18/37] teflon: pass output tensor indices to
+ ml_subgraph_create
+
+Pass list of output tensor indices to ml_subgraph_create in case the
+driver needs to special-case them.
+
+Currently, the etnaviv driver tries to infer output tensors as tensors
+which hare not consumed by any operation in the subgraph, but this
+is incorrect for tensors that are used both by operations inside and
+outside of the current subgraph.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/drivers/ethosu/ethosu_ml.c    | 3 ++-
+ src/gallium/drivers/ethosu/ethosu_ml.h    | 3 ++-
+ src/gallium/drivers/etnaviv/etnaviv_ml.c  | 3 ++-
+ src/gallium/drivers/etnaviv/etnaviv_ml.h  | 3 ++-
+ src/gallium/drivers/rocket/rkt_ml.c       | 3 ++-
+ src/gallium/drivers/rocket/rkt_ml.h       | 3 ++-
+ src/gallium/frontends/teflon/tfl_device.c | 4 +++-
+ src/gallium/include/pipe/p_state.h        | 5 ++++-
+ 8 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/src/gallium/drivers/ethosu/ethosu_ml.c b/src/gallium/drivers/ethosu/ethosu_ml.c
+index 2e9859b96b2..d05ec5eff39 100644
+--- a/src/gallium/drivers/ethosu/ethosu_ml.c
++++ b/src/gallium/drivers/ethosu/ethosu_ml.c
+@@ -178,7 +178,8 @@ ethosu_ml_operation_supported(struct pipe_ml_device *pdevice,
+ struct pipe_ml_subgraph *
+ ethosu_ml_subgraph_create(struct pipe_ml_device *pdevice,
+                           const struct pipe_ml_operation *poperations,
+-                          unsigned count)
++                          unsigned count,
++                          unsigned outputs_count, unsigned output_idxs[])
+ {
+    struct ethosu_subgraph *subgraph;
+ 
+diff --git a/src/gallium/drivers/ethosu/ethosu_ml.h b/src/gallium/drivers/ethosu/ethosu_ml.h
+index 89ba61dd2ef..de2ef94b53e 100644
+--- a/src/gallium/drivers/ethosu/ethosu_ml.h
++++ b/src/gallium/drivers/ethosu/ethosu_ml.h
+@@ -280,7 +280,8 @@ ethosu_ml_operation_supported(struct pipe_ml_device *pdevice,
+ struct pipe_ml_subgraph *
+ ethosu_ml_subgraph_create(struct pipe_ml_device *pdevice,
+                           const struct pipe_ml_operation *poperations,
+-                          unsigned count);
++                          unsigned count,
++                          unsigned count_outputs, unsigned output_idxs[]);
+ 
+ uint8_t *
+ ethosu_ml_subgraph_serialize(struct pipe_ml_device *pdevice,
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 84f5a66a067..a1351031b7a 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -726,7 +726,8 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+ struct pipe_ml_subgraph *
+ etna_ml_subgraph_create(struct pipe_ml_device *pdevice,
+                         const struct pipe_ml_operation *poperations,
+-                        unsigned count)
++                        unsigned count,
++                        unsigned outputs_count, unsigned output_idxs[])
+ {
+    struct etna_ml_device *device = etna_ml_device(pdevice);
+    unsigned nn_core_count = device->info->npu.nn_core_count;
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.h b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+index dbced87fbc8..dcc93ee1c91 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+@@ -197,7 +197,8 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+ struct pipe_ml_subgraph *
+ etna_ml_subgraph_create(struct pipe_ml_device *pdevice,
+                         const struct pipe_ml_operation *operations,
+-                        unsigned count);
++                        unsigned count,
++                        unsigned outputs_count, unsigned output_idxs[]);
+ 
+ void
+ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psubgraph,
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 85ae94cb13a..b39ceddd107 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -312,7 +312,8 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
+ struct pipe_ml_subgraph *
+ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
+                        const struct pipe_ml_operation *poperations,
+-                       unsigned count)
++                       unsigned count,
++                       unsigned outputs_count, unsigned output_idxs[])
+ {
+    struct rkt_screen *screen = rkt_ml_device_screen(pdevice);
+    struct rkt_ml_device *dev = rkt_ml_device(pdevice);
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 7775989d3d5..d02b5b71812 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -128,7 +128,8 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice, const struct pipe_ml_
+ struct pipe_ml_subgraph *
+ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
+                        const struct pipe_ml_operation *poperations,
+-                       unsigned count);
++                       unsigned count,
++                       unsigned outputs_count, unsigned output_idxs[]);
+ 
+ void rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+                             struct pipe_ml_subgraph *psubgraph,
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 197954d1c78..93c7bdd7b4b 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -644,7 +644,9 @@ partition_init(TfLiteContext *tf_context, const char *buffer, size_t length)
+    struct pipe_ml_subgraph *subgraph;
+    subgraph = delegate->ml_dev->ml_subgraph_create(delegate->ml_dev,
+                                                    operations,
+-                                                   params->nodes_to_replace->size);
++                                                   params->nodes_to_replace->size,
++                                                   params->output_tensors->size,
++                                                   params->output_tensors->data);
+ 
+    struct teflon_subgraph *tsubgraph = calloc(1, sizeof(*tsubgraph));
+    tsubgraph->base = subgraph;
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+index 0ae00006597..eb78062dcfd 100644
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -1318,11 +1318,14 @@ struct pipe_ml_device {
+     * \param device      pipe_ml_device to be used
+     * \param operations  array containing the definitions of the operations in the graph
+     * \param count       number of operations
++    * \param outputs_count number of output tensors
++    * \param output_idxs output tensor indices
+     * \return            a newly allocated pipe_ml_subgraph
+     */
+    struct pipe_ml_subgraph *(*ml_subgraph_create)(struct pipe_ml_device *device,
+                                                   const struct pipe_ml_operation *operations,
+-                                                  unsigned count);
++                                                  unsigned count,
++                                                  unsigned ouptuts_count, unsigned output_idxs[]);
+ 
+    /**
+     * Serialize a compiled subgraph into a byte buffer.
+-- 
+2.55.0
+

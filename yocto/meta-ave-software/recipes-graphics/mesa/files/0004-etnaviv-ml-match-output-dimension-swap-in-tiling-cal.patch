@@ -1,0 +1,36 @@
+From 249a959493a053b703325c38647d69a87b00eb56 Mon Sep 17 00:00:00 2001
+From: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Date: Thu, 26 Mar 2026 17:36:19 +0100
+Subject: [PATCH 04/37] etnaviv/ml: match output dimension swap in tiling
+ calculation
+
+create_nn_config() swaps output_width and output_height for non-fully-connected
+operations, but etna_ml_calculate_tiling_v8() was computing tiles using the
+pre-swap dimensions. This caused tile_x to be capped at the shorter dimension
+(e.g. 48) while the actual NN config had out_x=98, resulting in misaligned
+output tiles and corrupted data.
+
+Apply the same SWAP in the tiling function so tile dimensions match what the
+hardware is programmed with.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
+index 642a95ee1f4..42b58f78498 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
+@@ -120,6 +120,10 @@ etna_ml_calculate_tiling_v8(struct etna_ml_device *device, const struct etna_ope
+       etna_ml_calc_addition_sizes(&input_width, &input_height, &input_channels,
+                                  &output_width, &output_height, &output_channels);
+ 
++   /* Match the SWAP(output_width, output_height) done in create_nn_config() */
++   if (!operation->fully_connected)
++      SWAP(output_width, output_height);
++
+    if (operation->pooling_first_pixel) {
+       output_width *= 2;
+       output_height *= 2;
+-- 
+2.55.0
+

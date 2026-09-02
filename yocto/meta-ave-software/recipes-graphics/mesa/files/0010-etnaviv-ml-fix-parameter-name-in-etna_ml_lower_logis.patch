@@ -1,0 +1,88 @@
+From 079f3cdde9b76e4201df6f5bd2c2e230298a07de Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Tue, 26 May 2026 14:48:45 +0200
+Subject: [PATCH 10/37] etnaviv/ml: fix parameter name in
+ etna_ml_lower_logistic()
+
+Rename the 'abs' parameter to etna_ml_lower_logistic() to 'log',
+to avoid confusion.
+
+While at it, also rename the 'pad' parameter in the
+etna_ml_lower_absolute() declaration to 'abs', for
+consistency with the function definition.
+
+No functional change.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.c | 22 ++++++++++-----------
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.h |  4 ++--
+ 2 files changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+index 02f8d968ef4..7951b743283 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+@@ -1037,7 +1037,7 @@ etna_ml_lower_absolute(struct etna_ml_subgraph *subgraph,
+ 
+ void
+ etna_ml_lower_logistic(struct etna_ml_subgraph *subgraph,
+-                       const struct pipe_ml_operation *abs,
++                       const struct pipe_ml_operation *log,
+                        struct etna_operation *operation)
+ {
+    operation->type = ETNA_JOB_TYPE_TP;
+@@ -1045,21 +1045,21 @@ etna_ml_lower_logistic(struct etna_ml_subgraph *subgraph,
+    operation->stride = 1;
+ 
+    operation->input_count = 1;
+-   operation->input_width = abs->input_tensors[0]->dims[1];
+-   operation->input_height = abs->input_tensors[0]->dims[2];
+-   operation->input_channels = abs->input_tensors[0]->dims[3];
++   operation->input_width = log->input_tensors[0]->dims[1];
++   operation->input_height = log->input_tensors[0]->dims[2];
++   operation->input_channels = log->input_tensors[0]->dims[3];
+    operation->input_tensor_sizes[0] = operation->input_width *
+                                       operation->input_height *
+                                       operation->input_channels;
+-   operation->input_zero_point = etna_tensor_zero_point(abs->input_tensors[0]);
+-   operation->input_scale = abs->input_tensors[0]->scale;
++   operation->input_zero_point = etna_tensor_zero_point(log->input_tensors[0]);
++   operation->input_scale = log->input_tensors[0]->scale;
+ 
+    operation->output_count = 1;
+-   operation->output_width = abs->output_tensors[0]->dims[1];
+-   operation->output_height = abs->output_tensors[0]->dims[2];
+-   operation->output_channels = abs->output_tensors[0]->dims[3];
+-   operation->output_zero_point = etna_tensor_zero_point(abs->output_tensors[0]);
+-   operation->output_scale = abs->output_tensors[0]->scale;
++   operation->output_width = log->output_tensors[0]->dims[1];
++   operation->output_height = log->output_tensors[0]->dims[2];
++   operation->output_channels = log->output_tensors[0]->dims[3];
++   operation->output_zero_point = etna_tensor_zero_point(log->output_tensors[0]);
++   operation->output_scale = log->output_tensors[0]->scale;
+    operation->output_tensor_sizes[0] = operation->output_width *
+                                        operation->output_height *
+                                        operation->output_channels;
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
+index f75bfd680dd..a5e9610fb8c 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
+@@ -33,12 +33,12 @@ etna_ml_lower_relu(struct etna_ml_subgraph *subgraph,
+ 
+ void
+ etna_ml_lower_absolute(struct etna_ml_subgraph *subgraph,
+-                       const struct pipe_ml_operation *pad,
++                       const struct pipe_ml_operation *abs,
+                        struct etna_operation *operation);
+ 
+ void
+ etna_ml_lower_logistic(struct etna_ml_subgraph *subgraph,
+-                       const struct pipe_ml_operation *pad,
++                       const struct pipe_ml_operation *log,
+                        struct etna_operation *operation);
+ 
+ void
+-- 
+2.55.0
+

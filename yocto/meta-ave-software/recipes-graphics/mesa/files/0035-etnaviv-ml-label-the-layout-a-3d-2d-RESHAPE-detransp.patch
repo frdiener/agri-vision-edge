@@ -1,0 +1,37 @@
+From 9038cf217e06dcade0e55f7b25eb6c7bd4b8c278 Mon Sep 17 00:00:00 2001
+From: Freimut Diener <mail@f-diener.dev>
+Date: Sat, 29 Aug 2026 14:50:13 +0200
+Subject: [PATCH 35/37] etnaviv/ml: label the layout a 3d->2d RESHAPE
+ detransposes into
+
+The RESHAPE lowering detransposes a flattened head into NHWC but never records
+that on its output. The fixup after the switch then fills the layout in from
+operation->input_tensors[0], which for a detranspose is the tensor it converts
+away from, so the result comes out labelled NCHW while its bytes are NHWC.
+
+Nothing reads that label today, but anything reasoning about operand layouts
+has to be able to trust it.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 1202e2a4393..a89e4ffee9d 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -520,6 +520,12 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+             etna_ml_lower_detranspose(subgraph, poperation->input_tensors[0], operation);
+             operation->output_tensors[0] = poperation->output_tensors[0]->index;
+             list_addtail(&operation->link, etna_operations);
++
++            /* The generic fixup below would copy the layout from the tensor
++             * this detransposes, i.e. the one before the conversion. */
++            struct etna_ml_tensor *output = etna_ml_get_tensor(subgraph, operation->output_tensors[0]);
++            output->exp_layout = tensor->exp_layout;
++            output->act_layout = tensor->exp_layout;
+          }
+          else {
+             add_bypass(poperation, input_tensors[0], operation, etna_operations);
+-- 
+2.55.0
+

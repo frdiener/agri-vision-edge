@@ -1,0 +1,96 @@
+From 8b9b34b8ff82a5ccd4c74a83793addfe2993bdb6 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Fri, 28 Feb 2025 15:12:12 +0100
+Subject: [PATCH 06/37] etnaviv/ml: Use NEON for signed input/output tensor
+ copies
+
+Enable via ETNA_NPU_NEON=1, this should (slightly) speed up signed
+input tensor writes and signed output tensor reads.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 40 +++++++++++++++++++++---
+ 1 file changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index b87fda28a5c..7901997d75b 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -904,6 +904,8 @@ close_batch(struct pipe_context *pctx)
+    ctx->dirty = 0;
+ }
+ 
++#include <arm_neon.h>
++
+ void
+ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psubgraph,
+                         unsigned inputs_count, unsigned input_idxs[], void *inputs[],
+@@ -915,6 +917,7 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+    struct etna_ml_subgraph *subgraph = (struct etna_ml_subgraph *)(psubgraph);
+    struct etna_cmd_stream *stream = ctx->stream;
+    static bool is_initialized = false;
++   bool use_neon = getenv("ETNA_NPU_NEON") != NULL;
+ 
+    if (!is_initialized) {
+       init_npu(pctx);
+@@ -944,8 +947,22 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+          uint8_t *dst_map;
+          dst_map = pipe_buffer_map_range(pctx, subgraph->io_rsrc, tensor->offset, tensor->size, PIPE_MAP_WRITE, &dst_transfer);
+          assert(dst_map);
+-         for (unsigned k = 0; k < tensor->size; k++) {
+-            dst_map[k] = src[k] + 128;
++         if (use_neon) {
++            uint8x16_t const_128 = { 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128 };
++            for (unsigned k = 0; k < tensor->size; k += 16) {
++               uint8x16_t val = vld1q_u8(src + k);
++               uint8x16_t dst = vaddq_u8(val, const_128);
++               vst1q_u8(dst_map + k, dst);
++            }
++            if (tensor->size % 16) {
++               for (unsigned k = tensor->size / 16 * 16; k < tensor->size; k++) {
++                  dst_map[k] = src[k] + 128;
++               }
++            }
++         } else {
++            for (unsigned k = 0; k < tensor->size; k++) {
++               dst_map[k] = src[k] + 128;
++            }
+          }
+          pipe_buffer_unmap(pctx, dst_transfer);
+       } else {
+@@ -1048,6 +1065,7 @@ etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgr
+ {
+    struct etna_ml_subgraph *subgraph = (struct etna_ml_subgraph *)(psubgraph);
+    unsigned operation_count = util_dynarray_num_elements(&subgraph->operations, struct etna_vip_instruction);
++   bool use_neon = getenv("ETNA_NPU_NEON") != NULL;
+ 
+    if (operation_count > 0) {
+       if (DBG_ENABLED(ETNA_DBG_ML_MSGS)) {
+@@ -1082,8 +1100,22 @@ etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgr
+                                                      PIPE_MAP_READ,
+                                                      &src_transfer);
+          assert(src_map);
+-         for (unsigned k = 0; k < size; k++) {
+-            ((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;
++         if (use_neon) {
++            uint8x16_t const_128 = { 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128 };
++            for (unsigned k = 0; k < size; k += 16) {
++               uint8x16_t src = vld1q_u8(src_map + k);
++               uint8x16_t dst = vsubq_u8(src, const_128);
++               vst1q_u8(((uint8_t *)outputs[i]) + k, dst);
++            }
++            if (size % 16) {
++               for (unsigned k = size / 16 * 16; k < size; k++) {
++                  ((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;
++               }
++            }
++         } else {
++            for (unsigned k = 0; k < size; k++) {
++               ((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;
++            }
+          }
+          pipe_buffer_unmap(context, src_transfer);
+       } else {
+-- 
+2.55.0
+

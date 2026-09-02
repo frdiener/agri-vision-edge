@@ -1,0 +1,153 @@
+From d4be9d8e2c9cfd24a09cfee48df722fc430f1e9f Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Fri, 29 May 2026 18:43:26 +0200
+Subject: [PATCH 24/37] debug: teflon: allow forcing operations unsupported via
+ env
+
+Add debug environment controls that make selected TFLite operations fail
+compatibility checks at runtime. This helps test graph partitioning and
+fallback paths without editing the model.
+---
+ src/gallium/frontends/teflon/tfl_device.c | 104 ++++++++++++++++++++--
+ 1 file changed, 97 insertions(+), 7 deletions(-)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 93c7bdd7b4b..51efb3d19dd 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -910,6 +910,77 @@ check_op_support(TfLiteDelegate *tf_delegate, TfLiteContext *tf_context, TfLiteN
+    return supported;
+ }
+ 
++struct range {
++    int start;
++    int end;
++};
++
++struct range_list {
++    struct range *ranges;
++    int count;
++};
++
++static struct range_list *parse_range_env(const char *env_name)
++{
++    char *next = getenv(env_name);
++    if (!next)
++        return NULL;
++
++    struct range_list *list = calloc(1, sizeof(*list));
++
++    while (*next) {
++        unsigned long start = strtoul(next, &next, 0);
++        unsigned long end = start;
++
++        if (*next == '-') {
++            next++;
++            end = strtoul(next, &next, 0);
++        }
++
++        if (end < start)
++            end = start;
++
++        list->ranges = realloc(
++            list->ranges,
++            (list->count + 1) * sizeof(*list->ranges));
++
++        list->ranges[list->count++] = (struct range){
++            .start = (int)start,
++            .end = (int)end,
++        };
++
++        if (*next != ',')
++            break;
++
++        next++;
++    }
++
++    return list;
++}
++
++static bool range_contains(const struct range_list *list, int value)
++{
++    if (!list)
++        return false;
++
++    for (int i = 0; i < list->count; i++) {
++        if (value >= list->ranges[i].start &&
++            value <= list->ranges[i].end)
++            return true;
++    }
++
++    return false;
++}
++
++static void free_range_list(struct range_list *list)
++{
++    if (!list)
++        return;
++
++    free(list->ranges);
++    free(list);
++}
++
+ static TfLiteStatus
+ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+ {
+@@ -930,6 +1001,15 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+       teflon_debug("limiting delegate to first %lu nodes in execution plan\n", max_supported);
+    }
+ 
++   struct range_list *unsupported_nodes =
++      parse_range_env("TEFLON_UNSUPPORTED_NODES");
++
++   struct range_list *unsupported_ops =
++      parse_range_env("TEFLON_UNSUPPORTED_OPS");
++
++   teflon_debug("unsupported_nodes=%p\n", unsupported_nodes);
++   teflon_debug("unsupported_ops=%p\n", unsupported_ops);
++
+    teflon_debug("%3s %-15s %3s %-14s %s\n", "idx", "type", "ver", "support", "inputs");
+    teflon_debug("================================================================================================\n");
+ 
+@@ -944,14 +1024,20 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+       TF_LITE_ENSURE_STATUS(tf_context->GetNodeAndRegistration(
+          tf_context, node_index, &node, &registration));
+ 
+-      supported = check_op_support(tf_delegate, tf_context, node, registration);
+-      if (supported)
+-         supported = i < max_supported;
++      if (i < max_supported &&
++         !range_contains(unsupported_nodes, i) &&
++         !range_contains(unsupported_ops, registration->builtin_code))
++      {
++         supported = check_op_support(
++            tf_delegate, tf_context, node, registration);
++      }
+ 
+-      teflon_debug("%3d %-15s v%-2d %-11s in:", node_index,
+-                   tflite_builtin_op_name(registration->builtin_code),
+-                   registration->version,
+-                   supported ? "🟢 supported" : "🔴 unsupported");
++      teflon_debug("%3d op:%3d %-15s v%-2d %-11s in:",
++                  node_index,
++                  registration->builtin_code,
++                  tflite_builtin_op_name(registration->builtin_code),
++                  registration->version,
++                  supported ? "🟢 supported" : "🔴 unsupported");
+       for (int j = 0; j < node->inputs->size; j++) {
+          teflon_debug(" %d(%s)", node->inputs->data[j],
+                       tflite_type_name(tf_context->tensors[node->inputs->data[j]].type));
+@@ -986,6 +1072,10 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+       if (supported)
+          supported_nodes->data[node_count++] = node_index;
+    }
++
++   free_range_list(unsupported_nodes);
++   free_range_list(unsupported_ops);
++
+    supported_nodes->size = node_count;
+ 
+    TfLiteRegistration registration = {};
+-- 
+2.55.0
+

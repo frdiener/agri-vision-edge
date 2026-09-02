@@ -1,0 +1,39 @@
+From 917f0f78929d491a359850f7cc629f3a77d8c272 Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Wed, 10 Jun 2026 13:56:42 +0200
+Subject: [PATCH 25/37] debug: ml: log operation compatibility checks
+
+Print ML compatibility decisions and common rejection reasons from teflon
+and etnaviv. This helps diagnose why operations are delegated to the NPU
+or left on the CPU.
+---
+ src/gallium/frontends/teflon/tfl_device.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 51efb3d19dd..fbd48c033c4 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -878,6 +878,7 @@ fused_relu6_supported(TfLiteTensor *tensor)
+       quantized_max = UINT8_MAX;
+       break;
+    default:
++      teflon_debug("Only INT8 or UINT8 supported\n");
+       return false;
+    }
+ 
+@@ -887,8 +888,10 @@ fused_relu6_supported(TfLiteTensor *tensor)
+    /* Handle per-channel quantization where zero_point->size may be 1 */
+    for (int i = 0; i < affine->scale->size; i++) {
+       int zp_idx = (affine->zero_point->size == 1) ? 0 : i;
+-      if ((quantized_max - affine->zero_point->data[zp_idx]) * affine->scale->data[i] > 6.0f)
++      if ((quantized_max - affine->zero_point->data[zp_idx]) * affine->scale->data[i] > 6.0f) {
++         teflon_debug("Unsupported Scale\n");
+          return false;
++      }
+    }
+    return true;
+ }
+-- 
+2.55.0
+

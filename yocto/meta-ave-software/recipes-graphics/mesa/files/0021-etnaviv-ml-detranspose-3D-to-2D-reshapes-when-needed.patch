@@ -1,0 +1,47 @@
+From 4923cafc8c5f19eb001c2b02a28bae5c2ac9a715 Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Fri, 29 May 2026 11:30:16 +0200
+Subject: [PATCH 21/37] etnaviv/ml: detranspose 3D to 2D reshapes when needed
+
+When a reshape consumes a tensor that is still in NCHW layout and
+produces a non-3D output, insert a detranspose instead of bypassing the
+operation. This keeps flattened outputs in the layout expected by the
+frontend.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 28f6fcb62bd..0a8fd06c67e 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -403,8 +403,25 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+             list_addtail(&operation->link, etna_operations);
+             break;
+          }
+-         case PIPE_ML_OPERATION_TYPE_RESHAPE: {
++      case PIPE_ML_OPERATION_TYPE_RESHAPE: {
++         struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, input_tensors[0]);
++         if (
++             /* # input tensor is NCHW */
++             tensor->act_layout == ETNA_ML_LAYOUT_NCHW &&
++             /* input tensor is 3d */
++             is_3d(poperation->input_tensors[0]) &&
++             /* output tensor is 2d */
++             !is_3d(poperation->output_tensors[0])
++             ){
++            /* add detranspose */
++            etna_ml_lower_detranspose(subgraph, poperation->output_tensors[0], operation);
++            operation->input_tensors[0] = input_tensors[0];
++            operation->output_tensors[0] = poperation->output_tensors[0]->index;
++            list_addtail(&operation->link, etna_operations);
++         }
++         else {
+             add_bypass(poperation, input_tensors[0], operation, etna_operations);
++         }
+             break;
+          }
+          case PIPE_ML_OPERATION_TYPE_RELU: {
+-- 
+2.55.0
+

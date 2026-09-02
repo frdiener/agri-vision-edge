@@ -1,0 +1,222 @@
+From 3b44ef0a15141368ed343005f37e25b414ee744a Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Wed, 17 Jun 2026 16:00:37 +0200
+Subject: [PATCH 28/37] etnaviv/ml: support Leaky ReLU TP operations
+
+Add ETNA_ML_TP_LEAKY_RELU lowering, LUT generation, TP config setup, and
+operation support plumbing. Store the Leaky ReLU alpha value on the
+lowered etnaviv operation so the LUT can apply the requested slope.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c    | 10 +++
+ src/gallium/drivers/etnaviv/etnaviv_ml.h    |  3 +
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.c | 86 ++++++++++++++++++++-
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.h |  5 ++
+ 4 files changed, 102 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 8ccec601f46..fb335aa35c3 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -200,6 +200,7 @@ etna_tp_type_name(enum etna_ml_tp_type type)
+    case ETNA_ML_TP_ABSOLUTE:    return "abs";
+    case ETNA_ML_TP_LOGISTIC:    return "logistic";
+    case ETNA_ML_TP_RELU6:       return "relu6";
++   case ETNA_ML_TP_LEAKY_RELU:  return "leaky_relu";
+    }
+    return "???";
+ }
+@@ -503,6 +504,13 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+             list_addtail(&operation->link, etna_operations);
+             break;
+          }
++         case PIPE_ML_OPERATION_TYPE_LEAKY_RELU: {
++            etna_ml_lower_leaky_relu(subgraph, poperation, operation);
++            operation->input_tensors[0] = input_tensors[0];
++            operation->output_tensors[0] = poperation->output_tensors[0]->index;
++            list_addtail(&operation->link, etna_operations);
++            break;
++         }
+          case PIPE_ML_OPERATION_TYPE_SUBTRACT: {
+             struct etna_operation *operation = calloc(1, sizeof(*operation));
+             etna_ml_lower_add(subgraph, poperation, operation);
+@@ -664,6 +672,7 @@ count_tensors(const struct pipe_ml_operation *poperations,
+       case PIPE_ML_OPERATION_TYPE_ABSOLUTE:
+       case PIPE_ML_OPERATION_TYPE_LOGISTIC:
+       case PIPE_ML_OPERATION_TYPE_RELU6:
++      case PIPE_ML_OPERATION_TYPE_LEAKY_RELU:
+       case PIPE_ML_OPERATION_TYPE_TRANSPOSE:
+          break;
+       default:
+@@ -798,6 +807,7 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+       case PIPE_ML_OPERATION_TYPE_RELU:
+       case PIPE_ML_OPERATION_TYPE_ABSOLUTE:
+       case PIPE_ML_OPERATION_TYPE_LOGISTIC:
++      case PIPE_ML_OPERATION_TYPE_LEAKY_RELU:
+          supported = true;
+          break;
+       default:
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.h b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+index 74793a55845..6d5119637b5 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+@@ -60,6 +60,7 @@ enum etna_ml_tp_type {
+    ETNA_ML_TP_ABSOLUTE,
+    ETNA_ML_TP_LOGISTIC,
+    ETNA_ML_TP_RELU6,
++   ETNA_ML_TP_LEAKY_RELU,
+ };
+ 
+ enum etna_ml_tensor_layout {
+@@ -174,6 +175,8 @@ struct etna_operation {
+    unsigned pad_after_y;
+    unsigned pad_before_z;
+    unsigned pad_after_z;
++
++   float leaky_relu_alpha;
+ };
+ 
+ struct etna_idx_replacement {
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+index 7951b743283..51fd9b51439 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+@@ -806,7 +806,8 @@ create_pwl_lut_config(struct etna_ml_subgraph *subgraph, const struct etna_opera
+    uint32_t scale;
+ 
+    if (operation->tp_type == ETNA_ML_TP_LOGISTIC ||
+-       operation->tp_type == ETNA_ML_TP_RELU6)
++       operation->tp_type == ETNA_ML_TP_RELU6 ||
++       operation->tp_type == ETNA_ML_TP_LEAKY_RELU)
+       scale = fui(1.0 / operation->output_scale);
+    else
+       scale = fui(operation->input_scale / operation->output_scale);
+@@ -1095,6 +1096,38 @@ etna_ml_lower_relu6(struct etna_ml_subgraph *subgraph,
+                                        operation->output_channels;
+ }
+ 
++void
++etna_ml_lower_leaky_relu(struct etna_ml_subgraph *subgraph,
++                         const struct pipe_ml_operation *leaky_relu,
++                         struct etna_operation *operation)
++{
++   operation->type = ETNA_JOB_TYPE_TP;
++   operation->tp_type = ETNA_ML_TP_LEAKY_RELU;
++   operation->stride = 1;
++
++   operation->input_count = 1;
++   operation->input_width = leaky_relu->input_tensors[0]->dims[1];
++   operation->input_height = leaky_relu->input_tensors[0]->dims[2];
++   operation->input_channels = leaky_relu->input_tensors[0]->dims[3];
++   operation->input_tensor_sizes[0] = operation->input_width *
++                                      operation->input_height *
++                                      operation->input_channels;
++   operation->input_zero_point = etna_tensor_zero_point(leaky_relu->input_tensors[0]);
++   operation->input_scale = leaky_relu->input_tensors[0]->scale;
++
++   operation->output_count = 1;
++   operation->output_width = leaky_relu->output_tensors[0]->dims[1];
++   operation->output_height = leaky_relu->output_tensors[0]->dims[2];
++   operation->output_channels = leaky_relu->output_tensors[0]->dims[3];
++   operation->output_zero_point = etna_tensor_zero_point(leaky_relu->output_tensors[0]);
++   operation->output_scale = leaky_relu->output_tensors[0]->scale;
++   operation->output_tensor_sizes[0] = operation->output_width *
++                                       operation->output_height *
++                                       operation->output_channels;
++
++   operation->leaky_relu_alpha = leaky_relu->leakyrelu.alpha;
++}
++
+ static void *
+ create_relu_lut(struct etna_ml_subgraph *subgraph,
+                const struct etna_operation *operation,
+@@ -1311,6 +1344,39 @@ create_relu6_lut(struct etna_ml_subgraph *subgraph,
+    return map;
+ }
+ 
++static void *
++create_leaky_relu_lut(struct etna_ml_subgraph *subgraph,
++                      const struct etna_operation *operation,
++                      unsigned *out_size)
++{
++   unsigned lut_table_len = 1024;
++   *out_size = lut_table_len * sizeof(uint32_t);
++   uint32_t *map = calloc(lut_table_len, sizeof(uint32_t));
++   unsigned pos = 0;
++
++   /* Positive half: identity (same real-value encoding as relu6) */
++   for (int i = 0; i < 16; i++)
++      map[pos++] = fp21(0.0f);
++
++   for (int cur_val = 0x8000; cur_val < 0xf8000; cur_val += 0x800)
++      map[pos++] = fp21(fp32(cur_val) * operation->input_scale);
++
++   for (int i = 0; i < 16; i++)
++      map[pos++] = fp21(fp32(0xf7fff) * operation->input_scale);
++
++   /* Negative half: alpha * input (output is negative for alpha < 1, input < 0) */
++   for (int i = 0; i < 16; i++)
++      map[pos++] = fp21(0.0f);
++
++   for (int cur_val = 0x8000; cur_val < 0xf8000; cur_val += 0x800)
++      map[pos++] = fp21(-operation->leaky_relu_alpha * fp32(cur_val) * operation->input_scale);
++
++   for (int i = 0; i < 16; i++)
++      map[pos++] = fp21(-operation->leaky_relu_alpha * fp32(0xf7fff) * operation->input_scale);
++
++   return map;
++}
++
+ void
+ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+                              const struct etna_operation *operation,
+@@ -1422,6 +1488,21 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+       num_configs = tp_cores_used;
+       break;
+    }
++   case ETNA_ML_TP_LEAKY_RELU: {
++      unsigned tp_cores_used = etna_ml_dev(subgraph)->info->npu.tp_core_count;
++
++      if (operation->input_width < 6)
++         tp_cores_used = 1;
++
++      ML_DBG("leaky_relu: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
++      instruction->pwl_lut_data = create_leaky_relu_lut(subgraph, operation, &instruction->pwl_lut_size);
++      for (unsigned i = 0; i < tp_cores_used; i++) {
++         instruction->config_data[i] = create_pwl_lut_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_sizes[i] = sizeof(struct etna_tp_params);
++      }
++      num_configs = tp_cores_used;
++      break;
++   }
+    }
+    instruction->type = ETNA_JOB_TYPE_TP;
+    instruction->tp_type = operation->tp_type;
+@@ -1485,7 +1566,8 @@ etna_ml_emit_operation_tp(struct pipe_context *pctx,
+       if (more_than_one_tp_job &&
+           (operation->tp_type == ETNA_ML_TP_PAD ||
+            operation->tp_type == ETNA_ML_TP_RELU ||
+-           operation->tp_type == ETNA_ML_TP_ABSOLUTE)) {
++           operation->tp_type == ETNA_ML_TP_ABSOLUTE ||
++           operation->tp_type == ETNA_ML_TP_LEAKY_RELU)) {
+          etna_set_state(stream, VIVS_GL_UNK03950, j < tp_core_count - 1 ? 0x8 : 0x0);
+       } else {
+          etna_set_state(stream, VIVS_GL_UNK03950, 0x0);
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
+index a5e9610fb8c..e0ee192aa26 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.h
+@@ -46,6 +46,11 @@ etna_ml_lower_relu6(struct etna_ml_subgraph *subgraph,
+                     const struct pipe_ml_operation *relu6,
+                     struct etna_operation *operation);
+ 
++void
++etna_ml_lower_leaky_relu(struct etna_ml_subgraph *subgraph,
++                         const struct pipe_ml_operation *leaky_relu,
++                         struct etna_operation *operation);
++
+ void
+ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+                              const struct etna_operation *operation,
+-- 
+2.55.0
+

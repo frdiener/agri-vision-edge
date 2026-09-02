@@ -1,0 +1,57 @@
+From f874166cc739753d5be6837c6064177fa5765bc4 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Tue, 26 May 2026 16:18:12 +0200
+Subject: [PATCH 15/37] debug: etnaviv/ml: report op unsupport reason
+
+ETNA_MESA_DEBUG=ml_msgs
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 25 ++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 3720424b184..a688e795a17 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -631,6 +631,26 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+               operation->input_tensors[0]->dims[3] == 1) &&
+              operation->output_tensors[0]->dims[3] <= max_channels) {
+             supported = true;
++         } else {
++            if (!tensor_quantization_supported(input_tensor) ||
++                !tensor_quantization_supported(weight_tensor) ||
++                !tensor_quantization_supported(bias_tensor) ||
++                !tensor_quantization_supported(output_tensor)) {
++               ML_DBG("tensor quantization not supported\n");
++            }
++            if (operation->conv.dilation_width_factor != 1 ||
++                operation->conv.dilation_height_factor != 1) {
++               ML_DBG("dilation not supported\n");
++            }
++	    if (!(!operation->conv.depthwise ||
++                  depth_multiplier == 1 ||
++                  operation->input_tensors[0]->dims[3] == 1)) {
++               ML_DBG("depthwise params not supported\n");
++            }
++            if (operation->output_tensors[0]->dims[3] > max_channels) {
++               ML_DBG("%lu channels not supported (max %lu)\n",
++                      operation->output_tensors[0]->dims[3], max_channels);
++            }
+          }
+          break;
+       }
+@@ -644,9 +664,10 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+          supported = true;
+ 
+          if (operation->conc.axis != 3 &&
+-             operation->conc.axis != -1)
++             operation->conc.axis != -1) {
++            ML_DBG("concatenation not supported: axis %d\n", operation->conc.axis);
+             supported = false;
+-
++         }
+          break;
+       }
+       case PIPE_ML_OPERATION_TYPE_SPLIT: {
+-- 
+2.55.0
+

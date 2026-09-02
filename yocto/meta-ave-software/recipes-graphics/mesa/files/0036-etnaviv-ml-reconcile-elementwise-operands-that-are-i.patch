@@ -1,0 +1,118 @@
+From 86ceff9f587ad8c1da688706d8f193dc1a630f3a Mon Sep 17 00:00:00 2001
+From: Freimut Diener <mail@f-diener.dev>
+Date: Sat, 29 Aug 2026 17:05:07 +0200
+Subject: [PATCH 36/37] etnaviv/ml: reconcile elementwise operands that are in
+ different layouts
+
+etna_ml_lower_add() stacks its two operands and sums them offset by offset, so
+it doesn't care which layout they are in as long as both are in the same one.
+Nothing ensures that. Operands are only ever converted towards a layout the
+operation demands, and an elementwise operation demands none.
+
+An FPN upsample pairs a RESIZE with a lateral connection, and RESIZE does
+require NCHW: create_resize_config() reads its input at c*(W*H) + y*W + x, one
+channel plane at a time. So with per-channel weights, where every convolution
+falls back to the CPU and each RESIZE and ADD is delegated as a two-op island,
+the resized operand arrives in NCHW and the lateral one in NHWC straight from
+the frontend, and the add pairs unrelated elements. Per-tensor weights hide it
+because both operands then come from delegated convolutions and are both NCHW.
+
+Ask for NHWC when the operands disagree, and for nothing when they agree, so
+matching operands are left alone whatever they match in. Settle the operand
+layouts in a first pass, as this is the first decision that depends on more
+than one of them.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 55 ++++++++++++++++++++----
+ 1 file changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index a89e4ffee9d..b37712eefa2 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -325,6 +325,30 @@ concatenation_needs_nchw(const struct pipe_tensor *tensor, int axis)
+    return padded_axis(tensor, axis) == 3;
+ }
+ 
++/*
++ * An elementwise operation pairs its operands offset by offset, so it doesn't
++ * care which layout they are in, only that both are in the same one. Ask for a
++ * layout just when they disagree, so that operands that already match are left
++ * alone whatever they match in.
++ */
++static enum etna_ml_tensor_layout
++elementwise_layout(struct etna_ml_subgraph *subgraph,
++                   const struct pipe_ml_operation *poperation)
++{
++   struct etna_ml_tensor *a, *b;
++
++   if (poperation->input_count != 2)
++      return ETNA_ML_LAYOUT_ANY;
++
++   a = etna_ml_get_tensor(subgraph, poperation->input_tensors[0]->index);
++   b = etna_ml_get_tensor(subgraph, poperation->input_tensors[1]->index);
++
++   if (a->act_layout == b->act_layout)
++      return ETNA_ML_LAYOUT_ANY;
++
++   return ETNA_ML_LAYOUT_NHWC;
++}
++
+ /** Tensor layout inference:
+   * - Graph inputs are in NHWC order.
+   * - Graph outputs are expected in NHWC order.
+@@ -357,6 +381,18 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+       assert(poperation->input_count <= MAX_TENSORS);
+       unsigned input_tensors[MAX_TENSORS] = {};
+ 
++      /* Settle every operand first: what one of them needs can depend on what
++       * the others are already in. */
++      for (int i = 0; i < poperation->input_count; i++) {
++         struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, poperation->input_tensors[i]->index);
++
++         if (!etna_ml_find_producer(poperations, count, poperation->input_tensors[i]->index)) {
++            /* In TensorFlow Lite, graph inputs are in channel-last */
++            tensor->act_layout = ETNA_ML_LAYOUT_NHWC;
++            tensor->exp_layout = ETNA_ML_LAYOUT_NHWC;
++         }
++      }
++
+       for (int i = 0; i < poperation->input_count; i++) {
+          struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, poperation->input_tensors[i]->index);
+          enum etna_ml_tensor_layout operation_layout = ETNA_ML_LAYOUT_ANY;
+@@ -369,12 +405,9 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+                   concatenation_needs_nchw(poperation->output_tensors[0],
+                                            poperation->conc.axis))
+             operation_layout = ETNA_ML_LAYOUT_NCHW;
+-
+-         if (!etna_ml_find_producer(poperations, count, poperation->input_tensors[i]->index)) {
+-            /* In TensorFlow Lite, graph inputs are in channel-last */
+-            tensor->act_layout = ETNA_ML_LAYOUT_NHWC;
+-            tensor->exp_layout = ETNA_ML_LAYOUT_NHWC;
+-         }
++         else if (poperation->type == PIPE_ML_OPERATION_TYPE_ADD ||
++                  poperation->type == PIPE_ML_OPERATION_TYPE_SUBTRACT)
++            operation_layout = elementwise_layout(subgraph, poperation);
+ 
+          input_tensors[i] = poperation->input_tensors[i]->index;
+ 
+@@ -383,9 +416,15 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+ 
+          if (operation_layout != ETNA_ML_LAYOUT_ANY &&
+              tensor->act_layout != operation_layout) {
+-            ML_DBG("Adding transpose %s -> %s.\n", layout[tensor->act_layout], layout[operation_layout]);
++            bool to_nchw = operation_layout == ETNA_ML_LAYOUT_NCHW;
++
++            ML_DBG("Adding %s %s -> %s.\n", to_nchw ? "transpose" : "detranspose",
++                   layout[tensor->act_layout], layout[operation_layout]);
+             struct etna_operation *transpose = calloc(1, sizeof(*transpose));
+-            etna_ml_lower_transpose(subgraph, poperation->input_tensors[i], transpose);
++            if (to_nchw)
++               etna_ml_lower_transpose(subgraph, poperation->input_tensors[i], transpose);
++            else
++               etna_ml_lower_detranspose(subgraph, poperation->input_tensors[i], transpose);
+             transpose->input_tensors[0] = input_tensors[i];
+             transpose->output_tensors[0] = etna_ml_allocate_tensor(subgraph);
+             input_tensors[i] = transpose->output_tensors[0];
+-- 
+2.55.0
+

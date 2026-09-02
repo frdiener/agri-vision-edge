@@ -1,0 +1,50 @@
+From 30273f085fe8af3beee2ff1693c866663a758b2a Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Wed, 20 May 2026 15:59:24 +0200
+Subject: [PATCH 07/37] teflon: Support standalone ReLU6 activation
+
+Add support for kTfLiteBuiltinRelu6 operations.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/frontends/teflon/tfl_device.c | 4 ++++
+ src/gallium/include/pipe/p_state.h        | 1 +
+ 2 files changed, 5 insertions(+)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 8cfb573abde..3cf16a21776 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -273,6 +273,8 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
+       break;
+    case kTfLiteBuiltinHardSwish:
+       operation->type = PIPE_ML_OPERATION_TYPE_HSWISH;
++   case kTfLiteBuiltinRelu6:
++      operation->type = PIPE_ML_OPERATION_TYPE_RELU6;
+       break;
+    case kTfLiteBuiltinSub:
+       operation->type = PIPE_ML_OPERATION_TYPE_SUBTRACT;
+@@ -508,6 +510,8 @@ dump_graph(struct pipe_tensor *tensors, unsigned tensor_count, struct pipe_ml_op
+          break;
+       case PIPE_ML_OPERATION_TYPE_HSWISH:
+          teflon_debug("%-15s ", "HSWISH");
++      case PIPE_ML_OPERATION_TYPE_RELU6:
++         teflon_debug("%-15s ", "RELU6");
+          break;
+       case PIPE_ML_OPERATION_TYPE_SUBTRACT:
+          teflon_debug("%-15s ", "SUB");
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+index 3f7734bc68d..0ae00006597 100644
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -1073,6 +1073,7 @@ enum pipe_ml_operation_type {
+    PIPE_ML_OPERATION_TYPE_QUANTIZE,
+    PIPE_ML_OPERATION_TYPE_MAXIMUM,
+    PIPE_ML_OPERATION_TYPE_MINIMUM,
++   PIPE_ML_OPERATION_TYPE_RELU6,
+ };
+ 
+ enum pipe_ml_pooling_type {
+-- 
+2.55.0
+

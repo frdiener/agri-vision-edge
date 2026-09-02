@@ -1,0 +1,1059 @@
+From 3221f5555a1702d53902843f451d7f6d210e9240 Mon Sep 17 00:00:00 2001
+From: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Date: Wed, 25 Mar 2026 13:28:48 +0100
+Subject: [PATCH 02/37] etnaviv/ml: use heap allocations during compilation,
+ defer BO creation to submission
+
+Stop allocating kernel driver buffer objects (etna_bo, pipe_resource) during
+subgraph compilation. Instead, all data produced during compilation is stored
+in plain heap memory (calloc/malloc/free).
+
+A new prepare_submission() function, called lazily from
+etna_ml_subgraph_invoke on the first invocation, creates the actual BOs and
+uploads the heap data. A relocation mechanism tracks which words in config
+data contain GPU addresses that need patching at submission time.
+
+This follows the same pattern used by the ethosu driver, where
+ethosu_ml_subgraph_create only allocates heap memory and
+prepare_for_submission() creates the DRM/pipe resources at invoke time.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c      | 144 ++++++++---
+ src/gallium/drivers/etnaviv/etnaviv_ml.h      |  38 ++-
+ src/gallium/drivers/etnaviv/etnaviv_ml_nn.c   |  63 +++--
+ src/gallium/drivers/etnaviv/etnaviv_ml_nn.h   |   8 +-
+ .../drivers/etnaviv/etnaviv_ml_nn_v7.c        |  13 +-
+ .../drivers/etnaviv/etnaviv_ml_nn_v8.c        |  25 +-
+ src/gallium/drivers/etnaviv/etnaviv_ml_tp.c   | 230 ++++++++----------
+ 7 files changed, 308 insertions(+), 213 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index cc248e772b1..b14f0faa615 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -103,16 +103,6 @@ etna_ml_create_bo(struct etna_screen *screen, size_t size)
+    return bo;
+ }
+ 
+-struct pipe_resource *
+-etna_ml_create_resource(struct pipe_screen *pscreen, size_t size)
+-{
+-   struct pipe_resource *res = pipe_buffer_create(pscreen, 0, PIPE_USAGE_DEFAULT, size);
+-   void *ptr = etna_bo_map(etna_buffer_resource(res)->bo);
+-   memset(ptr, 0, pipe_buffer_size(res));
+-
+-   return res;
+-}
+-
+ struct etna_core_npu_info *
+ etna_ml_get_core_info(struct etna_screen *screen)
+ {
+@@ -733,10 +723,6 @@ etna_ml_subgraph_create(struct pipe_ml_device *pdevice,
+ 
+    lower_operations(subgraph, poperations, count, &operations);
+ 
+-   /* Create the single arena resource for all tensors */
+-   if (subgraph->io_used > 0)
+-      subgraph->io_rsrc = etna_ml_create_resource(&subgraph->screen->base, subgraph->io_used);
+-
+    list_for_each_entry(struct etna_operation, operation, &operations, link) {
+       struct etna_vip_instruction instruction = {0};
+ 
+@@ -765,6 +751,94 @@ etna_ml_subgraph_create(struct pipe_ml_device *pdevice,
+    return &subgraph->base;
+ }
+ 
++static void
++etna_ml_apply_relocations(struct etna_ml_subgraph *subgraph,
++                          struct etna_vip_instruction *instr)
++{
++   struct etna_bo *io_bo = etna_buffer_resource(subgraph->io_rsrc)->bo;
++
++   util_dynarray_foreach(&instr->relocations, struct etna_ml_relocation, reloc) {
++      uint32_t *config_words = (uint32_t *)instr->config_data[reloc->config_idx];
++      uint32_t new_addr;
++
++      switch (reloc->type) {
++      case ETNA_ML_RELOC_INPUT:
++      case ETNA_ML_RELOC_OUTPUT:
++         new_addr = etna_bo_gpu_va(io_bo) + reloc->addend;
++         break;
++      case ETNA_ML_RELOC_COEFFICIENTS:
++         new_addr = etna_bo_gpu_va(instr->coefficients) + reloc->addend;
++         break;
++      case ETNA_ML_RELOC_PWL_LUT:
++         new_addr = etna_bo_gpu_va(instr->pwl_lut) + reloc->addend;
++         break;
++      default:
++         UNREACHABLE("Unknown relocation type");
++         return;
++      }
++
++      new_addr >>= reloc->shift;
++
++      if (reloc->mask_bits == 32)
++         config_words[reloc->word_offset] = new_addr;
++      else {
++         uint32_t mask = (1u << reloc->mask_bits) - 1;
++         config_words[reloc->word_offset] =
++            (config_words[reloc->word_offset] & ~mask) | (new_addr & mask);
++      }
++   }
++}
++
++static void
++prepare_submission(struct etna_ml_subgraph *subgraph)
++{
++   struct pipe_screen *pscreen = &subgraph->screen->base;
++
++   /* Create the IO arena resource */
++   subgraph->io_rsrc = pipe_buffer_create(pscreen, 0, PIPE_USAGE_DEFAULT, subgraph->io_used);
++   void *ptr = etna_bo_map(etna_buffer_resource(subgraph->io_rsrc)->bo);
++   memset(ptr, 0, pipe_buffer_size(subgraph->io_rsrc));
++
++   /* Upload per-instruction data to BOs and apply relocations */
++   util_dynarray_foreach(&subgraph->operations, struct etna_vip_instruction, instr) {
++      /* Upload coefficients to BO */
++      if (instr->coefficients_data) {
++         instr->coefficients = etna_ml_create_bo(subgraph->screen, instr->coefficients_size);
++         etna_bo_cpu_prep(instr->coefficients, DRM_ETNA_PREP_WRITE);
++         memcpy(etna_bo_map(instr->coefficients), instr->coefficients_data, instr->coefficients_size);
++         etna_bo_cpu_fini(instr->coefficients);
++      }
++
++      /* Upload PWL LUT to BO */
++      if (instr->pwl_lut_data) {
++         instr->pwl_lut = etna_ml_create_bo(subgraph->screen, instr->pwl_lut_size);
++         etna_bo_cpu_prep(instr->pwl_lut, DRM_ETNA_PREP_WRITE);
++         memcpy(etna_bo_map(instr->pwl_lut), instr->pwl_lut_data, instr->pwl_lut_size);
++         etna_bo_cpu_fini(instr->pwl_lut);
++      }
++
++      /* Apply relocations: patch config data with actual GPU addresses */
++      etna_ml_apply_relocations(subgraph, instr);
++
++      /* Upload config data to BOs */
++      for (unsigned j = 0; j < MAX_CONFIG_BOS && instr->config_data[j]; j++) {
++         instr->configs[j] = etna_ml_create_bo(subgraph->screen, instr->config_sizes[j]);
++         etna_bo_cpu_prep(instr->configs[j], DRM_ETNA_PREP_WRITE);
++         memcpy(etna_bo_map(instr->configs[j]), instr->config_data[j], instr->config_sizes[j]);
++         etna_bo_cpu_fini(instr->configs[j]);
++      }
++
++      /* Free heap copies */
++      for (unsigned j = 0; j < MAX_CONFIG_BOS; j++)
++         free(instr->config_data[j]);
++      free(instr->coefficients_data);
++      free(instr->pwl_lut_data);
++      instr->coefficients_data = NULL;
++      instr->pwl_lut_data = NULL;
++      memset(instr->config_data, 0, sizeof(instr->config_data));
++   }
++}
++
+ static void
+ dump_buffer(const uint8_t *ptr, char *name, int operation_nr, int suboperation_nr, int offset, unsigned size)
+ {
+@@ -854,6 +928,9 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+       is_initialized = true;
+    }
+ 
++   if (subgraph->io_rsrc == NULL)
++      prepare_submission(subgraph);
++
+    if (!DBG_ENABLED(ETNA_DBG_NPU_NO_BATCHING)) {
+       /* These zeroes match the blob's cmdstream. They are here to make diff'ing easier.*/
+       etna_cmd_stream_emit(stream, 0x0);
+@@ -888,8 +965,8 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+ 
+       if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS)) {
+          struct pipe_transfer *transfer = NULL;
+-         pipe_buffer_map(pctx, operation->input, PIPE_MAP_READ, &transfer);
+-         dump_bo(etna_buffer_resource(operation->input)->bo, "input", i, 0, operation->input_offset, 0);
++         pipe_buffer_map(pctx, subgraph->io_rsrc, PIPE_MAP_READ, &transfer);
++         dump_bo(etna_buffer_resource(subgraph->io_rsrc)->bo, "input", i, 0, operation->input_offset, 0);
+          pipe_buffer_unmap(pctx, transfer);
+ 
+          switch (operation->type) {
+@@ -927,8 +1004,8 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+          etna_cmd_stream_ref_bo(stream, operation->coefficients, ETNA_RELOC_READ);
+       if (operation->pwl_lut)
+          etna_cmd_stream_ref_bo(stream, operation->pwl_lut, ETNA_RELOC_READ);
+-      etna_cmd_stream_ref_bo(stream, etna_buffer_resource(operation->input)->bo, ETNA_RELOC_READ);
+-      etna_cmd_stream_ref_bo(stream, etna_buffer_resource(operation->output)->bo, ETNA_RELOC_WRITE);
++      etna_cmd_stream_ref_bo(stream, etna_buffer_resource(subgraph->io_rsrc)->bo, ETNA_RELOC_READ);
++      etna_cmd_stream_ref_bo(stream, etna_buffer_resource(subgraph->io_rsrc)->bo, ETNA_RELOC_WRITE);
+ 
+       switch (operation->type) {
+          case ETNA_JOB_TYPE_TP:
+@@ -953,8 +1030,8 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
+          if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS)) {
+             struct pipe_transfer *transfer = NULL;
+ 
+-            pipe_buffer_map(pctx, operation->output, PIPE_MAP_READ, &transfer);
+-            dump_bo(etna_buffer_resource(operation->output)->bo, "output", i, 0, operation->output_offset, 0);
++            pipe_buffer_map(pctx, subgraph->io_rsrc, PIPE_MAP_READ, &transfer);
++            dump_bo(etna_buffer_resource(subgraph->io_rsrc)->bo, "output", i, 0, operation->output_offset, 0);
+             pipe_buffer_unmap(pctx, transfer);
+          }
+ 
+@@ -978,13 +1055,8 @@ etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgr
+ {
+    struct etna_ml_subgraph *subgraph = (struct etna_ml_subgraph *)(psubgraph);
+    unsigned operation_count = util_dynarray_num_elements(&subgraph->operations, struct etna_vip_instruction);
+-   struct etna_vip_instruction *last_operation;
+ 
+    if (operation_count > 0) {
+-      last_operation = util_dynarray_element(&subgraph->operations,
+-                                             struct etna_vip_instruction,
+-                                             operation_count - 1);
+-
+       if (DBG_ENABLED(ETNA_DBG_ML_MSGS)) {
+          long start, end;
+          struct timespec time;
+@@ -995,7 +1067,7 @@ etna_ml_subgraph_read_outputs(struct pipe_context *context, struct pipe_ml_subgr
+          context->flush(context, NULL, 0);
+ 
+          struct pipe_transfer *transfer = NULL;
+-         pipe_buffer_map(context, last_operation->output, PIPE_MAP_READ, &transfer);
++         pipe_buffer_map(context, subgraph->io_rsrc, PIPE_MAP_READ, &transfer);
+          pipe_buffer_unmap(context, transfer);
+ 
+          clock_gettime(CLOCK_MONOTONIC, &time);
+@@ -1033,12 +1105,20 @@ etna_ml_subgraph_destroy(struct pipe_ml_device *pdevice, struct pipe_ml_subgraph
+    struct etna_ml_subgraph *subgraph = (struct etna_ml_subgraph *)(psubgraph);
+ 
+    util_dynarray_foreach(&subgraph->operations, struct etna_vip_instruction, operation) {
+-      for (unsigned j = 0; j < MAX_CONFIG_BOS && operation->configs[j]; j++)
+-         etna_bo_del(operation->configs[j]);
+-      etna_bo_del(operation->coefficients);
+-      etna_bo_del(operation->pwl_lut);
+-      pipe_resource_reference(&operation->input, NULL);
+-      pipe_resource_reference(&operation->output, NULL);
++      if (subgraph->io_rsrc) {
++         /* BOs were created by prepare_submission */
++         for (unsigned j = 0; j < MAX_CONFIG_BOS && operation->configs[j]; j++)
++            etna_bo_del(operation->configs[j]);
++         etna_bo_del(operation->coefficients);
++         etna_bo_del(operation->pwl_lut);
++      } else {
++         /* Still in heap-only state */
++         for (unsigned j = 0; j < MAX_CONFIG_BOS; j++)
++            free(operation->config_data[j]);
++         free(operation->coefficients_data);
++         free(operation->pwl_lut_data);
++      }
++      util_dynarray_fini(&operation->relocations);
+    }
+    util_dynarray_fini(&subgraph->operations);
+ 
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.h b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+index de6b543734f..51486d2af43 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.h
+@@ -11,6 +11,22 @@
+ #include "util/macros.h"
+ #include "etnaviv_context.h"
+ 
++enum etna_ml_reloc_type {
++   ETNA_ML_RELOC_INPUT,
++   ETNA_ML_RELOC_OUTPUT,
++   ETNA_ML_RELOC_COEFFICIENTS,
++   ETNA_ML_RELOC_PWL_LUT,
++};
++
++struct etna_ml_relocation {
++   uint16_t config_idx;
++   uint16_t word_offset;
++   uint8_t type;       /* enum etna_ml_reloc_type */
++   uint8_t shift;
++   uint8_t mask_bits;
++   uint32_t addend;
++};
++
+ #define MAX_CONFIG_BOS 4
+ 
+ struct etna_ml_device {
+@@ -71,15 +87,23 @@ struct etna_vip_instruction {
+    enum etna_job_type type;
+    enum etna_ml_tp_type tp_type;
+ 
+-   struct etna_bo *configs[MAX_CONFIG_BOS];
+-   struct etna_bo *coefficients;
+-   struct etna_bo *pwl_lut;
+-   struct pipe_resource *input;
++   /* Heap buffers populated during compilation */
++   uint8_t *config_data[MAX_CONFIG_BOS];
++   uint32_t config_sizes[MAX_CONFIG_BOS];
++   uint8_t *coefficients_data;
++   uint32_t coefficients_size;
++   uint8_t *pwl_lut_data;
++   uint32_t pwl_lut_size;
++
+    unsigned input_offset;
+-   struct pipe_resource *output;
+    unsigned output_offset;
+ 
+-   struct etna_bo *kernel;
++   struct util_dynarray relocations; /* struct etna_ml_relocation */
++
++   /* BOs populated by prepare_submission(), NULL until then */
++   struct etna_bo *configs[MAX_CONFIG_BOS];
++   struct etna_bo *coefficients;
++   struct etna_bo *pwl_lut;
+ };
+ 
+ #define MAX_TENSORS 10
+@@ -156,8 +180,6 @@ unsigned etna_ml_get_size(struct etna_ml_subgraph *subgraph, unsigned idx);
+ 
+ struct etna_bo *etna_ml_create_bo(struct etna_screen *screen, size_t size);
+ 
+-struct pipe_resource *etna_ml_create_resource(struct pipe_screen *pscreen, size_t size);
+-
+ struct etna_core_npu_info *etna_ml_get_core_info(struct etna_screen *screen);
+ 
+ bool
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+index 589552ceb58..2934995c1e2 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+@@ -986,14 +986,14 @@ etna_ml_calculate_tiling(struct etna_screen *screen, const struct etna_operation
+       return etna_ml_calculate_tiling_v8(screen, operation, tile_width_out, tile_height_out);
+ }
+ 
+-static struct etna_bo *
+-create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, struct etna_bo *coefficients, unsigned coef_cache_size)
++static void *
++create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned coef_cache_size)
+ {
+    struct etna_screen *screen = subgraph->screen;
+    unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
+    unsigned nn_core_version = screen->specs.nn_core_version;
+    unsigned oc_sram_size = etna_ml_get_core_info(screen)->on_chip_sram_size;
+-   struct etna_bo *bo = etna_ml_create_bo(screen, sizeof(struct etna_nn_params));
++   struct etna_nn_params *map = calloc(1, sizeof(struct etna_nn_params));
+    unsigned input_width = operation->input_width;
+    unsigned input_height = operation->input_height;
+    unsigned input_channels = operation->input_channels;
+@@ -1028,9 +1028,6 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+       SWAP(output_width, output_height);
+    }
+ 
+-   etna_bo_cpu_prep(bo, DRM_ETNA_PREP_WRITE);
+-
+-   struct etna_nn_params *map = etna_bo_map(bo);
+    map->layer_type = 0x0;
+    map->no_z_offset = nn_core_version == 8;
+    map->prelu = 0x0;
+@@ -1072,9 +1069,8 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+    map->further7 = 0x0;
+    map->further8 = 0x0;
+ 
+-   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+-   map->in_image_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
++   map->in_image_address = offset;
+    map->in_image_x_size = input_width;
+    map->in_image_y_size = input_height;
+    map->in_image_x_stride = input_width;
+@@ -1122,9 +1118,8 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+       }
+    }
+ 
+-   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+-   map->out_image_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
++   map->out_image_address = offset;
+    map->out_image_x_size = output_width;
+    map->out_image_y_size = output_height;
+    map->out_image_z_size = output_channels;
+@@ -1154,7 +1149,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+    map->out_image_tile_x_size = tile_x;
+    map->out_image_tile_y_size = tile_y;
+ 
+-   map->kernel_address = etna_bo_gpu_va(coefficients) >> 6;
++   map->kernel_address = 0;
+    map->kernel_xy_size = weight_width;
+    map->kernel_y_size = weight_height;
+    map->kernel_z_size = input_channels;
+@@ -1273,9 +1268,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+ 
+    map->per_channel_post_mul = 0x0;
+ 
+-   etna_bo_cpu_fini(bo);
+-
+-   return bo;
++   return map;
+ }
+ 
+ void
+@@ -1288,21 +1281,41 @@ etna_ml_compile_operation_nn(struct etna_ml_subgraph *subgraph, const struct etn
+    instruction->type = ETNA_JOB_TYPE_NN;
+ 
+    if (nn_core_version == 7)
+-      instruction->coefficients = etna_ml_create_coeffs_v7(subgraph, operation, &coef_cache_size);
++      instruction->coefficients_data = etna_ml_create_coeffs_v7(subgraph, operation, &coef_cache_size, &instruction->coefficients_size);
+    else
+-      instruction->coefficients = etna_ml_create_coeffs_v8(subgraph, operation, &coef_cache_size);
+-
+-   struct pipe_resource *input = subgraph->io_rsrc;
+-   assert(input);
+-   pipe_resource_reference(&instruction->input, input);
++      instruction->coefficients_data = etna_ml_create_coeffs_v8(subgraph, operation, &coef_cache_size, &instruction->coefficients_size);
+ 
+-   struct pipe_resource *output = subgraph->io_rsrc;
+-   assert(output);
+-   pipe_resource_reference(&instruction->output, output);
+-
+-   instruction->configs[0] = create_nn_config(subgraph, operation, instruction->coefficients, coef_cache_size);
++   instruction->config_data[0] = create_nn_config(subgraph, operation, coef_cache_size);
++   instruction->config_sizes[0] = sizeof(struct etna_nn_params);
+    instruction->input_offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+    instruction->output_offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
++
++   util_dynarray_init(&instruction->relocations, NULL);
++
++   struct etna_ml_relocation reloc;
++
++   /* kernel_address: word 5, shift 6, 26 bits */
++   reloc = (struct etna_ml_relocation) {
++      .config_idx = 0, .word_offset = 5,
++      .type = ETNA_ML_RELOC_COEFFICIENTS, .shift = 6, .mask_bits = 26, .addend = 0,
++   };
++   util_dynarray_append(&instruction->relocations, reloc);
++
++   /* in_image_address: word 6 */
++   reloc = (struct etna_ml_relocation) {
++      .config_idx = 0, .word_offset = 6,
++      .type = ETNA_ML_RELOC_INPUT, .shift = 0, .mask_bits = 32,
++      .addend = instruction->input_offset,
++   };
++   util_dynarray_append(&instruction->relocations, reloc);
++
++   /* out_image_address: word 7 */
++   reloc = (struct etna_ml_relocation) {
++      .config_idx = 0, .word_offset = 7,
++      .type = ETNA_ML_RELOC_OUTPUT, .shift = 0, .mask_bits = 32,
++      .addend = instruction->output_offset,
++   };
++   util_dynarray_append(&instruction->relocations, reloc);
+ }
+ 
+ void
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.h b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.h
+index 42cdbb2009e..a416e9f8250 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.h
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.h
+@@ -13,14 +13,14 @@ etna_ml_calc_addition_sizes(unsigned *input_width, unsigned *input_height, unsig
+ unsigned
+ etna_ml_calculate_tiling_v7(struct etna_screen *screen, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out);
+ 
+-struct etna_bo *
+-etna_ml_create_coeffs_v7(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size);
++void *
++etna_ml_create_coeffs_v7(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size, unsigned *out_size);
+ 
+ unsigned
+ etna_ml_calculate_tiling_v8(struct etna_screen *screen, const struct etna_operation *operation, unsigned *tile_width_out, unsigned *tile_height_out);
+ 
+-struct etna_bo *
+-etna_ml_create_coeffs_v8(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size);
++void *
++etna_ml_create_coeffs_v8(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size, unsigned *out_size);
+ 
+ void
+ etna_ml_lower_convolution(struct etna_ml_subgraph *subgraph,
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
+index 47ecfac6178..f62bf96b543 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
+@@ -510,8 +510,8 @@ calculate_zrl_bits(struct etna_ml_subgraph *subgraph, const struct etna_operatio
+    return best_zrl_bits;
+ }
+ 
+-struct etna_bo *
+-etna_ml_create_coeffs_v7(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size)
++void *
++etna_ml_create_coeffs_v7(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size, unsigned *out_size)
+ {
+    struct etna_screen *screen = subgraph->screen;
+    unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
+@@ -526,11 +526,9 @@ etna_ml_create_coeffs_v7(struct etna_ml_subgraph *subgraph, const struct etna_op
+    bo_size = calculate_weight_bo_size(subgraph, operation);
+    zrl_bits = calculate_zrl_bits(subgraph, operation);
+ 
+-   struct etna_bo *compressed = etna_ml_create_bo(screen, bo_size);
++   uint8_t *compressed = calloc(1, bo_size);
+ 
+-   etna_bo_cpu_prep(compressed, DRM_ETNA_PREP_WRITE);
+-
+-   uint32_t *map = etna_bo_map(compressed);
++   uint32_t *map = (uint32_t *)compressed;
+ 
+    uint32_t *header = map;
+    map += header_size / 4;
+@@ -553,9 +551,8 @@ etna_ml_create_coeffs_v7(struct etna_ml_subgraph *subgraph, const struct etna_op
+       map += actual_size / 4;
+    }
+ 
+-   etna_bo_cpu_fini(compressed);
+-
+    *cache_size = max_core_size * cores_used;
++   *out_size = bo_size;
+ 
+    return compressed;
+ }
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
+index 8321b867bf2..6f7a45b1924 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c
+@@ -665,8 +665,8 @@ static uint32_t pack_symbol_map(uint8_t map[8])
+    return ret;
+ }
+ 
+-static struct etna_bo *
+-create_bo(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation)
++static void *
++create_buf(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *buf_size)
+ {
+    struct etna_screen *screen = subgraph->screen;
+    unsigned nn_core_count = etna_ml_get_core_info(screen)->nn_core_count;
+@@ -685,7 +685,8 @@ create_bo(struct etna_ml_subgraph *subgraph, const struct etna_operation *operat
+    unsigned tail_size = 64;
+    max_size = header_size + cores_used * body_size + tail_size;
+ 
+-   return etna_ml_create_bo(screen, max_size);
++   *buf_size = max_size;
++   return calloc(1, max_size);
+ }
+ 
+ static void
+@@ -783,17 +784,16 @@ fill_biases(struct etna_ml_subgraph *subgraph, const struct etna_operation *oper
+    return map;
+ }
+ 
+-struct etna_bo *
+-etna_ml_create_coeffs_v8(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size)
++void *
++etna_ml_create_coeffs_v8(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, unsigned *cache_size, unsigned *out_size)
+ {
+-   struct etna_bo *bo = create_bo(subgraph, operation);
+-   uint32_t *map = etna_bo_map(bo);
++   unsigned buf_size;
++   uint8_t *buf = create_buf(subgraph, operation, &buf_size);
++   uint32_t *map = (uint32_t *)buf;
+    struct etna_nn_header_v8 *header = (struct etna_nn_header_v8 *)map;
+    struct encoder encoder;
+    uint8_t symbol_map[8];
+ 
+-   etna_bo_cpu_prep(bo, DRM_ETNA_PREP_WRITE);
+-
+    calculate_symbol_map(subgraph, operation, symbol_map);
+    header->symbol_map = pack_symbol_map(symbol_map);
+    header->version = 1;
+@@ -806,9 +806,8 @@ etna_ml_create_coeffs_v8(struct etna_ml_subgraph *subgraph, const struct etna_op
+    map = fill_biases(subgraph, operation, encoder.dest);
+ 
+    /* Size of the data that will go into the SRAM cache, header included */
+-   *cache_size = (uint8_t*)map - (uint8_t*)etna_bo_map(bo);
+-
+-   etna_bo_cpu_fini(bo);
++   *cache_size = (uint8_t*)map - buf;
++   *out_size = buf_size;
+ 
+-   return bo;
++   return buf;
+ }
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+index ddc42a0c6a4..6091b978bf9 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_tp.c
+@@ -244,14 +244,10 @@ set_default_tp_config(struct etna_tp_params *map)
+    map->unused9 = 0x0;
+ }
+ 
+-static struct etna_bo *
++static void *
+ create_transpose_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation)
+ {
+-   struct etna_bo *bo = etna_ml_create_bo(subgraph->screen, sizeof(struct etna_tp_params));
+-
+-   etna_bo_cpu_prep(bo, DRM_ETNA_PREP_WRITE);
+-
+-   struct etna_tp_params *map = etna_bo_map(bo);
++   struct etna_tp_params *map = calloc(1, sizeof(struct etna_tp_params));
+ 
+    set_default_tp_config(map);
+ 
+@@ -265,13 +261,11 @@ create_transpose_config(struct etna_ml_subgraph *subgraph, const struct etna_ope
+    map->in_tile_y_size = operation->input_height;
+    map->in_tile_y_inc = operation->input_height;
+ 
+-   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+-   map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
++   map->in_image_base_address = offset;
+ 
+-   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+-   map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
++   map->out_image_base_address = offset;
+ 
+    map->out_loop_1_inc = operation->input_width * operation->input_height;
+    map->out_loop_0_count = operation->input_height;
+@@ -286,22 +280,16 @@ create_transpose_config(struct etna_ml_subgraph *subgraph, const struct etna_ope
+    map->out_zp = operation->input_zero_point;
+    map->no_flush = 0x0;
+ 
+-   etna_bo_cpu_fini(bo);
+-
+-   return bo;
++   return map;
+ }
+ 
+-static struct etna_bo *
++static void *
+ create_detranspose_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation)
+ {
+    unsigned input_width = operation->input_width;
+    unsigned input_height = operation->input_height;
+    unsigned input_channels = operation->input_channels;
+-   struct etna_bo *bo = etna_ml_create_bo(subgraph->screen, sizeof(struct etna_tp_params));
+-
+-   etna_bo_cpu_prep(bo, DRM_ETNA_PREP_WRITE);
+-
+-   struct etna_tp_params *map = etna_bo_map(bo);
++   struct etna_tp_params *map = calloc(1, sizeof(struct etna_tp_params));
+ 
+    set_default_tp_config(map);
+ 
+@@ -315,13 +303,11 @@ create_detranspose_config(struct etna_ml_subgraph *subgraph, const struct etna_o
+    map->in_tile_y_size = 0x1;
+    map->in_tile_y_inc = 0x1;
+ 
+-   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+-   map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
++   map->in_image_base_address = offset;
+ 
+-   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+-   map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
++   map->out_image_base_address = offset;
+ 
+    map->out_loop_0_inc = input_channels;
+    map->out_loop_1_inc = 0x0;
+@@ -339,9 +325,7 @@ create_detranspose_config(struct etna_ml_subgraph *subgraph, const struct etna_o
+    map->in_zp = operation->input_zero_point;
+    map->out_zp = operation->input_zero_point;
+ 
+-   etna_bo_cpu_fini(bo);
+-
+-   return bo;
++   return map;
+ }
+ 
+ static unsigned
+@@ -404,11 +388,11 @@ split_reshuffle(struct etna_ml_subgraph *subgraph, const struct etna_operation *
+    return dim_to_split;
+ }
+ 
+-static struct etna_bo *
++static void *
+ create_reshuffle_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation,
+                         unsigned tp_core, unsigned tp_cores_used)
+ {
+-   struct etna_bo *bo = etna_ml_create_bo(subgraph->screen, sizeof(struct etna_tp_params));
++   struct etna_tp_params *map = calloc(1, sizeof(struct etna_tp_params));
+    unsigned input_width = operation->input_width;
+    unsigned input_height = operation->input_height;
+    unsigned output_width = operation->output_width;
+@@ -416,10 +400,6 @@ create_reshuffle_config(struct etna_ml_subgraph *subgraph, const struct etna_ope
+    unsigned in_dims[3];
+    unsigned out_dims[3];
+ 
+-   etna_bo_cpu_prep(bo, DRM_ETNA_PREP_WRITE);
+-
+-   struct etna_tp_params *map = etna_bo_map(bo);
+-
+    set_default_tp_config(map);
+ 
+    SWAP(input_width, input_height);
+@@ -457,13 +437,11 @@ create_reshuffle_config(struct etna_ml_subgraph *subgraph, const struct etna_ope
+    map->in_tile_y_size = out_dims[1] * 2;
+    map->in_tile_y_inc = out_dims[1] * 2;
+ 
+-   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+-   map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
++   map->in_image_base_address = offset;
+ 
+-   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+-   map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
++   map->out_image_base_address = offset;
+ 
+    for (unsigned i = 0; i < tp_core; i++) {
+       unsigned in_dims[3];
+@@ -526,9 +504,7 @@ create_reshuffle_config(struct etna_ml_subgraph *subgraph, const struct etna_ope
+    map->out_image_circular_buf_size = 0x0;
+    map->out_image_circular_buf_end_address_plus_1 = 0xFFFFFFFF >> 6;
+ 
+-   etna_bo_cpu_fini(bo);
+-
+-   return bo;
++   return map;
+ }
+ 
+ 
+@@ -558,11 +534,11 @@ split_pad(struct etna_ml_subgraph *subgraph, const struct etna_operation *operat
+    }
+ }
+ 
+-static struct etna_bo *
++static void *
+ create_pad_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation,
+                   unsigned tp_core, unsigned tp_cores_used)
+ {
+-   struct etna_bo *bo = etna_ml_create_bo(subgraph->screen, sizeof(struct etna_tp_params));
++   struct etna_tp_params *map = calloc(1, sizeof(struct etna_tp_params));
+    unsigned input_width = operation->input_width;
+    unsigned input_height = operation->input_height;
+    unsigned input_channels = operation->input_channels;
+@@ -592,10 +568,6 @@ create_pad_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+       SWAP(pad_after_x, pad_after_z);
+    }
+ 
+-   etna_bo_cpu_prep(bo, DRM_ETNA_PREP_WRITE);
+-
+-   struct etna_tp_params *map = etna_bo_map(bo);
+-
+    set_default_tp_config(map);
+ 
+    in_dims[0] = input_width;
+@@ -634,11 +606,10 @@ create_pad_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+    map->in_tile_y_inc = out_dims[1];
+ 
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+-   map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(subgraph->io_rsrc)->bo) + offset;
++   map->in_image_base_address = offset;
+ 
+-   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+-   map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
++   map->out_image_base_address = offset;
+ 
+    for (unsigned i = 0; i < tp_core; i++) {
+       unsigned in_dims[3];
+@@ -693,9 +664,7 @@ create_pad_config(struct etna_ml_subgraph *subgraph, const struct etna_operation
+    map->out_image_circular_buf_size = 0x0;
+    map->out_image_circular_buf_end_address_plus_1 = 0xFFFFFFFF >> 6;
+ 
+-   etna_bo_cpu_fini(bo);
+-
+-   return bo;
++   return map;
+ }
+ 
+ static inline uint8_t
+@@ -732,11 +701,11 @@ split_pwl_lut(struct etna_ml_subgraph *subgraph, const struct etna_operation *op
+    }
+ }
+ 
+-static struct etna_bo *
++static void *
+ create_pwl_lut_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation,
+-                   unsigned tp_core, unsigned tp_cores_used, struct etna_bo *pwl_lut)
++                   unsigned tp_core, unsigned tp_cores_used)
+ {
+-   struct etna_bo *bo = etna_ml_create_bo(subgraph->screen, sizeof(struct etna_tp_params));
++   struct etna_tp_params *map = calloc(1, sizeof(struct etna_tp_params));
+    unsigned input_width = operation->input_width;
+    unsigned input_height = operation->input_height;
+    unsigned input_channels = operation->input_channels;
+@@ -749,10 +718,6 @@ create_pwl_lut_config(struct etna_ml_subgraph *subgraph, const struct etna_opera
+    SWAP(input_width, input_channels);
+    SWAP(output_width, output_channels);
+ 
+-   etna_bo_cpu_prep(bo, DRM_ETNA_PREP_WRITE);
+-
+-   struct etna_tp_params *map = etna_bo_map(bo);
+-
+    set_default_tp_config(map);
+ 
+    in_dims[0] = input_width;
+@@ -786,16 +751,14 @@ create_pwl_lut_config(struct etna_ml_subgraph *subgraph, const struct etna_opera
+    map->alu_pwl_enable = 0x1;
+    map->alu_load_pwl_lut = 0x1;
+    map->alu_load_pwl_lut_global_mem = 0x1;
+-   map->alu_load_pwl_lut_address = etna_bo_gpu_va(pwl_lut);
++   map->alu_load_pwl_lut_address = 0;
+    map->alu_pwl_sign_support = 0x1;
+ 
+-   struct pipe_resource *input = subgraph->io_rsrc;
+    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+-   map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
++   map->in_image_base_address = offset;
+ 
+-   struct pipe_resource *output = subgraph->io_rsrc;
+    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+-   map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
++   map->out_image_base_address = offset;
+ 
+    for (unsigned i = 0; i < tp_core; i++) {
+       unsigned in_dims[3];
+@@ -867,9 +830,7 @@ create_pwl_lut_config(struct etna_ml_subgraph *subgraph, const struct etna_opera
+    map->out_image_circular_buf_size = 0x0;
+    map->out_image_circular_buf_end_address_plus_1 = 0xFFFFFFFF >> 6;
+ 
+-   etna_bo_cpu_fini(bo);
+-
+-   return bo;
++   return map;
+ }
+ 
+ void
+@@ -1103,18 +1064,14 @@ etna_ml_lower_logistic(struct etna_ml_subgraph *subgraph,
+                                        operation->output_channels;
+ }
+ 
+-static struct etna_bo *
+-create_relu_lut_bo(struct etna_ml_subgraph *subgraph,
+-                   const struct etna_operation *operation)
++static void *
++create_relu_lut(struct etna_ml_subgraph *subgraph,
++               const struct etna_operation *operation,
++               unsigned *out_size)
+ {
+    const unsigned lut_length = 1024;
+-   struct etna_bo *pwl_lut = etna_bo_new(subgraph->screen->dev,
+-                                         lut_length * sizeof(uint32_t),
+-                                         DRM_ETNA_GEM_CACHE_WC);
+-
+-   etna_bo_cpu_prep(pwl_lut, DRM_ETNA_PREP_WRITE);
+-
+-   uint32_t *map = etna_bo_map(pwl_lut);
++   *out_size = lut_length * sizeof(uint32_t);
++   uint32_t *map = calloc(lut_length, sizeof(uint32_t));
+ 
+    for (int i = 0; i < lut_length; i++) {
+       if (i < 16)
+@@ -1127,23 +1084,17 @@ create_relu_lut_bo(struct etna_ml_subgraph *subgraph,
+          map[i] = 0x100000;
+    }
+ 
+-   etna_bo_cpu_fini(pwl_lut);
+-
+-   return pwl_lut;
++   return map;
+ }
+ 
+-static struct etna_bo *
+-create_abs_lut_bo(struct etna_ml_subgraph *subgraph,
+-                  const struct etna_operation *operation)
++static void *
++create_abs_lut(struct etna_ml_subgraph *subgraph,
++               const struct etna_operation *operation,
++               unsigned *out_size)
+ {
+    unsigned lut_length = 1024;
+-   struct etna_bo *pwl_lut = etna_bo_new(subgraph->screen->dev,
+-                                         lut_length * sizeof(uint32_t),
+-                                         DRM_ETNA_GEM_CACHE_WC);
+-
+-   etna_bo_cpu_prep(pwl_lut, DRM_ETNA_PREP_WRITE);
+-
+-   uint32_t *map = etna_bo_map(pwl_lut);
++   *out_size = lut_length * sizeof(uint32_t);
++   uint32_t *map = calloc(lut_length, sizeof(uint32_t));
+ 
+    for (int i = 0; i < lut_length; i++) {
+       if (i < 16)
+@@ -1160,9 +1111,7 @@ create_abs_lut_bo(struct etna_ml_subgraph *subgraph,
+          map[i] = 0xf7fff;
+    }
+ 
+-   etna_bo_cpu_fini(pwl_lut);
+-
+-   return pwl_lut;
++   return map;
+ }
+ 
+ /* Based on code from src/util/half_float.c in Mesa itself. */
+@@ -1249,19 +1198,15 @@ fp32(uint32_t val)
+    return f32.f;
+ }
+ 
+-static struct etna_bo *
+-create_log_lut_bo(struct etna_ml_subgraph *subgraph,
+-                  const struct etna_operation *operation)
++static void *
++create_log_lut(struct etna_ml_subgraph *subgraph,
++               const struct etna_operation *operation,
++               unsigned *out_size)
+ {
+    unsigned lut_table_len = 1024;
++   *out_size = lut_table_len * sizeof(uint32_t);
+ 
+-   struct etna_bo *pwl_lut = etna_bo_new(subgraph->screen->dev,
+-                                         lut_table_len * sizeof(uint32_t),
+-                                         DRM_ETNA_GEM_CACHE_WC);
+-
+-   etna_bo_cpu_prep(pwl_lut, DRM_ETNA_PREP_WRITE);
+-
+-   uint32_t *map = etna_bo_map(pwl_lut);
++   uint32_t *map = calloc(lut_table_len, sizeof(uint32_t));
+    unsigned pos = 0;
+ 
+    uint32_t initial_val = fp21(0.5);
+@@ -1298,9 +1243,7 @@ create_log_lut_bo(struct etna_ml_subgraph *subgraph,
+    for (int i = 0; i < 16; i++)
+          map[pos++] = final_val;
+ 
+-   etna_bo_cpu_fini(pwl_lut);
+-
+-   return pwl_lut;
++   return map;
+ }
+ 
+ void
+@@ -1308,23 +1251,21 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+                              const struct etna_operation *operation,
+                              struct etna_vip_instruction *instruction)
+ {
+-   struct pipe_resource *input = subgraph->io_rsrc;
+-   assert(input);
+-   pipe_resource_reference(&instruction->input, input);
+-
+-   struct pipe_resource *output = subgraph->io_rsrc;
+-   assert(output);
+-   pipe_resource_reference(&instruction->output, output);
+-
+    instruction->input_offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+    instruction->output_offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+ 
++   unsigned num_configs = 0;
++
+    switch (operation->tp_type) {
+    case ETNA_ML_TP_TRANSPOSE:
+-      instruction->configs[0] = create_transpose_config(subgraph, operation);
++      instruction->config_data[0] = create_transpose_config(subgraph, operation);
++      instruction->config_sizes[0] = sizeof(struct etna_tp_params);
++      num_configs = 1;
+       break;
+    case ETNA_ML_TP_DETRANSPOSE:
+-      instruction->configs[0] = create_detranspose_config(subgraph, operation);
++      instruction->config_data[0] = create_detranspose_config(subgraph, operation);
++      instruction->config_sizes[0] = sizeof(struct etna_tp_params);
++      num_configs = 1;
+       break;
+    case ETNA_ML_TP_RESHUFFLE: {
+       unsigned tp_core_count = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
+@@ -1339,8 +1280,10 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+ 
+       ML_DBG("reshuffle: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
+       for (unsigned i = 0; i < tp_cores_used; i++) {
+-         instruction->configs[i] = create_reshuffle_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_data[i] = create_reshuffle_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_sizes[i] = sizeof(struct etna_tp_params);
+       }
++      num_configs = tp_cores_used;
+       break;
+    }
+    case ETNA_ML_TP_PAD: {
+@@ -1351,8 +1294,10 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+ 
+       ML_DBG("pad: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
+       for (unsigned i = 0; i < tp_cores_used; i++) {
+-         instruction->configs[i] = create_pad_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_data[i] = create_pad_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_sizes[i] = sizeof(struct etna_tp_params);
+       }
++      num_configs = tp_cores_used;
+       break;
+    }
+    case ETNA_ML_TP_RELU: {
+@@ -1362,20 +1307,24 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+          tp_cores_used = 1;
+ 
+       ML_DBG("relu: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
+-      instruction->pwl_lut = create_relu_lut_bo(subgraph, operation);
++      instruction->pwl_lut_data = create_relu_lut(subgraph, operation, &instruction->pwl_lut_size);
+       for (unsigned i = 0; i < tp_cores_used; i++) {
+-         instruction->configs[i] = create_pwl_lut_config(subgraph, operation, i, tp_cores_used, instruction->pwl_lut);
++         instruction->config_data[i] = create_pwl_lut_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_sizes[i] = sizeof(struct etna_tp_params);
+       }
++      num_configs = tp_cores_used;
+       break;
+    }
+    case ETNA_ML_TP_ABSOLUTE: {
+       unsigned tp_cores_used = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
+ 
+       ML_DBG("absolute: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
+-      instruction->pwl_lut = create_abs_lut_bo(subgraph, operation);
++      instruction->pwl_lut_data = create_abs_lut(subgraph, operation, &instruction->pwl_lut_size);
+       for (unsigned i = 0; i < tp_cores_used; i++) {
+-         instruction->configs[i] = create_pwl_lut_config(subgraph, operation, i, tp_cores_used, instruction->pwl_lut);
++         instruction->config_data[i] = create_pwl_lut_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_sizes[i] = sizeof(struct etna_tp_params);
+       }
++      num_configs = tp_cores_used;
+       break;
+    }
+    case ETNA_ML_TP_LOGISTIC: {
+@@ -1385,15 +1334,50 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
+          tp_cores_used = 1;
+ 
+       ML_DBG("logistic: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
+-      instruction->pwl_lut = create_log_lut_bo(subgraph, operation);
++      instruction->pwl_lut_data = create_log_lut(subgraph, operation, &instruction->pwl_lut_size);
+       for (unsigned i = 0; i < tp_cores_used; i++) {
+-         instruction->configs[i] = create_pwl_lut_config(subgraph, operation, i, tp_cores_used, instruction->pwl_lut);
++         instruction->config_data[i] = create_pwl_lut_config(subgraph, operation, i, tp_cores_used);
++         instruction->config_sizes[i] = sizeof(struct etna_tp_params);
+       }
++      num_configs = tp_cores_used;
+       break;
+    }
+    }
+    instruction->type = ETNA_JOB_TYPE_TP;
+    instruction->tp_type = operation->tp_type;
++
++   /* Add relocations for all configs */
++   util_dynarray_init(&instruction->relocations, NULL);
++   for (unsigned i = 0; i < num_configs; i++) {
++      uint32_t *words = (uint32_t *)instruction->config_data[i];
++      struct etna_ml_relocation reloc;
++
++      /* in_image_base_address: word 10 */
++      reloc = (struct etna_ml_relocation) {
++         .config_idx = i, .word_offset = 10,
++         .type = ETNA_ML_RELOC_INPUT, .shift = 0, .mask_bits = 32,
++         .addend = words[10],
++      };
++      util_dynarray_append(&instruction->relocations, reloc);
++
++      /* out_image_base_address: word 13 */
++      reloc = (struct etna_ml_relocation) {
++         .config_idx = i, .word_offset = 13,
++         .type = ETNA_ML_RELOC_OUTPUT, .shift = 0, .mask_bits = 32,
++         .addend = words[13],
++      };
++      util_dynarray_append(&instruction->relocations, reloc);
++
++      /* alu_load_pwl_lut_address: word 11 (only for PWL configs) */
++      if (instruction->pwl_lut_data) {
++         reloc = (struct etna_ml_relocation) {
++            .config_idx = i, .word_offset = 11,
++            .type = ETNA_ML_RELOC_PWL_LUT, .shift = 0, .mask_bits = 32,
++            .addend = 0,
++         };
++         util_dynarray_append(&instruction->relocations, reloc);
++      }
++   }
+ }
+ 
+ void
+-- 
+2.55.0
+

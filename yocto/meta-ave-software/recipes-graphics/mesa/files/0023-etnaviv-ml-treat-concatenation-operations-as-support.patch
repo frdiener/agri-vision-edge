@@ -1,0 +1,37 @@
+From 84c4fc75a4057d2bf75eee20dfe50e78411f207f Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Fri, 29 May 2026 14:43:14 +0200
+Subject: [PATCH 23/37] etnaviv/ml: treat concatenation operations as supported
+
+The etnaviv ML lowering path represents concatenation as a fake operation
+that aliases input tensors into the output tensor. Stop rejecting concat
+operations during compatibility checks so graph partitioning can keep
+those subgraphs delegated.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index ef5409681ea..e149d10329b 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -693,11 +693,11 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+       case PIPE_ML_OPERATION_TYPE_CONCATENATION: {
+          supported = true;
+ 
+-         if (operation->conc.axis != 3 &&
+-             operation->conc.axis != -1) {
+-            ML_DBG("concatenation not supported: axis %d\n", operation->conc.axis);
+-            supported = false;
+-         }
++         /* if (operation->conc.axis != 3 && */
++         /*     operation->conc.axis != -1) { */
++         /*    ML_DBG("concatenation not supported: axis %d\n", operation->conc.axis); */
++         /*    supported = false; */
++         /* } */
+          break;
+       }
+       case PIPE_ML_OPERATION_TYPE_SPLIT: {
+-- 
+2.55.0
+

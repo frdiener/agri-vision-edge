@@ -1,0 +1,84 @@
+From 0a084554ca6e91385241d9cf6b530b67bc5887dd Mon Sep 17 00:00:00 2001
+From: Freimut Diener <mail@f-diener.dev>
+Date: Sat, 29 Aug 2026 14:17:49 +0200
+Subject: [PATCH 34/37] etnaviv/ml: don't transpose concatenation operands that
+ are already stacked
+
+The CONCAT job emits no instruction, it only aliases each operand into the
+output buffer at a linear byte offset. That concatenates along whichever axis
+is outermost in memory, so only an innermost-axis concatenation needs its
+operands transposed to NCHW first. Along any other axis they are already
+stacked as the frontend laid them out, and transposing restacks them into
+per-channel planes, grouping the result per operand instead.
+
+lower_operations() forces NCHW for every concatenation regardless. An SSD
+MobileNetV2 with per-channel weights shows it: every convolution falls back to
+the CPU, so the two axis 1 head concatenations are delegated as isolated
+islands fed with frontend-layout operands. Nothing undoes the transposes
+either, as both outputs are flat and the is_3d() guards on the output fixup
+and on the following RESHAPE decline.
+
+Only suppress the transpose rather than converting towards a per-axis layout.
+With per-tensor weights the same operands arrive through a RESHAPE that
+detransposes a flattened head and leaves its output labelled NCHW although the
+bytes are NHWC by then, so act_layout cannot be trusted here.
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 33 +++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 91404466996..1202e2a4393 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -297,6 +297,34 @@ is_3d(struct pipe_tensor *tensor)
+           tensor->dims[3] > 1;
+ }
+ 
++/*
++ * Map a frontend axis argument, which is relative to the tensor's logical
++ * rank, onto an index into dims[], which is left-padded to 4 entries. A rank
++ * of zero means the frontend didn't provide one.
++ */
++static int
++padded_axis(const struct pipe_tensor *tensor, int axis)
++{
++   int rank = tensor->rank ? tensor->rank : 4;
++
++   if (axis < 0)
++      axis += rank;
++
++   return axis + (4 - rank);
++}
++
++/*
++ * The CONCAT job aliases its operands into the output at linear byte offsets,
++ * so it concatenates along whichever axis is outermost in memory. Only the
++ * innermost axis needs NCHW for that; along any other axis the operands are
++ * already stacked as the frontend laid them out.
++ */
++static bool
++concatenation_needs_nchw(const struct pipe_tensor *tensor, int axis)
++{
++   return padded_axis(tensor, axis) == 3;
++}
++
+ /** Tensor layout inference:
+   * - Graph inputs are in NHWC order.
+   * - Graph outputs are expected in NHWC order.
+@@ -335,9 +363,12 @@ lower_operations(struct etna_ml_subgraph *subgraph,
+ 
+          if (poperation->type == PIPE_ML_OPERATION_TYPE_CONVOLUTION ||
+              poperation->type == PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED ||
+-             poperation->type == PIPE_ML_OPERATION_TYPE_CONCATENATION ||
+              poperation->type == PIPE_ML_OPERATION_TYPE_RESIZE)
+             operation_layout = ETNA_ML_LAYOUT_NCHW;
++         else if (poperation->type == PIPE_ML_OPERATION_TYPE_CONCATENATION &&
++                  concatenation_needs_nchw(poperation->output_tensors[0],
++                                           poperation->conc.axis))
++            operation_layout = ETNA_ML_LAYOUT_NCHW;
+ 
+          if (!etna_ml_find_producer(poperations, count, poperation->input_tensors[i]->index)) {
+             /* In TensorFlow Lite, graph inputs are in channel-last */
+-- 
+2.55.0
+

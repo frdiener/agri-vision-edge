@@ -1,0 +1,16 @@
+root:x:0:
+users:x:100:
+empower:x:991:
+systemd-timesync:x:992:
+systemd-resolve:x:993:
+systemd-network:x:994:
+systemd-coredump:x:995:
+systemd-journal:x:996:
+render:x:997:
+sshd:x:998:
+messagebus:x:999:
+nogroup:x:65534:
+wayland:x:234
+weston:x:235
+weston-launch:x:236:
+seat:x:237:

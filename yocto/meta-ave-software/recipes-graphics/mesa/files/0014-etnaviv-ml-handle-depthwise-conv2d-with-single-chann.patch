@@ -1,0 +1,101 @@
+From bb69419f7eefe71faaf720a5b115991a7510374d Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Thu, 7 Aug 2025 16:31:58 +0200
+Subject: [PATCH 14/37] etnaviv/ml: handle depthwise conv2d with single-channel
+ input as conv2d
+
+Depthwise 2D convolutions that apply multiple filters to each input
+channel and thus multiply the number output channels are not currently
+implemented correctly.
+Reject them as unsupported, unless the input tensor is single-channel.
+In that case, just run the equivalent non-depthwise convolution instead.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c    | 11 +++++++++--
+ src/gallium/drivers/etnaviv/etnaviv_ml_nn.c |  7 ++++---
+ 2 files changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index 8643452ff93..3720424b184 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -114,16 +114,18 @@ needs_reshuffle(struct etna_ml_subgraph *subgraph, const struct pipe_ml_operatio
+                       poperation->conv.padding_left > 0 ||
+                       poperation->conv.padding_right > 0;
+    unsigned input_width = poperation->input_tensors[0]->dims[1];
++   unsigned input_channels = poperation->input_tensors[0]->dims[3];
++   bool depthwise = poperation->conv.depthwise && input_channels > 1;
+ 
+    if (!has_stride)
+       return false;
+ 
+    if (nn_core_version < 8)
+-      return !(poperation->conv.depthwise && (input_width > 5 || input_width < 3)) && !pointwise;
++      return !(depthwise && (input_width > 5 || input_width < 3)) && !pointwise;
+    else {
+       unsigned input_channels = poperation->input_tensors[0]->dims[3];
+ 
+-      if (poperation->conv.depthwise)
++      if (depthwise)
+          return false;
+ 
+       if (poperation->conv.pointwise && input_width >= 3 && input_channels > 1)
+@@ -614,6 +616,8 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+          struct pipe_tensor *weight_tensor = operation->conv.weight_tensor;
+          struct pipe_tensor *bias_tensor = operation->conv.bias_tensor;
+          struct pipe_tensor *output_tensor = operation->output_tensors[0];
++         unsigned depth_multiplier = operation->output_tensors[0]->dims[3] /
++                                     operation->input_tensors[0]->dims[3];
+ 
+          // Dilation and per-axis quantization not yet implemented
+          if (tensor_quantization_supported(input_tensor) &&
+@@ -622,6 +626,9 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+              tensor_quantization_supported(output_tensor) &&
+              operation->conv.dilation_width_factor == 1 &&
+              operation->conv.dilation_height_factor == 1 &&
++	     (!operation->conv.depthwise ||
++              depth_multiplier == 1 ||
++              operation->input_tensors[0]->dims[3] == 1) &&
+              operation->output_tensors[0]->dims[3] <= max_channels) {
+             supported = true;
+          }
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+index 972d8f88e99..a5c8a2659ab 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c
+@@ -500,11 +500,12 @@ calc_pooling_first_pixel(struct etna_ml_subgraph *subgraph,
+    unsigned nn_core_version = etna_ml_dev(subgraph)->specs->nn_core_version;
+    unsigned input_width = poperation->input_tensors[0]->dims[1];
+    unsigned input_channels = poperation->input_tensors[0]->dims[3];
++   bool depthwise = poperation->conv.depthwise && input_channels > 1;
+ 
+    if (poperation->conv.stride_x == 1)
+       return false;
+ 
+-   if (poperation->conv.depthwise)
++   if (depthwise)
+       return true;
+ 
+    if (nn_core_version < 8) {
+@@ -555,7 +556,7 @@ etna_ml_lower_convolution(struct etna_ml_subgraph *subgraph,
+ 
+    operation->type = ETNA_JOB_TYPE_NN;
+    operation->addition = false;
+-   operation->depthwise = poperation->conv.depthwise;
++   operation->depthwise = poperation->conv.depthwise && poperation->input_tensors[0]->dims[3] > 1;
+    operation->pointwise = poperation->conv.pointwise;
+    operation->relu = poperation->conv.relu;
+    operation->pooling_first_pixel = calc_pooling_first_pixel(subgraph, poperation);
+@@ -605,7 +606,7 @@ etna_ml_lower_convolution(struct etna_ml_subgraph *subgraph,
+    if (operation->pointwise && operation->input_channels == 1)
+       pointwise_to_2x2(subgraph, operation);
+ 
+-   if (operation->depthwise) {
++   if (poperation->conv.depthwise) {
+       if (nn_core_version < 8) {
+          if (operation->output_channels > 1 || operation->stride > 1) {
+             if (operation->input_width < 8 && operation->input_width > 2)
+-- 
+2.55.0
+

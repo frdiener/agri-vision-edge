@@ -1,0 +1,43 @@
+From 41314fc7850568b18a310d4c49b12de8a2510989 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Thu, 7 Aug 2025 16:20:24 +0200
+Subject: [PATCH 13/37] debug: etnaviv/ml: Add ETNA_NPU_MAX_CHANNELS
+ environment variable
+
+Add the ETNA_NPU_MAX_CHANNELS environment variable to allow limiting
+convolutions with high channel count output tensors to the CPU.
+Default to 768 channels max.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/drivers/etnaviv/etnaviv_ml.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/etnaviv/etnaviv_ml.c b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+index bb82ac1e38d..8643452ff93 100644
+--- a/src/gallium/drivers/etnaviv/etnaviv_ml.c
++++ b/src/gallium/drivers/etnaviv/etnaviv_ml.c
+@@ -604,6 +604,10 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+ {
+    bool supported = false;
+ 
++   unsigned long max_channels = 1280; /* FIXME - arbitrary limit to avoid OOM */
++   if (getenv("ETNA_NPU_MAX_CHANNELS"))
++      max_channels = strtoul(getenv("ETNA_NPU_MAX_CHANNELS"), NULL, 0);
++
+    switch (operation->type) {
+       case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
+          struct pipe_tensor *input_tensor = operation->input_tensors[0];
+@@ -617,7 +621,8 @@ etna_ml_operation_supported(struct pipe_ml_device *pdevice,
+              tensor_quantization_supported(bias_tensor) &&
+              tensor_quantization_supported(output_tensor) &&
+              operation->conv.dilation_width_factor == 1 &&
+-             operation->conv.dilation_height_factor == 1) {
++             operation->conv.dilation_height_factor == 1 &&
++             operation->output_tensors[0]->dims[3] <= max_channels) {
+             supported = true;
+          }
+          break;
+-- 
+2.55.0
+

@@ -1,0 +1,51 @@
+From 472f259ea42b2767efaf6bdf9b60129f94a4ca2c Mon Sep 17 00:00:00 2001
+From: Freimut Diener <f.diener@pengutronix.de>
+Date: Sat, 27 Jun 2026 08:21:31 +0200
+Subject: [PATCH 27/37] teflon: improve ReLU6 range checks for quantized
+ tensors
+
+Check the quantized ReLU6 limit explicitly and allow only overshoot that
+is small enough to be numerically insignificant. Also improve the debug
+output for rejected fused ReLU6 activations.
+---
+ src/gallium/frontends/teflon/tfl_device.c | 24 +++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index d6070d5c4ea..3678ce598bc 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -851,8 +851,28 @@ fused_relu6_supported(TfLiteTensor *tensor)
+    /* Handle per-channel quantization where zero_point->size may be 1 */
+    for (int i = 0; i < affine->scale->size; i++) {
+       int zp_idx = (affine->zero_point->size == 1) ? 0 : i;
+-      if ((quantized_max - affine->zero_point->data[zp_idx]) * affine->scale->data[i] > 6.0f) {
+-         teflon_debug("Unsupported Scale\n");
++
++      float scale = affine->scale->data[i];
++      int zp = affine->zero_point->data[zp_idx];
++      float range = (quantized_max - zp) * scale;
++
++      /* Maximum overshoot that preserves every int8 code's bin: half a
++       * quantization step. At range <= 6.0 + 0.5*scale the value 6.0 still
++       * rounds to quantized_max, so the fused [0,6] clamp is bit-exact. */
++      float limit = 6.0f + 0.5f * scale;
++
++      teflon_debug(
++         "ReLU6 check: tensor=%p channel=%d scale=%f zp=%d qmax=%d range=%f\n",
++         (void *)tensor,
++         i,
++         scale,
++         zp,
++         quantized_max,
++         range);
++
++      if (range > limit) {
++         teflon_debug("Unsupported ReLU6 range: range=%f exceeds limit=%f\n",
++                      range, limit);
+          return false;
+       }
+    }
+-- 
+2.55.0
+

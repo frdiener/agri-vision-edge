@@ -1,0 +1,43 @@
+From 760c2ea739366ba17844cbfaa669b6094f7031e2 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Tue, 20 Aug 2024 16:36:02 +0200
+Subject: [PATCH 11/37] debug: teflon: Add TEFLON_MAX_NODES environment
+ variable
+
+This allows to only mark a given number of operations as supported
+by the NPU, and process the rest of the model on the CPU.
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+---
+ src/gallium/frontends/teflon/tfl_device.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 2b335b8c6a7..012e3c8fbe9 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -901,6 +901,12 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+       fill_tensor(delegate, tf_context, &delegate->tensors[i], i);
+    delegate->tensor_count = tf_context->tensors_size;
+ 
++   unsigned long max_supported = ULONG_MAX;
++   if (getenv("TEFLON_MAX_NODES")) {
++      max_supported = strtoul(getenv("TEFLON_MAX_NODES"), NULL, 0);
++      teflon_debug("limiting delegate to first %lu nodes in execution plan\n", max_supported);
++   }
++
+    teflon_debug("%3s %-15s %3s %-11s %s\n", "idx", "type", "ver", "support", "inputs");
+    teflon_debug("================================================================================================\n");
+ 
+@@ -916,6 +922,8 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+          tf_context, node_index, &node, &registration));
+ 
+       supported = check_op_support(tf_delegate, tf_context, node, registration);
++      if (supported)
++         supported = i < max_supported;
+ 
+       teflon_debug("%3d %-15s v%-2d %-11s in:", node_index,
+                    tflite_builtin_op_name(registration->builtin_code),
+-- 
+2.55.0
+
