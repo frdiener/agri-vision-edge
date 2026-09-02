@@ -1,0 +1,40 @@
+# External Yocto layers — checked out by setup.sh, not tracked here
+/bitbake/
+/openembedded-core/
+/meta-openembedded/
+/meta-arm/
+/meta-tensorflow/
+/meta-ptx/
+
+# Yocto build artefacts
+/build/tmp/
+/build/cache/
+/build/sstate-cache/
+/build/downloads/
+/build/buildhistory/
+build*/tmp/
+build*/cache/
+build*/sstate-cache/
+build*/downloads/
+build*/buildhistory/
+
+# Common Yocto outputs that land outside build/
+/tmp/
+/downloads/
+/sstate-cache/
+
+# BitBake pseudo database
+/pseudo/
+
+# Python bytecode
+*.pyc
+*.pyo
+__pycache__/
+
+# Editor temporaries
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
