@@ -1,0 +1,19 @@
+# YOCTO.BSP-AVE — pinned external source manifest
+#
+# Format: <name> <url> <sha>
+#
+# NOTE — openembedded-core:
+#   The AVE workspace used two NFS helper scripts
+#   (scripts/nfs-cp, scripts/nfs-export-updater) sourced from
+#   https://github.com/ejoerns/poky-nfsroot on top of the public OE-Core
+#   master.  The scripts are development conveniences and do not affect any
+#   recipe, machine config, class, or build output.
+#   The SHA recorded here (9ca41405e6bc) is the public upstream commit it
+#   was based on.
+
+bitbake           https://git.openembedded.org/bitbake                        cb28befc56d201cace72d70891e731b955fb567f
+openembedded-core https://git.openembedded.org/openembedded-core              9ca41405e6bca276468a3b6f67eaa328b8016485
+meta-openembedded https://github.com/openembedded/meta-openembedded.git       420222862f5a6d95023b8f5f3b7e1808b2264ef9
+meta-arm          https://git.yoctoproject.org/meta-arm                       eb9b2afff9e2f5136274c9bbbf6b711716db1098
+meta-tensorflow   https://git.yoctoproject.org/meta-tensorflow                a5cff71e96f31e6a7fa1aa159d27ed840af2ee2b
+meta-ptx          https://github.com/pengutronix/meta-ptx.git                 34d31c8865451acf7f009ed95fa719322201fefa
