@@ -5,16 +5,16 @@
 #
 # Output goes to benchmark_results/<hostname>/<tiled|untiled>_<model-stem>/.
 # By default a run whose output already contains latency.json is skipped; pass
-# --override to re-run it.
+# --override to re-run it. --filter '<glob>' narrows the sweep to matching model
+# stems, for recollecting one subset in a single coherent batch.
 #
 # All models use the NPU delegate (--delegate, default /usr/lib/libteflon.so).
 # Note: the Teflon delegate targets INT8 — routing an fp32 graph through it
-# reports support for float conv ops and silently degrades results, so use --cpu
-# for trustworthy fp32 (and CPU-reference int8) numbers.
+# reports support for float conv ops and silently degrades results. Use --cpu
+# for runs without delegate.
 #
 # Pass --cpu to disable the delegate for every model and write the results to
-# benchmark_results/<hostname>_cpu/ instead, for a clean CPU-only run alongside
-# the delegated one.
+# benchmark_results/<hostname>_cpu/ instead.
 #
 # The platform directory is $(hostname), plus --suffix for a tree that is the
 # same board under a different delegate build, plus _cpu when --cpu is given:
@@ -48,6 +48,7 @@ override=0
 cpu_only=0
 delegate="/usr/lib/libteflon.so"
 suffix=""
+filter=""
 forward_args=()
 
 while [[ $# -gt 0 ]]; do
@@ -71,6 +72,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         --suffix=*)
             suffix="${1#*=}"
+            ;;
+        --filter)
+            filter="$2"
+            shift
+            ;;
+        --filter=*)
+            filter="${1#*=}"
             ;;
         *)
             forward_args+=("$1")
@@ -97,6 +105,18 @@ output_root="${repo_root}/benchmark_results/${platform}"
 shopt -s nullglob
 models=("${models_dir}"/*.tflite)
 shopt -u nullglob
+
+# --filter narrows the sweep to model stems matching a glob.
+if [[ -n "${filter}" ]]; then
+    selected=()
+    for model in "${models[@]}"; do
+        stem="$(basename "${model}" .tflite)"
+        # shellcheck disable=SC2053  -- the glob is the point.
+        [[ "${stem}" == ${filter} ]] && selected+=("${model}")
+    done
+    models=(${selected[@]+"${selected[@]}"})
+    echo "filter: ${filter}"
+fi
 
 if [[ ${#models[@]} -eq 0 ]]; then
     echo "no .tflite models found in ${models_dir}" >&2
