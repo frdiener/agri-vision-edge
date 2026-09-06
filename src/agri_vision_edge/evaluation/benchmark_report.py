@@ -1,41 +1,8 @@
-"""
-Benchmark result aggregation and publication-level reporting.
+"""Aggregate benchmark artifacts into analysis frames, figures and LaTeX tables.
 
-This is the evaluation-time counterpart to :mod:`agri_vision_edge.evaluation.curves`:
-where ``curves`` charts *training* scalars over steps, this module aggregates the
-*evaluation* artifacts written by ``bin/benchmark_tflite.py`` (``latency.json`` /
-``runtime.json``) and ``bin/evaluate_coco.py`` (``metrics.json``) into one tidy
-frame, then renders the figures and LaTeX tables used in the thesis.
-
-Layout consumed::
-
-    benchmark_results/<platform>/<run>/{metrics,latency,runtime}.json
-    benchmark_results/<platform>/resize.json
-
-The second is not a run. It is the host's measured ``cv2.resize`` cost, written
-by ``scripts/benchmark_resize.py``, and it exists because every latency above
-contains one: ``predict()`` resizes the source frame to the model's input
-inside the timed region, by an amount that depends on both the evaluation
-regime and the input size. :func:`add_resize_cost` subtracts it, which is what
-makes the resolution ladder and the tiling study comparisons of the detector
-rather than of its preprocessing.
-
-The run name encodes the configuration and is decoded by :func:`parse_run_name`::
-
-    <tiling>_<arch>_<classes>_<dataset>_<size>_<precision>_<quant>[_<granularity>]_<nms>_<split>
-    untiled_ssd-mn2-fpnlite_mc_phenobench-tiled_320_int8_ptq_per-tensor_fastnms_val
-
-``<tiling>`` (``tiled`` / ``untiled``) is the prefix ``benchmark_all.sh`` puts on
-each result directory and names the *input regime the model was evaluated on* --
-every model is swept over both. It is orthogonal to the ``<dataset>`` token
-(``phenobench`` / ``phenobench-tiled``), which names the data the model was
-*trained* on; the cross of the two is the interesting axis. ``<granularity>``
-(``per-tensor`` / ``per-channel``) is present on int8 runs and omitted on fp32.
-Everything else is discovered dynamically: new platforms (i.MX 8M Plus, i.MX 93)
-and quantization schemes (``qatN``) appear automatically once their artifacts
-exist.
-Plot helpers return ``None`` when a comparison has too few groups to be
-meaningful, so callers can skip them without special-casing.
+Reads ``benchmark_results/<platform>/<run>`` artifacts and per-platform
+``resize.json`` measurements. Run names encode the evaluation and export
+configuration used by :func:`parse_run_name`.
 """
 
 from __future__ import annotations
@@ -51,8 +18,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.ticker import FuncFormatter
 
-# Reuse the shared axis styling so benchmark figures match the training-curve
-# figures (despined, grid-below, consistent spines).
+# Use the same axis styling as training-curve figures.
 from .curves import _prepare_axis
 
 # =========================================================
@@ -62,29 +28,20 @@ from .curves import _prepare_axis
 _PRECISIONS = {"fp32", "fp16", "int8", "int16", "dynamic"}
 _SPLITS = {"val", "test", "train", "eval"}
 _CLASSES = {"sc", "mc"}
-#: int8 weight granularities. Carried as a first-class field so it never leaks
-#: into the ``dataset`` token (both per-tensor and per-channel exports name it
-#: explicitly now, mirroring the conversion artifact filenames).
+#: INT8 weight granularity, kept separate from the dataset token.
 _GRANULARITIES = {"per-tensor", "per-channel"}
-#: Evaluation-input regimes, carried as the leading token of a benchmark result
-#: directory. Stripped before the architecture is read, otherwise it would be
-#: swallowed by the ``arch`` prefix and split every model in two.
+#: Evaluation input regime stored as the leading run-name token.
 _EVAL_TILINGS = {"tiled", "untiled"}
 
 ARCH_LABELS = {
     "ssd-mn2": "SSD MobileNetV2",
     "ssd-mn2-fpnlite": "SSD MobileNetV2 FPNLite",
-    # Auxiliary reference detectors. They are not part of the SSD comparison
-    # the thesis is built on -- they exist to say how far the operating point
-    # sits from a modern anchor-free single-stage detector -- but they share
-    # the deployment chain, so they belong in the same frame.
+    # Auxiliary detectors share the deployment pipeline but are not primary comparison models.
     "yolov7-tiny": "YOLOv7-tiny",
     "yolox-nano": "YOLOX-Nano",
 }
 
-#: Architectures the thesis' controlled comparison is built on. Everything else
-#: is auxiliary and has to be opted into, otherwise a detector that exists in
-#: one configuration only silently joins means taken over the full matrix.
+#: Architectures used for controlled comparisons.
 PRIMARY_ARCHS = ("ssd-mn2", "ssd-mn2-fpnlite")
 CLASS_LABELS = {
     "sc": "Single-class (weed)",
@@ -96,26 +53,10 @@ EVAL_TILING_LABELS = {
     "untiled": "Full-frame input",
 }
 
-#: The post-processing the toolchain emits by default, and what "shipping"
-#: means unless told otherwise. ``ave convert`` builds a matched pair for every
-#: deployable, keyed by the filename's NMS token: ``_fastnms`` is
-#: ``TFLite_Detection_PostProcess`` with ``use_regular_nms=False`` -- one
-#: class-agnostic pass over each anchor's argmax class -- and ``_regnms`` is the
-#: per-class pass the training checkpoint runs.
+#: Default export uses class-agnostic fast NMS.
 DEFAULT_NMS = "fastnms"
 
-#: The per-class alternative. **Also a deployable, and deployed.** It was
-#: converted, flashed and benchmarked on both boards under the delegate, and it
-#: carries the same metrics as any other variant, official evaluator included.
-#: Do not describe it as a diagnostic that "does not ship": the fused
-#: post-processing operator supports both modes, and which one an export uses is
-#: a deployment decision with a measurable accuracy/latency trade-off, not a
-#: property of the toolchain.
-#:
-#: It nevertheless plays a second role as the algorithm-matched **control**,
-#: because it is the mode the training checkpoint runs -- which is what lets the
-#: SavedModel rung be compared like for like and the substitution's cost be
-#: isolated from the format change.
+#: Per-class NMS export; also used as the checkpoint-matched control.
 REGULAR_NMS = "regnms"
 
 NMS_LABELS = {
@@ -143,12 +84,7 @@ _METRIC_KEYS = (
 
 
 def _classify_token(token: str) -> str | None:
-    """
-    Classify one run-name token into a configuration field.
-
-    Order-independent so renamed datasets and new ``qatN`` schemes parse
-    without code changes.
-    """
+    """Map a run-name token to a configuration field."""
     if token in _PRECISIONS:
         return "precision"
     if re.fullmatch(r"qat\d*|ptq", token):
@@ -165,26 +101,13 @@ def _classify_token(token: str) -> str | None:
 
 
 def parse_run_name(name: str) -> dict | None:
-    """
-    Decompose a run directory name into configuration fields.
+    """Parse a run directory or bare variant name into configuration fields.
 
-    Also accepts bare variant names (``artifacts/tf`` folders), which carry no
-    evaluation-tiling prefix; ``eval_tiling`` is then ``None``.
-
-    Args:
-        name:
-            Run directory name, e.g.
-            ``untiled_ssd-mn2-fpnlite_mc_phenobench-tiled_320_int8_ptq_fastnms_val``.
-
-    Returns:
-        Dict of configuration fields plus display labels, or ``None`` if the
-        name does not carry a recognizable ``sc``/``mc`` class token.
+    Returns ``None`` when no ``sc`` or ``mc`` class token is present.
     """
     tokens = name.split("_")
 
-    # The evaluation-input regime prefixes the run directory, i.e. it sits left
-    # of the architecture; strip it first so `arch` stays the plain model name
-    # and keeps matching ARCH_LABELS / the coverage variant keys.
+    # Remove the evaluation-tiling prefix before parsing the architecture.
     eval_tiling = None
     if tokens and tokens[0] in _EVAL_TILINGS:
         eval_tiling = tokens[0]
@@ -230,11 +153,7 @@ def parse_run_name(name: str) -> dict | None:
     }.get(info.get("granularity"), "")
     info["eval_tiling_label"] = EVAL_TILING_LABELS.get(eval_tiling, "")
 
-    # Compact label used on chart axes. It has to name the training dataset and
-    # the evaluation regime: the same architecture is trained on both the tiled
-    # and the untiled dataset and each model is then benchmarked on both inputs,
-    # so a label of arch + classes alone would collapse four distinct runs into
-    # one group and silently average them.
+    # Include training dataset and evaluation regime to keep run groups distinct.
     info["config"] = (
         f"{info['arch_label'].replace('SSD MobileNetV2', 'MNv2')}"
         f" | {info['classes'].upper()}"
@@ -259,15 +178,7 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _latency_fields(latency: dict) -> dict:
-    """
-    Latency summary for one run, preferring order statistics over the mean.
-
-    The benchmark already discards warm-up iterations, but a run still picks up
-    the odd scheduling outlier (seen: a single 367 ms sample against a 15 ms
-    median) which drags the mean and blows up the min/max range. The median and
-    p95 describe the achievable rate far better, so throughput is derived from
-    the median; the mean is kept for continuity.
-    """
+    """Extract latency statistics and derive FPS from median latency."""
 
     samples = sorted(latency.get("latencies_ms") or [])
 
@@ -284,8 +195,7 @@ def _latency_fields(latency: dict) -> dict:
 
     if samples:
         fields["p95_latency_ms"] = float(np.percentile(samples, 95))
-        # How far the mean is inflated by outliers -- a cheap tell that a run's
-        # timing was disturbed (see the sanity checks).
+        # Large max/median ratios flag disturbed timing runs.
         median = fields.get("median_latency_ms") or float(np.median(samples))
         if median:
             fields["latency_outlier_ratio"] = float(max(samples)) / float(median)
@@ -295,13 +205,9 @@ def _latency_fields(latency: dict) -> dict:
 
 
 def _runtime_fields(runtime: dict) -> dict:
-    """
-    Execution backend for one run.
+    """Extract the requested delegate and effective execution backend.
 
-    ``delegate`` is only the delegate that was *requested*; a missing or
-    unloadable one falls back to CPU. Newer artifacts record what was really
-    used, older ones do not, so an unknown backend is reported as such instead
-    of being optimistically read as accelerated.
+    Older artifacts without an effective backend are reported as ``unknown``.
     """
 
     requested = runtime.get("delegate_requested", runtime.get("delegate"))
@@ -317,21 +223,14 @@ def _runtime_fields(runtime: dict) -> dict:
         "delegate": requested,
         "delegate_active": runtime.get("delegate_active"),
         "backend": backend,
-        # Which pipeline stage produced the predictions. Artifacts written
-        # before this existed are all TFLite.
+        # Older artifacts without ``format`` are TFLite.
         "format": runtime.get("format", "tflite"),
         "input_dtype": _input_dtype(runtime),
     }
 
 
 def _input_dtype(runtime: dict) -> str | None:
-    """
-    Input dtype of the first input, across both artifact flavours.
-
-    TFLite records a repr (``<class 'numpy.float32'>``); the SavedModel runtime
-    records a bare name (``uint8``). Splitting on quotes unconditionally raises
-    on the latter, so fall back to the value as written.
-    """
+    """Return the first input dtype from TFLite or SavedModel runtime metadata."""
     details = runtime.get("input_details") or []
 
     if not details:
@@ -344,32 +243,10 @@ def _input_dtype(runtime: dict) -> str | None:
 
 
 def _faithful_fields(faithful: dict | None, *, classes: str | None) -> dict:
-    """
-    Official PhenoBench (``metrics_faithful.json``) metrics for one run.
+    """Normalize official PhenoBench metrics to 0-1 and add class metrics.
 
-    Upstream reports percentages; they are rescaled to the 0-1 range so they sit
-    in the same units as the pycocotools columns. ``mAP_cls`` is positional and
-    only interpretable with the class order, which newer artifacts carry as
-    ``class_names`` -- for older ones the upstream ``[crop, weed]`` order is
-    assumed.
-
-    ``faithful_mAP`` is upstream's own aggregate and is **not** comparable
-    across runs: it is the unweighted mean over whichever classes upstream
-    happened to score, which includes classes the model cannot predict (``crop``
-    for a weed-only model) and PhenoBench's partial semantic ids when upstream's
-    partial filter did not run. Prefer ``faithful_mAP_plants``, which averages
-    only the predictable classes and lines up with the pycocotools ``AP`` to
-    within ~0.6 AP -- see
-    :func:`agri_vision_edge.evaluation.faithful.annotate_class_metrics`.
-
-    Single-class runs need two further caveats, both flagged rather than
-    silently averaged away:
-
-    * ``faithful_mAP`` averages over crop and weed, so a weed-only model is
-      penalised for a class it cannot predict -- ``faithful_weed_AP`` is the
-      comparable number.
-    * results produced before the label remap scored weed predictions against
-      crop ground truth and are simply invalid (``faithful_stale``).
+    Older single-class artifacts without ``class_names`` are marked stale. Use
+    ``faithful_mAP_plants`` for comparable plant-only aggregate AP.
     """
 
     if not faithful:
@@ -396,8 +273,7 @@ def _faithful_fields(faithful: dict | None, *, classes: str | None) -> dict:
 
     predicted = faithful.get("predicted_classes")
 
-    # Artifacts without `class_names` predate the label remap; for single-class
-    # runs that remap is exactly what was broken, so those numbers are unusable.
+    # Older single-class artifacts predate the label remap and are invalid.
     fields["faithful_stale"] = "class_names" not in faithful and classes == "sc"
     fields["faithful_partial_classes"] = bool(
         predicted is not None and len(predicted) < len(names)
@@ -407,7 +283,7 @@ def _faithful_fields(faithful: dict | None, *, classes: str | None) -> dict:
 
 
 def _pct(value) -> float | None:
-    """Upstream percentage -> 0-1 fraction, matching the pycocotools columns."""
+    """Convert an upstream percentage to a 0-1 fraction."""
     return None if value is None else float(value) / 100.0
 
 
@@ -415,21 +291,10 @@ def load_benchmark_results(
     root: str | Path = "benchmark_results",
     exclude_dirs: Iterable[str] = NON_PLATFORM_DIRS,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Scan every platform / run under ``root`` into one tidy frame.
+    """Load benchmark runs into one frame.
 
-    Args:
-        root:
-            ``benchmark_results`` directory.
-        exclude_dirs:
-            Top-level directory names to skip (non-platform, e.g. ``attic``).
-
-    Returns:
-        ``(df, skipped)`` where ``df`` has one row per successful run with
-        configuration fields, pycocotools metrics (overall + per-class), the
-        official PhenoBench metrics when ``metrics_faithful.json`` is present,
-        latency order statistics and the execution backend; ``skipped`` lists
-        ``platform/run`` entries that were not loadable.
+    Returns ``(df, skipped)``; ``skipped`` records failed, invalid, missing and
+    unparsed runs.
     """
     root = Path(root)
     exclude = set(exclude_dirs)
@@ -451,10 +316,7 @@ def load_benchmark_results(
 
             metrics = _read_json(run_dir / "metrics.json")
             if metrics is None:
-                # A run whose predictions failed the integrity check has its
-                # metrics.json removed and a metrics_invalid.json left behind.
-                # Say so, otherwise it is indistinguishable from a run that was
-                # simply never evaluated.
+                # ``metrics_invalid.json`` marks runs rejected by the prediction integrity check.
                 if (run_dir / "metrics_invalid.json").exists():
                     skipped.append(f"{tag} (corrupt predictions)")
                 else:
@@ -468,10 +330,7 @@ def load_benchmark_results(
 
             row = dict(info)
             row["platform"] = platform_dir.name
-            # A `<board>_cpu` results tree is the same board with the delegate
-            # switched off, not a separate target. Carry the board separately
-            # from the backend so figures can group by hardware instead of
-            # treating the CPU reference run as a peer platform.
+            # ``<board>_cpu`` is the same device with delegation disabled.
             row["device"] = platform_dir.name.removesuffix("_cpu")
 
             for key in _METRIC_KEYS:
@@ -504,21 +363,10 @@ def load_benchmark_results(
 
 
 def select_nms(df: pd.DataFrame, nms: str | None = DEFAULT_NMS) -> pd.DataFrame:
-    """
-    Narrow a run frame to one post-processing variant.
+    """Filter to one NMS variant while retaining rows without an NMS token.
 
-    **Call this before any aggregation.** Every deployable is converted twice,
-    once with each NMS implementation, so a frame straight out of
-    :func:`load_benchmark_results` carries two rows per configuration that are
-    identical in every grouping key a table or figure uses. Without this filter
-    a "per scheme" row silently becomes a mean over two post-processing
-    algorithms, and a per-run table grows a duplicate for every deployable --
-    measured on the current sweep: 224 of 590 configuration groups.
-
-    Rows with no NMS token are kept regardless: the SavedModel reference tree
-    and the YOLO exports have no such pair, and dropping them would remove the
-    very rung the ladder needs. Pass ``nms=None`` to keep everything, which is
-    only correct when the caller groups on ``nms`` itself.
+    Use before aggregations that do not group by ``nms``. Pass ``None`` to keep
+    all variants.
     """
     if df.empty or nms is None or "nms" not in df.columns:
         return df
@@ -529,19 +377,11 @@ def select_nms(df: pd.DataFrame, nms: str | None = DEFAULT_NMS) -> pd.DataFrame:
 # Preprocessing cost
 # =========================================================
 
-#: Written by ``scripts/benchmark_resize.py``, one per measurement host::
-#:
-#:     benchmark_results/<platform>/resize.json
-#:
-#: A file rather than a directory, deliberately: :func:`load_benchmark_results`
-#: walks directories only, so the artifact can sit beside the runs it corrects
-#: without being scanned as a run that has no metrics.
+#: Per-platform resize measurements written by ``scripts/benchmark_resize.py``.
+#: Stored as a file so the run-directory scan ignores it.
 RESIZE_ARTIFACT = "resize.json"
 
-#: Latency columns the correction is applied to, and the corrected name each
-#: gets. ``min``/``max`` are excluded on purpose: a run's fastest inference and
-#: its slowest did not both pay the median resize, and subtracting a central
-#: estimate from an extreme produces a number with no defensible meaning.
+#: Latency statistics corrected for resize cost; min/max are not corrected.
 _CORRECTED_LATENCY_COLUMNS = {
     "median_latency_ms": "median_latency_ms_net",
     "mean_latency_ms": "mean_latency_ms_net",
@@ -552,17 +392,9 @@ _CORRECTED_LATENCY_COLUMNS = {
 def load_resize_costs(
     root: str | Path = "benchmark_results",
 ) -> pd.DataFrame:
-    """
-    Every host's measured ``cv2.resize`` cost, as one tidy frame.
+    """Load measured resize costs, one row per platform, input regime and size.
 
-    One row per ``(platform, eval_tiling, size)``: the preprocessing every run
-    in that cell paid inside its timed region, measured in isolation on the
-    same host by ``scripts/benchmark_resize.py`` (which documents what the
-    number is and is not).
-
-    ``size`` is a string, matching :func:`parse_run_name`'s token rather than
-    the integer the artifact stores, so the frame joins straight onto a run
-    frame without a cast at every call site.
+    ``size`` is stored as a string to match parsed run metadata.
     """
     root = Path(root)
 
@@ -604,18 +436,7 @@ def load_resize_costs(
 
 
 def _resize_platform_candidates(platform: str) -> list[str]:
-    """
-    The trees a run's platform may find its resize measurement filed under.
-
-    Resize runs on the CPU whatever the delegate is doing and whatever delegate
-    *build* is installed, so ``frdm-imx93``, ``frdm-imx93_cpu`` and
-    ``frdm-imx93_unpatched`` all pay the same preprocessing -- one measurement
-    per board, not per results tree. Suffixes are joined with ``_`` and board
-    hostnames use ``-``, so the leading token is the board.
-
-    Exact match first regardless, so a tree that does have its own artifact is
-    never overridden by the board's.
-    """
+    """Return resize-artifact lookup keys for a results-tree name, exact match first."""
     candidates = [platform, platform.removesuffix("_cpu"), platform.split("_")[0]]
 
     seen: list[str] = []
@@ -633,44 +454,10 @@ def add_resize_cost(
     *,
     statistic: str = "resize_median_ms",
 ) -> pd.DataFrame:
-    """
-    Attach the preprocessing cost of each run, and the latency net of it.
+    """Attach measured resize cost and latency with that cost removed.
 
-    Every latency in this frame is the wall time of ``runtime.predict()``, and
-    that call begins by resizing the source frame to the model's input. The
-    resize is genuine deployment work, so the uncorrected figure is the right
-    one to quote for "what does this cost to run" -- but it is *not* model
-    compute, and its size is set by the pair (source resolution, input size),
-    which the sweep varies on two axes at once::
-
-        untiled runs feed a 1024x1024 frame; tiled runs feed a 512x512 tile,
-        and the input size ranges over 320 / 512 / 1024.
-
-    So a 320 model evaluated untiled is charged a 1024->320 downscale that the
-    1024 model evaluated on the same frames does not pay, and the tiling
-    comparison moves the source resolution underneath everything in it. The
-    ``*_net`` columns take that term out, which is what makes the resolution
-    ladder and the tiling study comparisons of the detector rather than of the
-    preprocessing.
-
-    Runs with no measurement for their host get ``NaN``, never the uncorrected
-    value: a silently uncorrected row in a corrected column is a wrong number,
-    whereas a missing one is a missing measurement and says so.
-
-    The ``tf-savedmodel*`` trees stay ``NaN`` for a second, better reason, and
-    it is not an omission to be fixed: those graphs carry a
-    ``fixed_shape_resizer`` and are fed at native resolution, so they contain
-    no ``cv2.resize`` to subtract at all (see
-    :mod:`agri_vision_edge.runtime.inference.saved_model`). Filing a resize
-    artifact under them would subtract work that never happened.
-
-    Args:
-        df: run frame from :func:`load_benchmark_results`.
-        costs: frame from :func:`load_resize_costs`, or the results root to
-            load it from.
-        statistic: which order statistic to subtract. The median matches the
-            column the report quotes latency from; ``resize_mean_ms`` pairs
-            with ``mean_latency_ms`` if a caller wants like for like.
+    Unmatched rows remain ``NaN``. SavedModel rows have no external ``cv2.resize``
+    cost to subtract.
     """
     if df.empty:
         return df
@@ -712,10 +499,7 @@ def add_resize_cost(
         if column not in out.columns:
             continue
 
-        # Clipped at zero rather than allowed negative. A negative "compute
-        # time" is nonsense to print, and the only way to reach one is a resize
-        # measured under different conditions than the run -- which the
-        # magnitude of the clip makes obvious in the frame.
+        # Clamp invalid negative corrected latencies to zero.
         out[corrected] = (
             pd.to_numeric(out[column], errors="coerce") - out["resize_ms"]
         ).clip(lower=0.0)
@@ -723,9 +507,7 @@ def add_resize_cost(
     net = out["median_latency_ms_net"]
     out["fps_net"] = np.where(net > 0, 1000.0 / net, np.nan)
 
-    # What fraction of the measured latency was preprocessing. This is the
-    # number that decides whether the correction is worth quoting at all: a few
-    # percent on a 1024 model, far more on a 320 model fed full frames.
+    # Fraction of measured median latency spent resizing.
     if "median_latency_ms" in out.columns:
         measured = pd.to_numeric(out["median_latency_ms"], errors="coerce")
         out["resize_share"] = out["resize_ms"] / measured.where(measured > 0)
@@ -736,13 +518,7 @@ def add_resize_cost(
 def resize_cost_table(
     costs: pd.DataFrame | str | Path = "benchmark_results",
 ) -> pd.DataFrame:
-    """
-    The measured preprocessing cost per host, as a table for the appendix.
-
-    One row per host and source resolution, one column per model input size --
-    the shape the correction is applied in, so a reader can check any ``*_net``
-    figure against it by hand.
-    """
+    """Format measured resize costs by host, source size and model input size."""
     if not isinstance(costs, pd.DataFrame):
         costs = load_resize_costs(costs)
 
@@ -793,7 +569,7 @@ _PUBLICATION_RCPARAMS = {
 
 
 def apply_publication_style() -> None:
-    """Apply the serif, despined publication theme (extends ``curves``)."""
+    """Apply the shared publication plotting style."""
     plt.rcParams.update(_PUBLICATION_RCPARAMS)
 
 
@@ -812,28 +588,10 @@ def _grouped_bars(
     horizontal=False,
     percent=False,
 ):
-    """
-    Draw side-by-side bar groups.
+    """Draw grouped bars.
 
-    Args:
-        values:
-            Mapping ``{group_label: [value per category]}``.
-        percent:
-            Scale AP fractions to upstream's percentage-point convention
-            (``39.4``, not ``0.3940``) and mark the axis with ``(%)``. The bar
-            labels are the reason: at three decimals a fraction spends five
-            glyphs to carry two digits of information, and on a thesis page
-            that is the difference between a readable figure and a grey smear.
-            Tables reach the same convention through ``percent=`` arguments of
-            their own, so figure and table agree.
-        fmt:
-            Label format. ``None`` picks one to match ``percent``.
-        horizontal:
-            Put the categories on the **y** axis and the bars along x. Worth it
-            once the category labels stop fitting side by side: a vertical
-            chart has to share one figure width between every category, while a
-            horizontal one gives each label a full line and grows downward
-            instead (see :func:`plot_quantization_effect`).
+    ``percent`` scales fractional values by 100. ``horizontal`` places categories
+    on the y axis. ``fmt`` controls value labels.
     """
 
     def _missing(v):
@@ -854,11 +612,7 @@ def _grouped_bars(
     x = np.arange(len(categories))
     width = 0.8 / n_groups
 
-    # Vertical bars split one figure width between *every* bar, so what decides
-    # whether a label fits is the total, not the bars per group: five schemes
-    # across two variants is roomy, the same five across eight is where
-    # "46.546.3" comes from. Upright text needs only the bar's own width.
-    # Horizontal bars each own a full line and never collide.
+    # Rotate value labels when vertical grouped bars become too dense.
     label_rotation = 90 if (not horizontal and n_groups * len(categories) > 12) else 0
 
     for i, glabel in enumerate(group_labels):
@@ -883,10 +637,7 @@ def _grouped_bars(
                 if v is None or (isinstance(v, float) and np.isnan(v)):
                     continue
 
-                # The label sits on the far side of the bar's tip, so it
-                # follows the bar's direction: a negative bar grows away from
-                # the axis and its label has to go with it, or it is written
-                # back over the bar it belongs to.
+                # Place labels beyond the bar tip, including negative bars.
                 negative = v < 0
 
                 if horizontal:
@@ -917,9 +668,7 @@ def _grouped_bars(
         ax.margins(x=0.15)
     else:
         ax.set_xticks(x)
-        # Anchor rotated labels by their upper (right) end at the tick, so the
-        # text reads from the category position outward instead of being centred
-        # under it (much easier to read with long labels).
+        # Anchor rotated category labels at their ticks.
         ax.set_xticklabels(
             categories,
             rotation=rotation,
@@ -935,17 +684,9 @@ def _grouped_bars(
 
 
 def _legend_outside(fig, ax, **kwargs):
-    """
-    Put the legend right of the axes and actually reserve room for it.
+    """Place a legend to the right of the axes and reserve its width.
 
-    ``tight_layout`` only measures artists *inside* the axes, and neither the
-    notebook's inline render nor :func:`save_figure` passes
-    ``bbox_inches="tight"``. An outside legend is therefore drawn over whatever
-    happens to be beside it unless the space is taken out of the axes first --
-    which is what the ``subplots_adjust`` here does, using the legend's own
-    measured width rather than a guessed fraction.
-
-    Call it *after* ``tight_layout``; that would otherwise undo the reservation.
+    Call after ``tight_layout``.
     """
     legend = ax.legend(
         loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0, **kwargs
@@ -956,18 +697,7 @@ def _legend_outside(fig, ax, **kwargs):
 
 
 def reserve_legend_space(fig, pad: float = 0.04, passes: int = 3) -> None:
-    """
-    Take the width of the widest outside legend out of the axes.
-
-    Measures *every* legend on the figure, not just one: a plot with a second
-    legend below the first reserves too little if only the first is measured,
-    and the wider one is then clipped at the figure edge.
-
-    Iterates because the reservation is a fixed point, not a calculation. The
-    legend is anchored in *axes* coordinates, so narrowing the axes moves it and
-    changes the extent that decided how far to narrow them. A single pass
-    undershoots and still clips; three settle it.
-    """
+    """Reserve figure width for the widest outside legend."""
     right = 1.0
 
     for _ in range(passes):
@@ -999,15 +729,7 @@ def reserve_legend_space(fig, pad: float = 0.04, passes: int = 3) -> None:
 def _variant_label(
     frame: pd.DataFrame, columns: Iterable[str] = ("classes", "dataset", "size")
 ) -> pd.Series:
-    """
-    Architecture, joined with whichever of ``columns`` actually varies.
-
-    Two reasons, one cosmetic and one not. A label repeating ``MC | phenobench``
-    on every row spends axis width to say nothing, and that width comes out of
-    the bars. And ``size`` belongs in the list because a resolution that is not
-    part of the label is not part of the grouping either -- the rows are then
-    averaged into one bar with nothing on the axis admitting it.
-    """
+    """Build labels from architecture and configuration fields that vary."""
     label = _short(frame["arch_label"])
 
     for col in columns:
@@ -1035,24 +757,9 @@ def plot_quantization_effect(
     platform: str | None = None,
     nms: str | None = DEFAULT_NMS,
 ):
-    """FP32 vs INT8 on overall AP and weed AP (PTQ runs).
+    """Plot FP32 versus per-tensor PTQ INT8 AP and weed AP.
 
-    INT8 is represented by the per-tensor export (the default deployment
-    granularity) so each config contributes one FP32/INT8 pair; per-channel PTQ
-    is compared separately elsewhere.
-
-    Bars are **horizontal**, and the figure height grows with the number of
-    categories. Vertical bars do not survive a multi-platform sweep: one
-    category is ``platform | arch | classes | trained-on | eval-input``, so the
-    count is the product of all five and every added platform multiplies it.
-    At four platforms that is 67 categories sharing a 10-inch axis -- 0.15 in
-    each, for labels averaging 56 characters -- which no rotation can rescue.
-    Horizontal bars give each label its own line, and the two metric panels sit
-    side by side sharing one set of labels instead of repeating them.
-
-    ``eval_tiling`` / ``platform`` narrow the figure the same way
-    :func:`plot_scheme_effect` does; without them every regime and board is
-    shown at once.
+    Optional ``platform`` and ``eval_tiling`` arguments restrict the comparison.
     """
     df = select_nms(df, nms)
     df = df[df.get("quant") == "ptq"].copy() if "quant" in df else df.copy()
@@ -1114,20 +821,13 @@ def plot_quantization_effect(
     return fig
 
 
-#: Tree whose CPU runs stand in for "unaccelerated reference" everywhere: a
-#: conventional x86-64 machine, named for the ISA rather than a hostname so the
-#: contrast against the ARM boards is what the name carries. Nine functions
-#: below take it as a default, so a value that matches no directory empties
-#: them all silently -- `sanity_checks` asserts it resolves.
+#: CPU reference tree used for cross-device correctness checks.
 CPU_REFERENCE_PLATFORM = "x86_cpu"
 
 #: Metrics compared when checking that every CPU tree agrees with the reference.
 CPU_REFERENCE_METRICS = ("AP", "AP50", "AP75", "weed_AP", "crop_AP")
 
-#: Largest absolute metric difference still counted as "same result". CPU INT8
-#: predictions are bit-identical across x86 and ARM; only fp32 kernels differ,
-#: and only by pycocotools accumulation noise (measured max 2.3e-07 AP). Four
-#: orders of magnitude below the spread between INT8 *backends* (0.002-0.008).
+#: Tolerance for CPU-reference metric differences.
 CPU_REFERENCE_TOLERANCE = 1e-5
 
 
@@ -1137,17 +837,10 @@ def cpu_reference_divergence(
     reference: str = CPU_REFERENCE_PLATFORM,
     metrics: Iterable[str] = CPU_REFERENCE_METRICS,
 ) -> pd.DataFrame:
-    """
-    How far each CPU-backend results tree sits from the reference host's.
+    """Compare CPU result trees with the reference over shared configurations.
 
-    Reporting one CPU curve instead of one per board is only honest if the
-    boards actually agree, so this is the check that licenses it -- run it
-    before any figure that collapses them. One row per
-    ``(platform, metric)`` with the worst and mean absolute difference over the
-    configs the two have in common.
-
-    Empty when there is nothing to compare (no reference tree, or no other CPU
-    tree), which callers should treat as "unverified", not "passed".
+    Returns per-platform metric differences. An empty frame means no comparison was
+    possible.
     """
     if df.empty or "backend" not in df.columns:
         return pd.DataFrame()
@@ -1174,8 +867,7 @@ def cpu_reference_divergence(
 
     def _indexed(frame):
         f = frame.copy()
-        # fp32 rows carry no granularity; NaN never equals NaN, so a NaN key
-        # would silently drop every float config from the comparison.
+        # Replace missing key values so FP32 rows survive index matching.
         for k in keys:
             f[k] = f[k].astype("object").where(f[k].notna(), "-")
         f = f.set_index(keys)
@@ -1216,7 +908,7 @@ def cpu_reference_holds(
     *,
     tolerance: float = CPU_REFERENCE_TOLERANCE,
 ) -> bool:
-    """Whether every compared CPU tree matched the reference within tolerance."""
+    """Return whether all CPU-reference differences are below ``tolerance``."""
     if divergence.empty:
         return False
     return bool((divergence["max_abs_diff"] < tolerance).all())
@@ -1240,26 +932,10 @@ def plot_scheme_effect(
     platform: str | None = CPU_REFERENCE_PLATFORM,
     nms: str | None = DEFAULT_NMS,
 ):
-    """
-    All five quantization schemes side by side, one bar group per variant.
+    """Plot ``metric`` across export schemes for each model variant.
 
-    This is the figure for the PTQ-vs-QAT question, and unlike an aggregated
-    FP32-vs-INT8 view it shows each export on its own: a single broken scheme
-    stays visible instead of being averaged into an "INT8" bar.
-
-    ``nms`` is pinned for the same reason ``platform`` is: a bar is a mean over
-    the matching rows, and the default export and its algorithm-matched
-    control both match, so leaving it open silently halves the substitution's
-    cost into every INT8 bar.
-
-    ``platform`` defaults to the CPU reference, which makes this the *export*
-    comparison -- quantization cost with the accelerator held out. It has to be
-    pinned to one platform: a bar is a mean over the matching rows, so leaving
-    it open averages every board into each bar. With the i.MX8MP's collapsed
-    per-channel runs in the frame that turned a 0.313 bar into 0.235, a number
-    describing no configuration that exists. Pass ``platform=None`` deliberately
-    to get the old cross-platform mean; use :func:`plot_backend_effect` for the
-    CPU-vs-NPU question.
+    The default fixes the CPU reference platform and one NMS variant. Set
+    ``platform=None`` only when a cross-platform mean is intended.
     """
     if df.empty or metric not in df.columns:
         return None
@@ -1300,19 +976,17 @@ def plot_scheme_effect(
         title=(
             f"{metric} by quantization scheme"
             + (f" ({eval_tiling} input)" if eval_tiling else "")
-            + (f" — {platform}" if platform else " — mean over platforms")
+            + (f" - {platform}" if platform else " - mean over platforms")
         ),
         rotation=20,
     )
-    # Outside the axes: the bars reach the top of the plotting area and their
-    # value labels sit above them, so an in-axes legend lands on the numbers.
+    # Keep the legend outside the data region.
     fig.tight_layout()
     _legend_outside(fig, ax, title="scheme")
     return fig
 
 
-#: Bar colours for the backend comparison: the CPU reference first, then the
-#: accelerated boards.
+#: Backend comparison colours: CPU reference first, then NPU targets.
 BACKEND_COLORS = ("#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3")
 
 
@@ -1324,19 +998,7 @@ def plot_backend_effect(
     reference: str = CPU_REFERENCE_PLATFORM,
     nms: str | None = DEFAULT_NMS,
 ):
-    """
-    INT8 on the CPU reference vs each NPU delegate, per variant and scheme.
-
-    The companion to :func:`plot_scheme_effect`: that one holds the hardware
-    fixed and varies the export, this one holds the export fixed and varies the
-    hardware. Splitting them is what keeps either readable -- a single figure
-    crossing both axes is the product of every variant, scheme and board.
-
-    Only INT8 exports appear, because that is the only precision an NPU
-    delegate actually accelerates; the float baseline lives in the scheme
-    figure. A delegate that reproduces its CPU reference should draw bars of
-    equal height, so any visible gap is the accelerator changing the result.
-    """
+    """Plot INT8 accuracy on the CPU reference and each NPU delegate."""
     if df.empty or metric not in df.columns or "backend" not in df.columns:
         return None
 
@@ -1348,8 +1010,7 @@ def plot_backend_effect(
 
     sel = add_scheme(sel)
 
-    # One series per hardware backend: the CPU reference, then each board that
-    # actually ran through a delegate.
+    # One series for the CPU reference and one for each delegated target.
     is_reference = (sel["platform"] == reference) & (sel["backend"] == "cpu")
     sel = sel[is_reference | (sel["backend"] == "delegate")].copy()
     sel["series"] = np.where(
@@ -1397,7 +1058,7 @@ def plot_backend_effect(
 
 
 def plot_single_vs_multiclass(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
-    """Weed AP under single-class vs multi-class regimes."""
+    """Plot weed AP for single-class and multi-class models."""
     if df.empty or df["classes"].nunique() < 2:
         return None
 
@@ -1440,7 +1101,7 @@ def plot_single_vs_multiclass(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS
 
 
 def plot_architecture_effect(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
-    """Overall AP per architecture (SSD MobileNetV2 vs FPNLite)."""
+    """Plot overall AP by architecture."""
     if df.empty or df["arch"].nunique() < 2:
         return None
 
@@ -1480,7 +1141,7 @@ def plot_architecture_effect(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS)
 
 
 def plot_per_class_ap(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
-    """Crop vs weed AP for multi-class runs."""
+    """Plot crop and weed AP for multi-class runs."""
     if "crop_AP" not in df:
         return None
     df = select_nms(df, nms)
@@ -1519,7 +1180,7 @@ def plot_per_class_ap(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
 
 
 def plot_ap_by_area(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
-    """AP broken down by COCO object area (small / medium / large)."""
+    """Plot COCO AP by object area."""
     if df.empty:
         return None
 
@@ -1549,7 +1210,7 @@ def plot_ap_by_area(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
 
 
 def plot_latency(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
-    """Horizontal mean-latency bars with min/max whiskers, per run."""
+    """Plot per-run mean latency with min/max whiskers."""
     if "mean_latency_ms" not in df:
         return None
     df = select_nms(df, nms)
@@ -1592,7 +1253,7 @@ def plot_latency(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
             xytext=(3, 0),
             textcoords="offset points",
         )
-    ax.set_xlabel("mean latency (ms)  —  min/max whiskers")
+    ax.set_xlabel("mean latency (ms), min/max whiskers")
     ax.set_title("Inference latency per run")
     _prepare_axis(ax)
     ax.grid(axis="y", visible=False)
@@ -1600,22 +1261,12 @@ def plot_latency(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
     return fig
 
 
-#: Trees that are references rather than deployment targets. Their latency
-#: answers no question the trade-off asks: the SavedModel rung is a scoring
-#: reference, and the x86 CPU exists to establish that a device run computed
-#: the right answer -- comparing a desktop's milliseconds against an embedded
-#: board's is a statement about two machine classes, not about a deployment.
+#: Reference-only trees excluded from deployment latency comparisons.
 NON_TARGET_PLATFORMS = ("tf-savedmodel", "tf-savedmodel-nms0", CPU_REFERENCE_PLATFORM)
 
 
 def platform_label(platform: str) -> str:
-    """
-    Short figure label for a results tree: ``frdm-imx8mp_cpu`` -> ``i.MX8MP CPU``.
-
-    The directory names carry a vendor prefix and encode the backend as a
-    suffix, which makes them long and makes the CPU/NPU distinction -- the one
-    a reader is actually comparing -- the least visible part of the string.
-    """
+    """Convert a results-tree name to a short board/backend label."""
     name = platform
     backend = "CPU" if name.endswith("_cpu") else "NPU"
     name = name.removesuffix("_cpu").removesuffix("_unpatched")
@@ -1629,12 +1280,7 @@ def platform_label(platform: str) -> str:
     return f"{pretty} {backend}{suffix}"
 
 
-#: Marker per export scheme -- the *whole* scheme, not just its granularity.
-#: A scheme is a quantization method **and** a granularity, so keying the shape
-#: on granularity alone does not identify a point: `ptq_per-tensor` and
-#: `qat_per-tensor` drew the same circle in the same colour, and the same
-#: token appeared twice in a panel meaning two different exports. Colour is
-#: already platform, so the shape has to carry both halves.
+#: Marker identifies the full export scheme; colour identifies platform.
 SCHEME_MARKERS = {
     "fp32_ptq": "^",
     "int8_ptq_per-tensor": "o",
@@ -1651,19 +1297,9 @@ def plot_accuracy_latency(
     exclude_platforms: Iterable[str] = NON_TARGET_PLATFORMS,
     facet: str = "arch_label",
 ):
-    """
-    Accuracy / latency trade-off, one panel per architecture.
+    """Plot AP versus latency, faceted by architecture.
 
-    Faceted rather than pooled because accuracy here is set by architecture and
-    export scheme -- the delegates reproduce their CPU reference to within
-    0.002 AP -- while latency is set by platform and granularity. Pooled, the
-    two detectors form two AP bands that share no range, and most of the axis
-    is empty space between them.
-
-    Colour is platform and shape is the export scheme, which together identify
-    a point uniquely, so none needs a text label. An earlier version annotated
-    every point with its full configuration -- after scoping to one cell, the
-    same string on all of them.
+    Colour encodes platform and marker shape encodes export scheme.
     """
     if "mean_latency_ms" not in df:
         return None
@@ -1672,8 +1308,7 @@ def plot_accuracy_latency(
 
     sel = add_scheme(select_nms(df, nms))
     sel = sel[~sel["platform"].isin(set(exclude_platforms))]
-    # `_unpatched` is the same board under an older delegate build: a build
-    # comparison (§4.3), not a deployment option.
+    # Exclude alternate delegate builds from deployment comparisons.
     sel = sel[~sel["platform"].str.endswith("_unpatched")]
     sel = sel[sel["mean_latency_ms"].notna() & sel["AP"].notna()].copy()
     if sel.empty:
@@ -1737,10 +1372,7 @@ def plot_accuracy_latency(
 
     fig.suptitle("Accuracy / latency trade-off")
     fig.tight_layout()
-    # No `add_artist` here. That idiom keeps a first legend alive when a second
-    # is added to the *same* axes, but these sit on different ones -- and
-    # re-registering the object matplotlib already holds as `axes[0].legend_`
-    # draws it twice, text over itself, which reads as a doubled label.
+    # Legends are on different axes; adding the first legend as an artist would draw it twice.
     _legend_outside(fig, axes[0], handles=platform_handles, title="platform")
     axes[-1].legend(
         handles=scheme_handles,
@@ -1749,8 +1381,7 @@ def plot_accuracy_latency(
         bbox_to_anchor=(1.01, 0.0),
         borderaxespad=0.0,
     )
-    # Again, now that the second legend exists: the reservation is sized to the
-    # widest one, and this is the first moment both can be measured.
+    # Recompute reservation after both legends exist.
     reserve_legend_space(fig)
     return fig
 
@@ -1759,9 +1390,7 @@ def plot_accuracy_latency(
 # Thesis tables
 # =========================================================
 
-#: Published PhenoBench plant-detection baselines (test split), as printed in
-#: the dataset paper. Percentages, so they share the units of the *faithful*
-#: (upstream torchmetrics) columns -- never mix them with the pycocotools ones.
+#: Published PhenoBench plant-detection baselines, in percentage units.
 PHENOBENCH_BASELINES = (
     {
         "Approach": "Faster R-CNN",
@@ -1800,32 +1429,15 @@ def upstream_comparison_table(
     include_baselines: bool = True,
     nms: str | None = DEFAULT_NMS,
 ) -> pd.DataFrame:
-    """
-    Our detectors next to the published PhenoBench baselines.
+    """Compare local runs with published PhenoBench baselines.
 
-    Only runs that are actually comparable to the upstream leaderboard are
-    eligible, which is a narrow slice:
-
-    * **multi-class** -- upstream averages mAP over crop and weed, so a
-      weed-only model is scored against a class it cannot predict;
-    * **untiled training data and untiled evaluation** -- the upstream number is
-      a full-frame 1024x1024 one, and our tile-wise faithful evaluation is
-      explicitly not that;
-    * **official metrics only** -- the ``faithful_*`` columns, in upstream
-      percentage units. Runs whose faithful metrics predate the label remap are
-      dropped rather than shown as-is.
-
-    Note that the upstream figures are on the *test* split while ours are on
-    val, so this is an orientation, not a like-for-like ranking.
+    Uses official metrics and restricts local rows to multi-class, full-frame
+    training and full-frame evaluation. Published baselines use the test split.
     """
     if df.empty or "faithful_mAP" not in df.columns:
         return pd.DataFrame()
 
-    # The default export only. Both variants are deployable, so this is a
-    # presentation choice rather than a correctness one: listing a model twice
-    # under two post-processing settings on a leaderboard-style table invites
-    # the reader to compare our best configuration against upstream's single
-    # published one.
+    # Use one NMS export in leaderboard-style comparisons.
     df = select_nms(df, nms)
 
     sel = df[
@@ -1894,23 +1506,10 @@ def scheme_comparison_table(
     metrics: Iterable[tuple[str, str]] = _SCHEME_METRICS,
     drop_constant_keys: bool = True,
 ) -> pd.DataFrame:
-    """
-    PTQ vs. QAT per model variant: one row per (variant, scheme).
+    """Build one row per model variant and export scheme.
 
-    This is the table the quantization chapter is built on, so it also carries
-    ``dAP vs fp32`` -- the whole point is how far each INT8 export falls behind
-    (or ahead of) its own float baseline, which raw AP columns make the reader
-    compute by hand.
-
-    Rows are pycocotools metrics (our internally consistent numbers), not the
-    upstream ones; mixing the two in a single table would be meaningless.
-
-    Scoped to the default post-processing. The scheme axis and the NMS axis are
-    independent, so leaving both open would put two rows per scheme in the
-    table with nothing to tell them apart -- and quantization cost is not the
-    place to also price a post-processing swap. Both variants are deployable,
-    so ``nms=REGULAR_NMS`` reads the same table for the per-class export;
-    ``nms=None`` only if you are grouping on it yourself.
+    Uses pycocotools metrics and includes AP change relative to that variant's FP32
+    baseline. NMS is fixed unless ``nms=None``.
     """
     if df.empty:
         return pd.DataFrame()
@@ -1968,10 +1567,7 @@ def scheme_comparison_table(
     table = pd.DataFrame(rows)
 
     if drop_constant_keys and not table.empty:
-        # Columns the caller pinned carry no information per row -- `platform`
-        # and `eval_tiling` are arguments of this function, so they repeat one
-        # value down the table and push the metrics off the page. `arch_label`
-        # and `Scheme` stay unconditionally: they are what a row *is*.
+        # Drop pinned configuration columns that repeat one value.
         constant = [
             k
             for k in variant_keys
@@ -1988,9 +1584,7 @@ def platform_metrics_table(
     *,
     eval_tiling: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Full COCO metrics for every run on one device (one table per device).
-    """
+    """Format full COCO metrics for one platform."""
     sel = df[df["platform"] == platform] if not df.empty else df
     if eval_tiling is not None and not sel.empty:
         sel = sel[sel["eval_tiling"] == eval_tiling]
@@ -2031,13 +1625,7 @@ def platform_metrics_table(
 
 
 def latency_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Median / p95 latency and throughput per platform, backend and scheme.
-
-    Reported on the median rather than the mean: the sweeps pick up occasional
-    scheduling outliers an order of magnitude above the typical sample, which
-    the mean happily absorbs (see ``latency_outlier_ratio``).
-    """
+    """Format median and p95 latency plus throughput by platform, backend and scheme."""
     if df.empty or "median_latency_ms" not in df.columns:
         return pd.DataFrame()
 
@@ -2045,9 +1633,7 @@ def latency_table(df: pd.DataFrame) -> pd.DataFrame:
     if sel.empty:
         return pd.DataFrame()
 
-    # `nms` is a grouping key, not a nuisance column: the two variants are
-    # separate runs of separate graphs, so folding them into one median mixes
-    # two post-processing implementations into a number describing neither.
+    # Keep NMS as a grouping key; the variants are separate graphs.
     keys = [
         k
         for k in ("platform", "backend", "arch_label", "size", "scheme", "nms")
@@ -2085,42 +1671,18 @@ def latency_table(df: pd.DataFrame) -> pd.DataFrame:
 # Sanity checks
 # =========================================================
 
-#: A quantized export scoring this much below its own FP32 baseline is treated
-#: as a broken export rather than a quantization cost.
+#: Quantized runs below this share of FP32 AP are classified as collapsed.
 QUANT_COLLAPSE_FRACTION = 0.5
 
-#: Largest single-class fast-vs-per-class NMS difference still counted as zero.
-#: It should be *exactly* zero -- the two algorithms coincide at one class --
-#: so this only absorbs pycocotools accumulation noise.
+#: Numerical tolerance for the single-class NMS null control.
 NMS_CONTROL_TOLERANCE = 1e-6
 
 
 def sanity_checks(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Flag results that are more likely bugs than findings.
+    """Check benchmark data for invalid or suspect runs.
 
-    Averages and bar charts hide broken runs very effectively, so every table in
-    the notebook is preceded by this: it returns one row per detected issue with
-    a severity, the run it concerns and what was observed. An empty frame means
-    nothing suspicious was found -- not that everything is correct.
-
-    Checks:
-
-    * ``quant-collapse`` -- an INT8 export scoring far below its own FP32
-      baseline.
-    * ``backend-unknown`` / ``delegate-fallback`` -- a run whose effective
-      execution backend is not recorded, or which asked for a delegate and
-      silently ran on the CPU. Both invalidate latency comparisons.
-    * ``fp32-on-delegate`` -- a float graph pushed through an INT8 accelerator.
-    * ``latency-outliers`` -- max sample far above the median, i.e. a disturbed
-      timing run (harmless for the median, fatal for the mean).
-    * ``faithful-stale`` -- official metrics produced before the upstream label
-      remap.
-    * ``faithful-divergence`` -- official and pycocotools metrics disagreeing
-      beyond what the two implementations explain.
-    * ``nms-control-broken`` -- a single-class fast-vs-per-class NMS pair that
-      is not identically zero, which is impossible if the pair is what it says
-      it is.
+    Checks quantization collapse, backend fallback, FP32 delegation, latency
+    outliers, stale or divergent official metrics, and the single-class NMS control.
     """
     if df.empty:
         return pd.DataFrame()
@@ -2139,9 +1701,7 @@ def sanity_checks(df: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
-    # `nms` belongs here: without it an INT8 run is compared against the FP32
-    # baseline of the *other* post-processing, so the substitution's own loss
-    # is charged to quantization.
+    # Match quantized runs to FP32 baselines with the same NMS variant.
     variant_keys = [
         k
         for k in (
@@ -2218,8 +1778,7 @@ def sanity_checks(df: pd.DataFrame) -> pd.DataFrame:
                 f"max sample {float(ratio):.0f}x the median; use median/p95",
             )
 
-        # A run without official metrics has NaN here, and NaN is truthy --
-        # only an explicit True means the metrics exist and are stale.
+        # Only an explicit True marks official metrics as stale.
         if r.get("faithful_stale") is True:
             add(
                 "error",
@@ -2243,10 +1802,7 @@ def sanity_checks(df: pd.DataFrame) -> pd.DataFrame:
                 f"official mAP {r['faithful_mAP']:.3f} vs pycocotools AP {r['AP']:.3f}",
             )
 
-    # The post-processing substitution ships with its own null control: at one
-    # class the fast and per-class passes are the same algorithm, so a
-    # single-class pair that differs at all is a mispaired run, a stale
-    # metrics.json or a mislabelled export -- never a result.
+    # Single-class fast and regular NMS are the same algorithm; any delta indicates a bad pair.
     for _, r in nms_substitution_table(sel).iterrows():
         if r.get("classes") != "sc" or pd.isna(r.get("dAP")):
             continue
@@ -2259,7 +1815,8 @@ def sanity_checks(df: pd.DataFrame) -> pd.DataFrame:
                 r.get("platform"),
                 f"single-class fast-vs-per-class NMS differs by "
                 f"{float(r['dAP']):+.4f} AP; at one class the two are the same "
-                "algorithm, so the pair does not describe what it claims to",
+                "algorithm, so this measures degraded execution, not "
+                "post-processing",
             )
 
     if not issues:
@@ -2277,7 +1834,7 @@ def sanity_checks(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def sanity_summary(issues: pd.DataFrame) -> pd.DataFrame:
-    """Issue counts per check and severity."""
+    """Count sanity-check issues by check and severity."""
     if issues.empty:
         return pd.DataFrame()
     return (
@@ -2298,11 +1855,7 @@ def sanity_summary(issues: pd.DataFrame) -> pd.DataFrame:
 def quantization_delta_table(
     df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS
 ) -> pd.DataFrame:
-    """FP32 vs INT8 AP with relative change, one row per config (PTQ runs).
-
-    INT8 is the per-tensor export (the default deployment granularity), so each
-    config yields a single FP32/INT8 delta row.
-    """
+    """Compare FP32 with per-tensor PTQ INT8 AP for matched configurations."""
     df = select_nms(df, nms)
     df = df[df.get("quant") == "ptq"] if "quant" in df else df
     if "granularity" in df.columns:
@@ -2310,9 +1863,7 @@ def quantization_delta_table(
     if df.empty:
         return pd.DataFrame()
 
-    # Group on the full run identity. Anything left out of the keys collapses
-    # several runs into one group, and since the row is built from `iloc[0]`
-    # those extra runs would be dropped rather than reported.
+    # Group on the complete run identity before selecting one row per configuration.
     keys = [
         k
         for k in (
@@ -2353,57 +1904,33 @@ def quantization_delta_table(
 # The reference configuration, and collapsing onto it
 # =========================================================
 
-#: Verdicts a (config, platform) cell can carry, worst first. Used both by
-#: :func:`deployability_matrix` and, as a filter, by everything that averages.
+#: Deployability verdicts ordered from worst to best.
 DEPLOYABILITY_VERDICTS = ("failed", "unscoreable", "collapsed", "degraded", "ok", "-")
 
-#: Below this share of the CPU reference's AP a delegated run is not a
-#: quantization cost, it is a broken deployment. Same threshold the
-#: ``quant-collapse`` check uses, applied across hardware instead of precision.
+#: AP share below which a delegated run is classified as collapsed.
 DEPLOYABILITY_COLLAPSE_FRACTION = 0.5
 
-#: Milder disagreement with the CPU reference. A faithful delegate reproduces
-#: it; a few tenths of a point is requantization noise, several points is the
-#: accelerator changing the answer.
+#: Smaller CPU/delegate AP disagreement is classified as degraded.
 DEPLOYABILITY_DEGRADED_FRACTION = 0.9
 
-#: The configuration every analysis that is *not* a tiling or resolution study
-#: is reported at. Untiled multi-class, trained on full frames: it is the cell
-#: the published PhenoBench numbers are comparable to, and the one the resource
-#: sweep already collapses onto.
+#: Reference configuration for analyses that do not vary tiling or resolution.
 REFERENCE_CONFIG = {
     "classes": "mc",
     "dataset": "phenobench",
     "eval_tiling": "untiled",
-    # Pinned: once the resolution ladder lands, the other three fields no
-    # longer identify a single cell.
+    #: Resolution studies also pin the input size when selecting one cell.
     "size": "320",
 }
 
-#: Dimensions folded into the reference for cost-style metrics, and the reason
-#: each is expected to be free. These are mechanisms, not curve fits:
-#:
-#: * ``classes`` -- only the class predictor changes width
-#:   (``num_anchors x (num_classes + 1)``, 2 vs 3 channels per anchor), worth
-#:   +0.34 % / +0.03 % in file size;
-#: * ``dataset`` -- the untiled- and tiled-*trained* exports are the **same
-#:   graph** with different weight values, so there is no mechanism by which
-#:   their compute could differ (measured: -0.02 % / -0.05 % in file size);
-#: * ``eval_tiling`` -- this one is *not* free and is collapsed only because it
-#:   is out of scope here. Feeding 1024 px versus 512 px sources changes
-#:   ``cv2.resize`` preprocessing cost, which is real work; it is simply not
-#:   model compute. It carries the largest residual of the three and must be
-#:   quoted whenever the collapsed figure is.
+#: Dimensions allowed to collapse for cost metrics.
+#: Class count changes only the predictor head; training tiling changes weights, not graph shape;
+#: evaluation tiling changes preprocessing but not model compute.
 COLLAPSIBLE_DIMENSIONS = ("classes", "dataset", "eval_tiling")
 
-#: Dimensions that stay: architecture and export scheme are what the thesis is
-#: about, and they move cost by an order of magnitude more.
+#: Architecture and export scheme remain explicit analysis axes.
 KEPT_DIMENSIONS = ("arch", "scheme")
 
-#: Display names for the fields a collapse audit is resolved by. Architecture
-#: is always one of them: a cost figure without the detector it belongs to is
-#: not interpretable, and the two detectors here differ by ~20 % in inference
-#: cost.
+#: Display names for collapse-audit grouping fields.
 _GROUP_LABELS = {"platform": "Platform", "arch": "Architecture"}
 
 DIMENSION_LABELS = {
@@ -2416,11 +1943,9 @@ DIMENSION_LABELS = {
 
 
 def reference_config_slice(df: pd.DataFrame, **overrides) -> pd.DataFrame:
-    """
-    Narrow to the reference configuration (see :data:`REFERENCE_CONFIG`).
+    """Filter to :data:`REFERENCE_CONFIG`.
 
-    Pass ``dimension=None`` to leave one axis open -- e.g.
-    ``reference_config_slice(df, eval_tiling=None)`` for the tiling study.
+    Pass a field as ``None`` to leave that axis unpinned.
     """
     wanted = {**REFERENCE_CONFIG, **overrides}
     sel = df
@@ -2437,13 +1962,7 @@ def failed_deployment_mask(
     reference: str = CPU_REFERENCE_PLATFORM,
     fraction: float = DEPLOYABILITY_COLLAPSE_FRACTION,
 ) -> pd.Series:
-    """
-    Rows whose accuracy collapsed against the same file on the CPU reference.
-
-    The companion to :func:`deployability_matrix`, as a mask rather than a
-    table, for the places that need to *exclude* those runs rather than report
-    them.
-    """
+    """Return rows whose delegated accuracy collapsed against the matching CPU run."""
     if df.empty:
         return pd.Series(dtype=bool)
 
@@ -2467,15 +1986,7 @@ def failed_deployment_mask(
 
 
 def drop_failed_deployments(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
-    """
-    Remove runs whose output is real but describes a computation that did not
-    happen.
-
-    A ``collapsed`` run still has entirely valid latency numbers, so it will
-    happily enter a latency mean and pull it toward whatever the accelerator
-    does when it is not really working. Averaging is exactly where that
-    matters, so the collapse guard and the collapsed tables filter first.
-    """
+    """Remove delegated runs classified as failed deployments."""
     if df.empty:
         return df
     return df[~failed_deployment_mask(df, **kwargs).reindex(df.index, fill_value=False)]
@@ -2488,22 +1999,10 @@ def collapse_divergence(
     collapsible: Iterable[str] = COLLAPSIBLE_DIMENSIONS,
     kept: Iterable[str] = KEPT_DIMENSIONS,
 ) -> pd.DataFrame:
-    """
-    How much each dimension moves ``metric`` with everything else held fixed.
+    """Measure variation from collapsing each configuration dimension.
 
-    This is the measurement that licenses -- or refuses -- reporting one
-    collapsed number instead of the full matrix, and it has to be re-run per
-    metric because the answer is not the same for cost and for accuracy.
-
-    For every dimension, runs are grouped on *all other* configuration fields
-    and the relative spread ``(max - min) / median`` within each group is
-    recorded. A collapsed dimension is only harmless if its spread is small
-    against the dimensions deliberately kept: collapsing something that moves
-    the metric as much as the effect under study destroys the effect.
-
-    Returns:
-        One row per dimension with its role and the median / p90 / max relative
-        spread, in percent. Empty if nothing varies.
+    For each dimension, computes relative within-group spread while holding all
+    other configuration fields fixed.
     """
     if df.empty or metric not in df.columns:
         return pd.DataFrame()
@@ -2565,14 +2064,7 @@ def collapse_divergence(
 
 
 def collapse_holds(divergence: pd.DataFrame) -> bool:
-    """
-    Whether collapsing is defensible for the metric ``divergence`` describes.
-
-    The test is comparative, not a fixed threshold: every collapsed dimension
-    has to move the metric less than the *smallest* effect being kept.
-    Otherwise the reported number averages over something larger than what it
-    is meant to show.
-    """
+    """Return whether every collapsed dimension varies less than every retained dimension."""
     if divergence.empty:
         return False
 
@@ -2591,24 +2083,10 @@ def collapse_bias_table(
     dimensions: Iterable[str] = COLLAPSIBLE_DIMENSIONS,
     group: Iterable[str] = ("platform", "arch"),
 ) -> pd.DataFrame:
-    """
-    Which direction each collapsed dimension pulls the metric, and by how much.
+    """Measure directional bias from each collapsed dimension.
 
-    :func:`collapse_divergence` answers "is the residual small enough to
-    ignore"; this answers "is it noise or is it a bias", which is the question
-    that decides whether a collapsed mean can be quoted as an operating point.
-
-    Both are needed because a dimension can be individually small and
-    collectively directional. Here all three are: the reference configuration
-    is evaluated on full frames, so it pays the largest ``cv2.resize`` cost of
-    any cell folded into it, and every off-reference cell is therefore cheaper.
-    Small residuals that all point the same way do not cancel -- they add.
-
-    Returns:
-        One row per (group, dimension) with the median and mean relative change
-        of the off-reference value against the reference value, in percent.
-        Negative means the off-reference runs are cheaper, i.e. the collapsed
-        mean is optimistic.
+    Changes are relative to the reference configuration; negative values mean the
+    off-reference configuration lowers the metric.
     """
     if df.empty or metric not in df.columns:
         return pd.DataFrame()
@@ -2684,36 +2162,17 @@ def collapsed_latency_table(
     keys: Iterable[str] = ("platform", "backend", "arch_label", "size", "scheme"),
     collapse: Iterable[str] = COLLAPSIBLE_DIMENSIONS,
 ) -> pd.DataFrame:
-    """
-    Runtime cost at the reference configuration, with the collapsed dimensions
-    averaged in and the spread they contribute carried alongside.
+    """Summarize latency after collapsing selected configuration dimensions.
 
-    The point of the extra columns is that the collapse never becomes
-    invisible. ``Ref cell (ms)`` is the reference configuration measured on its
-    own, ``Lat med (ms)`` is the mean over everything collapsed into it,
-    ``spread %`` is what was averaged away, and ``bias %`` is the *direction*
-    of the disagreement.
-
-    ``bias %`` is the column to read, because the residual here is not
-    symmetric noise. The reference configuration is evaluated on full frames,
-    i.e. it is the one fed 1024 px sources and therefore the one paying the
-    largest ``cv2.resize`` cost, so folding the tiled-input runs in pulls the
-    figure **down**. On the fastest board that is worth around a tenth of the
-    total, which is not a rounding error. Quote the reference cell when the
-    claim is about a deployed operating point, and the collapsed mean only when
-    the claim is about the model.
-
-    ``collapse`` selects which dimensions are folded in; anything left out is
-    pinned to its reference value instead. Dropping ``eval_tiling`` from it
-    removes most of the bias, at the cost of a smaller sample per row.
+    Includes the reference-cell latency, collapsed mean, spread and directional
+    bias.
     """
     if df.empty or "median_latency_ms" not in df.columns:
         return pd.DataFrame()
 
     sel = add_scheme(drop_failed_deployments(df)).dropna(subset=["median_latency_ms"])
 
-    # Pin every dimension that is not being collapsed to its reference value,
-    # so a row is never a mean over an axis nobody asked to average.
+    # Pin every non-collapsed dimension to its reference value.
     sel = reference_config_slice(sel, **dict.fromkeys(collapse, None))
 
     if sel.empty:
@@ -2780,7 +2239,7 @@ def collapsed_latency_table(
 
 
 def _skipped_frame(skipped: Iterable[str]) -> pd.DataFrame:
-    """Parse ``load_benchmark_results``' skip list into ``platform/run/reason``."""
+    """Parse skipped-run strings into ``platform``, ``run`` and ``reason`` columns."""
     rows = []
     for entry in skipped or ():
         platform, _, rest = str(entry).partition("/")
@@ -2805,45 +2264,10 @@ def deployability_matrix(
     platforms: Iterable[str] | None = None,
     drop_constant_keys: bool = True,
 ) -> pd.DataFrame:
-    """
-    Which exports actually survive each target, one row per (variant, scheme).
+    """Classify each export/platform cell as ``ok``, ``degraded``, ``collapsed`` or ``unscoreable``.
 
-    This is the question that has to be answered *before* any accuracy or
-    latency table is read, because the three ways a deployment fails here do
-    not look alike and only one of them raises anything:
-
-    ``unscoreable``
-        The run produced output, and the output is not a detection. The Teflon
-        delegate claims float convolutions and returns ``NaN`` boxes with
-        out-of-range scores; nothing errors. Worse, ``pycocotools`` *rewards*
-        this -- its match test is ``if iou < threshold: continue``, which a
-        ``NaN`` fails, so every detection is accepted at every threshold and the
-        run reports a high AP with ``AP == AP50``. The integrity gate is what
-        turns that into a missing ``metrics.json``, so an absent cell here is a
-        finding, not a gap in the sweep.
-
-    ``collapsed`` / ``degraded``
-        The run loads, runs, and produces plausible-looking boxes that score far
-        below the *same file* on the same board's CPU. Measured for INT8
-        per-channel weights under Teflon on the i.MX8M Plus.
-
-    ``ok``
-        Reproduces the CPU reference.
-
-    Comparing each cell against the CPU reference rather than against a fixed
-    AP is what separates "this accelerator broke it" from "this export was
-    always weak": a per-tensor export that scores poorly on every backend is a
-    quantization result and belongs in the scheme table, not here.
-
-    Args:
-        runs_df: Frame from :func:`load_benchmark_results`.
-        skipped: Its companion skip list, which is where the unscoreable runs
-            went. Omit it and those cells read as never-run.
-        platforms: Columns to show. The reference is always used for scoring
-            even when it is not shown, so narrowing to the boards does not turn
-            every cell into an unjudged ``ok``. Note this holds for *this*
-            argument only -- filtering ``runs_df`` by platform upstream does
-            remove the reference from scoring, and warns.
+    Accuracy verdicts use the matching CPU run. ``skipped`` supplies runs rejected
+    before metrics were written.
     """
     if runs_df.empty:
         return pd.DataFrame()
@@ -2856,12 +2280,7 @@ def deployability_matrix(
     if any(k not in sel.columns for k in keys):
         return pd.DataFrame()
 
-    # A configuration with no baseline is scored `ok` (see `_verdict`), which
-    # is the right default for a genuinely unjudgeable cell but catastrophic
-    # when the *whole* reference tree is missing: every verdict then reads `ok`
-    # and the table reports that nothing ever broke. Narrowing `runs_df` by
-    # platform is the usual way to arrive here -- `platforms=` selects columns
-    # without removing the reference, and is what callers want instead.
+    # Without a CPU reference, accuracy verdicts cannot be classified.
     if reference not in set(sel["platform"].unique()):
         warnings.warn(
             f"deployability_matrix: reference platform {reference!r} is absent "
@@ -2896,15 +2315,10 @@ def deployability_matrix(
     for _, r in sel.iterrows():
         cells[(*(r[k] for k in keys), r["platform"])] = _verdict(r)
 
-    # The frame is the caller's statement of scope, but the skip list is not
-    # filtered by it -- so a caller who narrowed to, say, multi-class would get
-    # the single-class rows resurrected here as `unscoreable`. Recover only
-    # configurations the frame still contains; a genuinely unscoreable one is
-    # present on at least the CPU reference, which is what it is judged against.
+    # Apply the caller's scope to skipped runs before adding unscoreable cells.
     in_scope = set(sel[keys].itertuples(index=False, name=None))
 
-    # Runs that were benchmarked but could not be scored. They are the whole
-    # point of the table, and they exist only in the skip list.
+    # Add benchmarked runs rejected before metrics were written.
     for _, s in _skipped_frame(skipped).iterrows():
         info = parse_run_name(s["run"])
         if info is None:
@@ -2913,8 +2327,7 @@ def deployability_matrix(
             continue
         if nms is not None and info.get("nms") not in (None, nms):
             continue
-        # Built from `keys` rather than spelled out, so adding a field to the
-        # configuration identity cannot silently desynchronise the two paths.
+        # Build skipped-run keys from the same configuration identity.
         info["scheme"] = scheme_name(
             info.get("precision"), info.get("quant"), info.get("granularity")
         )
@@ -2952,9 +2365,7 @@ def deployability_matrix(
     )
 
     if drop_constant_keys:
-        # A caller scoped to one class regime and one training set gets three
-        # columns repeating one value beside the verdicts they came for.
-        # `arch_label` and `scheme` stay: they are what a row is.
+        # Drop scoped columns that repeat one value.
         constant = [
             k
             for k in ("classes", "dataset", "size")
@@ -2965,8 +2376,7 @@ def deployability_matrix(
     return table
 
 
-#: Config identity within one evaluation regime -- what makes a row of the
-#: deployability matrix joinable against the runs frame.
+#: Configuration identity used to pair NMS variants.
 _DEPLOY_KEYS = ("arch_label", "classes", "dataset", "size", "scheme")
 
 
@@ -2982,40 +2392,10 @@ def delegate_build_table(
     latency_scope: str = "ok-both",
     show_board_column=True,
 ) -> pd.DataFrame:
-    """
-    What rebuilding the delegate changed -- in verdicts, and in latency.
+    """Compare current and suffixed delegate builds per architecture.
 
-    A ``<board>{suffix}`` tree is the same board carrying an older delegate
-    build, so the pair prices the operator-support work in the two currencies
-    that matter: configurations that changed verdict, and what the ones that
-    already worked now cost.
-
-    Rows are resolved **per architecture** by default (``by_arch``). The plain
-    head and FPNLite do not respond to a delegate rebuild alike -- measured
-    here, the same rebuild moved per-tensor 320 by -30.6 % on ``ssd-mn2`` and
-    -60.6 % on FPNLite -- so pooling them reports a median belonging to neither.
-
-    ``latency_scope`` picks what the latency columns cover:
-
-    ``"ok-both"`` (default)
-        Only configurations both builds executed correctly. A collapsed run
-        still produces perfectly real timings, and fast ones -- the work it
-        skipped is exactly the work it got wrong -- so differencing against it
-        reports a speedup for breaking the model.
-
-    ``"paired"``
-        Every configuration both trees *timed*, whatever the verdict. A
-        collapsed run's wall clock is still a real measurement of dispatch and
-        CPU<->NPU tensor movement, which is the cost a delegate rebuild is
-        meant to shift, so this is the scope to read when the question is about
-        sync overhead rather than about compute. Read it against ``Before`` /
-        ``After``: the two medians describe runs of different correctness.
-
-    Either way the pairing is per configuration and the width is reported as
-    ``timed``. Empty latency columns mean the two trees share no timed
-    configuration at all -- which, note, includes the case where the older tree
-    never ran them, not only the case where the gate rejected them. Check
-    ``timed`` against ``Configs`` before reading a difference.
+    ``latency_scope="ok-both"`` uses correct runs in both trees; ``"paired"`` uses
+    all configurations timed by both.
     """
     if runs_df.empty:
         return pd.DataFrame()
@@ -3042,7 +2422,7 @@ def delegate_build_table(
         lat = lat[lat["eval_tiling"] == eval_tiling]
 
     def _timed(platform, subset):
-        """Median latency per config, indexed by ``keys``, timed runs only."""
+        """Return median latency per timed configuration, indexed by ``keys``."""
         if subset.empty:
             return pd.Series(dtype=float)
         rows = lat[lat["platform"] == platform].merge(subset[keys], on=keys)
@@ -3052,13 +2432,7 @@ def delegate_build_table(
         return rows.groupby(keys)["median_latency_ms"].median()
 
     def _paired(older, board, subset):
-        """
-        The two medians over configs *both* trees actually timed.
-
-        Returned as a triple with the pairing width, because a latency
-        difference whose support is one configuration is a different claim
-        from one over six, and the table has to be able to say which.
-        """
+        """Return paired medians and the number of configurations timed by both frames."""
         was_all, now_all = _timed(older, subset), _timed(board, subset)
         common = was_all.index.intersection(now_all.index)
         if len(common) == 0:
@@ -3116,7 +2490,7 @@ def delegate_build_table(
 
 
 def deployability_summary(matrix: pd.DataFrame) -> pd.DataFrame:
-    """Verdict counts per platform, worst first."""
+    """Count deployability verdicts per platform."""
     if matrix.empty:
         return pd.DataFrame()
 
@@ -3134,8 +2508,7 @@ def deployability_summary(matrix: pd.DataFrame) -> pd.DataFrame:
 # Post-processing substitution (fast vs per-class NMS)
 # =========================================================
 
-#: Keys that identify one deployable across the two NMS variants. Everything
-#: except ``nms`` itself, so the two rows differ in exactly one thing.
+#: Pairing keys for fast and regular NMS; excludes only ``nms``.
 NMS_PAIR_KEYS = (
     "platform",
     "eval_tiling",
@@ -3153,32 +2526,9 @@ def nms_substitution_table(
     deployed: str = DEFAULT_NMS,
     control: str = REGULAR_NMS,
 ) -> pd.DataFrame:
-    """
-    Price the post-processing substitution, one row per matched pair.
+    """Compare matched fast-NMS and regular-NMS exports.
 
-    The exported graph does not run the NMS the checkpoint runs.
-    ``TFLite_Detection_PostProcess`` with ``use_regular_nms=False`` makes a
-    single class-agnostic pass over each anchor's argmax class, while the
-    checkpoint suppresses per class. SSD shares one box regression across
-    classes, so an anchor's crop and weed hypotheses are the *same box* and only
-    the higher-scoring one survives the class-agnostic pass.
-
-    That mechanism predicts the shape of the result before it is measured, and
-    the prediction is testable in this very table:
-
-    * **single-class runs must show exactly zero.** With one class the two
-      algorithms are the same algorithm. Any non-zero ``dAP`` on an ``sc`` row
-      is a broken pairing, not a finding -- :func:`sanity_checks` flags it.
-    * **multi-class loss must land on the suppressed class**, i.e. on
-      ``crop``, with ``weed`` left alone.
-
-    Because the pair shares one checkpoint, one graph and one calibration set,
-    the delta is the substitution and nothing else, at whichever rung the row
-    happens to sit -- float, INT8, or INT8 on a delegate.
-
-    Returns:
-        One row per configuration with both variants' metrics and their
-        differences, or an empty frame if the sweep has no pairs.
+    Single-class pairs are a null control and should have zero metric delta.
     """
     if df.empty or "nms" not in df.columns:
         return pd.DataFrame()
@@ -3216,21 +2566,12 @@ def nms_substitution_table(
         out["dLatency (ms)"] = fast["median_latency_ms"] - reg["median_latency_ms"]
         out["dLatency (%)"] = 100 * out["dLatency (ms)"] / reg["median_latency_ms"]
 
-    # `+ 0.0` collapses the negative zero left by rounding a tiny negative. The
-    # single-class rows are the null control and have to read as a clean 0.
+        # Remove rounded negative zero from null-control deltas.
     return (out.round(4) + 0.0).reset_index()
 
 
 def nms_pair_coverage(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Where both post-processing variants exist, per platform.
-
-    Both are deployable and both were swept on the boards, but the CPU-only and
-    unpatched control trees carry the default export alone. That is deliberate,
-    so it does not belong in :func:`build_coverage` as a gap -- but it does
-    need saying somewhere, otherwise a reader wonders why the substitution
-    analysis covers three platforms and the accuracy tables cover nine.
-    """
+    """Count configurations containing both NMS variants per platform."""
     if df.empty or "nms" not in df.columns:
         return pd.DataFrame()
 
@@ -3262,21 +2603,9 @@ def nms_pair_coverage(df: pd.DataFrame) -> pd.DataFrame:
 def nms_substitution_summary(
     df: pd.DataFrame, *, drop_constant_keys: bool = True, **kwargs
 ) -> pd.DataFrame:
-    """
-    The substitution's accuracy cost aggregated over the cells it depends on.
+    """Summarize NMS metric deltas by architecture, class regime and input regime.
 
-    Grouped by architecture, class regime and evaluation input. The last two
-    are the axes the mechanism predicts -- single-class is the null control and
-    must be identically zero, and the tiled/full-frame split changes how many
-    crop and weed hypotheses compete for the same anchor. **Architecture is a
-    grouping key rather than something to average over**: the two detectors
-    have different anchor layouts and different numbers of candidates entering
-    suppression, so a mean over both describes neither.
-
-    ``drop_constant_keys`` removes grouping columns the caller has already
-    scoped to a single value. They carry no information in a summary and only
-    widen the table -- a scoped frame otherwise prints a ``classes`` column
-    reading ``mc`` on every row.
+    Constant grouping columns may be dropped after caller-side filtering.
     """
     pairs = nms_substitution_table(df, **kwargs)
     if pairs.empty:
@@ -3289,8 +2618,7 @@ def nms_substitution_summary(
     ]
 
     if drop_constant_keys:
-        # `arch_label` stays regardless: it is the axis the docstring above
-        # refuses to average over, so its absence would be misread as a mean.
+        # Architecture remains explicit because NMS behavior is architecture-dependent.
         varying = [
             k for k in keys if k == "arch_label" or pairs[k].nunique(dropna=False) > 1
         ]
@@ -3305,47 +2633,10 @@ def nms_substitution_summary(
 def nms_latency_tradeoff_table(
     df: pd.DataFrame, *, precision: str | None = "int8", **kwargs
 ) -> pd.DataFrame:
-    """
-    What the substitution *buys*, estimated against its own null control.
+    """Estimate NMS latency cost with a single-class difference-in-differences control.
 
-    The naive answer -- median latency of the fast runs minus the regular ones
-    -- is not trustworthy here, because the two variants were benchmarked as
-    separate runs and any drift between them lands in that difference. The
-    single-class pairs bound that drift: with one class the two graphs run the
-    *same* algorithm, so their latency difference is measurement error by
-    construction and nothing else.
-
-    So the estimate is a difference in differences::
-
-        saving = mean(dLatency | mc) - mean(dLatency | sc)
-                 \\_______________/   \\_______________/
-                   algorithm + drift        drift
-
-    ``sc drift`` is reported alongside it: when it is large the platform's
-    paired timings are simply not reliable at this resolution, and the row
-    should be read as an upper bound rather than a measurement.
-
-    The estimate carries its own uncertainty, because a difference of two noisy
-    means is itself noisy. ``SE`` combines the standard errors of both arms,
-    ``sigma`` is the estimate in units of that, and ``95% CI`` spans it. A row
-    whose interval contains zero has not resolved a saving from drift, however
-    large its point estimate looks -- which is the difference between a small
-    effect and no measured effect, and the two are not interchangeable in a
-    trade-off argument.
-
-    Restricted to ``precision`` -- INT8 by default, the only precision that
-    ships. The quantity being estimated is a roughly fixed millisecond cost, so
-    pooling a 340 ms fp32 regime with a 33 ms INT8 one adds variance without
-    adding signal: measured here, the fp32 pairs carry some forty times the
-    absolute timing noise (single-class drift sd 4.7 ms against 0.02-0.12 ms),
-    and four such pairs in twenty set the width of every interval. Pass
-    ``precision=None`` to pool them again.
-
-    Resolved **per architecture as well as per platform**. A latency figure
-    without the detector it belongs to is not interpretable -- the two
-    architectures differ by roughly 20 % in inference cost here -- and the
-    quantity being estimated is a fixed post-processing cost, so expressing it
-    as a share of the wrong total would misstate it.
+    ``saving = mean(dLatency | mc) - mean(dLatency | sc)``. Reports standard error,
+    sigma and a 95% confidence interval per platform and architecture.
     """
     if precision is not None and "precision" in df.columns:
         df = df[df["precision"] == precision]
@@ -3371,9 +2662,7 @@ def nms_latency_tradeoff_table(
         drift = float(sc.mean())
         saving = float(mc.mean()) - drift
 
-        # Standard error of a difference of independent means. Needs two
-        # samples per arm; with fewer, the interval is undefined rather than
-        # zero-width, so it is left empty instead of implying certainty.
+        # Standard error for a difference of independent means; undefined with fewer than two samples per arm.
         if len(mc) > 1 and len(sc) > 1:
             standard_error = float(
                 np.sqrt(mc.var(ddof=1) / len(mc) + sc.var(ddof=1) / len(sc))
@@ -3420,19 +2709,7 @@ def plot_nms_substitution(
     eval_tiling: str | None = "untiled",
     platform: str | None = None,
 ):
-    """
-    Per-class AP change from the post-processing substitution.
-
-    One panel per architecture, class regime along the y axis, export scheme as
-    the colour. Architecture is a **panel** rather than a colour because the two
-    detectors have different anchor layouts and different numbers of candidates
-    entering suppression: putting them in one group invites a comparison
-    between bars that do not describe the same competition.
-
-    Crop and weed are drawn separately on purpose -- the overall-AP bar averages
-    a class that loses heavily with one that barely moves, which is exactly the
-    structure the figure exists to show.
-    """
+    """Plot per-class AP change from fast versus regular NMS."""
     pairs = nms_substitution_table(df)
     if pairs.empty or "dCrop AP" not in pairs.columns:
         return None
@@ -3492,8 +2769,7 @@ def plot_nms_substitution(
         + (f" - {platform}" if platform else "")
     )
     fig.tight_layout()
-    # Every bar is negative, so the plotting area is full from the zero line
-    # leftwards and any in-axes corner would sit on data.
+    # Put the legend outside because all bars extend left from zero.
     _legend_outside(fig, axes[0], title="export scheme")
     return fig
 
@@ -3508,31 +2784,10 @@ def resolution_ladder_table(
     dataset: str | None = "phenobench",
     latency_platforms: Iterable[str] | None = None,
 ) -> pd.DataFrame:
-    """
-    Accuracy and latency against input resolution, one row per (arch, size,
-    scheme).
+    """Build accuracy and device-latency rows across input resolutions.
 
-    The rung a model sits on is defined entirely by which finetune output was
-    attached as a Kaggle input -- the quantization notebooks rebuild
-    ``FineTuneConfig`` from the attached manifest, so ``image_size`` is
-    inherited rather than set. That makes a mislabelled rung a plausible
-    failure, so the table reports the parsed ``size`` from the artifact name
-    next to the metrics instead of assuming the grouping is right.
-
-    Scoped to one class regime, training set, platform and input regime,
-    because resolution is the axis under study and everything else has to be
-    held fixed for the comparison to mean anything.
-
-    ``latency_platforms`` adds one median-latency column per target, joined on
-    the same rows. Accuracy is measured once on the CPU reference, but the
-    question a higher rung has to survive is what it costs **on the device**,
-    and a rung can only be disqualified by a number from the board it would
-    ship on. A target with no run at some resolution leaves the cell empty
-    rather than falling back to the reference host, whose milliseconds answer a
-    different question.
-
-    Empty until the 512/1024 rungs are benchmarked; the shape is fixed now so
-    the section lights up on its own when they land.
+    All non-resolution axes are fixed. ``latency_platforms`` adds matched target
+    latency columns.
     """
     if df.empty or "size" not in df.columns:
         return pd.DataFrame()
@@ -3568,8 +2823,7 @@ def resolution_ladder_table(
     out.columns = [n for _, n in cols]
 
     if latency_platforms:
-        # Latency comes from the *unscoped* frame: `sel` is pinned to the
-        # accuracy platform, so the boards were filtered out several lines ago.
+        # Join target latency from the unscoped frame; accuracy rows are reference-platform rows.
         wide = add_scheme(select_nms(df, nms))
         for column, value in (
             ("eval_tiling", eval_tiling),
@@ -3595,8 +2849,7 @@ def resolution_ladder_table(
             out[f"{label} (ms)"] = [
                 None if v is None or pd.isna(v) else round(float(v), 1) for v in latency
             ]
-            # Throughput on the target, not on the reference host: the whole
-            # point of the column is what the board sustains.
+            # Throughput is measured on the target platform.
             out[f"{label} FPS"] = [
                 None if v is None or pd.isna(v) or not v else round(1000.0 / v, 1)
                 for v in latency
@@ -3624,10 +2877,7 @@ def resolution_ladder_table(
     )
 
 
-#: Results tree holding the pre-conversion SavedModel reference. The *floored*
-#: one: its NMS score threshold matches the TFLite graphs', which is what keeps
-#: the first rung like-for-like. (`tf-savedmodel-nms0` is the floor-free control
-#: and is worth +0.002 AP on average.)
+#: SavedModel reference with the same score floor as the TFLite graphs.
 REFERENCE_PLATFORM = "tf-savedmodel"
 
 
@@ -3641,42 +2891,10 @@ def degradation_ladder_table(
     cpu_platform: str = CPU_REFERENCE_PLATFORM,
     metric: str = "AP",
 ) -> pd.DataFrame:
-    """
-    Decompose the deployment chain into its rungs, one loss per transformation.
+    """Decompose deployment into conversion, NMS, quantization and delegation deltas.
 
-    ::
-
-        SavedModel
-          --conversion-->    TFLite fp32 (per-class NMS)
-          --nms-swap-->      TFLite fp32 (fast NMS, deployed)
-          --quantization-->  int8 CPU
-          --delegation-->    int8 NPU
-
-    Each delta isolates one transformation by holding the others fixed. Two
-    rungs carry the interesting content:
-
-    * **The SavedModel rung.** Without it the conversion loss is invisible and
-      gets folded into "quantization"; for at least one config it is *larger*
-      than that config's quantization loss.
-    * **The NMS rung.** "Conversion" used to be three changes at once, and the
-      post-processing substitution dominated it. Splitting it out is what turns
-      a format cost that could not be explained into an algorithm cost that
-      can: feed identical pixels through both graphs with the same NMS and the
-      float formats agree. What is left in ``conversion`` is the resampling
-      difference (the SavedModel resizes in-graph with ``fixed_shape_resizer``,
-      the TFLite path externally with ``cv2``) and the missing clip window --
-      small, sign-random, and not a precision loss.
-
-      ``nms-swap`` is the cost of the **default** export choice, not an
-      unavoidable one: the per-class variant is equally deployable and was
-      benchmarked on both boards. :func:`nms_substitution_table` breaks the
-      cost down per class and :func:`nms_latency_tradeoff_table` prices what it
-      buys; it is exactly zero for single-class models by construction.
-
-    Rows are dropped only when the deployed chain itself is missing; an absent
-    reference or control leaves that column empty rather than removing the
-    config, so an incomplete sweep stays visible instead of silently narrowing
-    the table.
+    Each delta changes one rung while holding the others fixed. Missing reference
+    or control rungs remain empty; rows require the deployed TFLite chain.
     """
     if df.empty or metric not in df.columns:
         return pd.DataFrame()
@@ -3693,14 +2911,9 @@ def degradation_ladder_table(
     def _rung(
         platform, scheme=None, quantization=None, nms=DEFAULT_NMS, *, strict=False
     ):
-        """
-        One rung's metric per config.
+        """Return one rung's metric per configuration.
 
-        ``strict`` demands an explicit NMS token instead of accepting rows that
-        carry none. The control rung needs it: a result tree that predates the
-        paired export has untagged float runs, and letting one stand in for the
-        control would report a measured ``nms-swap`` of exactly zero for a
-        comparison that was never made.
+        ``strict`` requires an explicit matching NMS token.
         """
         rows = sel[sel["platform"] == platform]
         if scheme is not None:
@@ -3716,9 +2929,7 @@ def degradation_ladder_table(
         rows = rows.dropna(subset=[metric])
         if rows.empty:
             return pd.Series(dtype="float64")
-        # One row per config by construction now that the NMS variant is
-        # pinned; `first` rather than `mean` so a leftover duplicate shows up
-        # as a wrong number in one cell instead of a plausible average.
+        # One row is expected per config; ``first`` exposes duplicates instead of averaging them.
         return rows.groupby(keys)[metric].first()
 
     fp32_scheme = scheme_name("fp32", "ptq")
@@ -3740,7 +2951,7 @@ def degradation_ladder_table(
         }
     )
 
-    # A config needs at least the deployed chain to be worth a row.
+    # Require the deployed chain for each row.
     table = table.dropna(subset=[deployed_label, "int8 CPU"], how="any")
     if table.empty:
         return pd.DataFrame()
@@ -3750,30 +2961,15 @@ def degradation_ladder_table(
     table["quantization"] = table["int8 CPU"] - table[deployed_label]
     table["delegation"] = table[npu_label] - table["int8 CPU"]
 
-    # `+ 0.0` collapses the negative zero a rounded -1e-7 leaves behind. It is
-    # cosmetic in a notebook and not in a thesis table, where "-0" next to a
-    # column of real losses reads as a measured effect.
+    # Remove rounded negative zero from reported deltas.
     return table.round(4) + 0.0
 
 
 # =========================================================
-# The thesis story, in six steps
+# Deployment analysis stages
 # =========================================================
-#
-# Chapter 6 is one argument, and these functions are its steps in order. Each
-# takes the whole sweep and narrows it itself, so a caller cannot accidentally
-# feed one step the scope of another:
-#
-#   1  baseline_table            float accuracy of the trained detectors
-#   2  preparation_ladder_table  what conversion and PTQ cost
-#      nms_substitution_*        ... and how much of that is the NMS swap
-#   3  qat_reclaim_table         what QAT gets back
-#   4  deployability_matrix      which exports the accelerators execute correctly
-#   5  device_latency_table      what the survivors cost on CPU vs NPU
-#   6  story_ablation_table      how single-class and tiling move each step above
-#
-# Steps 1-5 are reported at REFERENCE_CONFIG; step 6 is the only one that
-# leaves it, one axis at a time.
+# 1 baseline, 2 conversion/PTQ and NMS, 3 QAT, 4 deployability, 5 device latency, 6 ablations.
+# Stages 1-5 use REFERENCE_CONFIG; stage 6 varies one axis at a time.
 
 #: Short architecture names for table columns, where the full label does not fit.
 ARCH_SHORT = {
@@ -3794,46 +2990,15 @@ def baseline_table(
     include_baselines: bool = True,
     sizes: str | Iterable[str] | None = None,
 ) -> pd.DataFrame:
-    """
-    **Step 1** -- float accuracy of the fine-tuned detectors.
+    """Build the float SavedModel baseline table at the reference configuration.
 
-    The float SavedModel at the reference configuration -- multi-class, trained
-    and evaluated full-frame -- across every input resolution present.  This is
-    the number every later step is a cost against, so it is measured *before*
-    TensorFlow Lite is involved at all: the checkpoint's own graph and its own
-    post-processing.
-
-    ``sizes`` selects the resolutions; ``None`` takes whatever the frame holds,
-    so the ladder is as ragged as the artifacts are -- currently 320/512/1024
-    for the plain detector and 320/512 for FPNLite. A missing cell means that
-    rung is absent from ``artifacts/tf``, not that it was measured and lost.
-
-    ``quant`` picks which float export stands for the checkpoint. The
-    SavedModel tree carries one per quantization path (``ptq`` and ``qat``),
-    which are separate fine-tunes and differ slightly; ``ptq`` is the float
-    graph before the paths diverge.
-
-    Reported with the **official PhenoBench evaluator** (``faithful_*``), not
-    with pycocotools. This is the one table in the notebook that puts our
-    numbers beside someone else's, so it has to use the metric stack those
-    numbers were produced with; the two families are not interchangeable and
-    mixing them in one column would be meaningless. Every *internal*
-    comparison downstream stays on pycocotools.
-
-    The published PhenoBench baselines are appended for orientation. They are
-    not a like-for-like ranking: upstream reports the withheld test split at
-    full resolution, this work the internal test split derived from the
-    validation partition. Say so wherever the table is used.
-
-    Runs whose official metrics predate the crop/weed label remap are dropped
-    rather than shown, matching :func:`upstream_comparison_table` -- a stale
-    ``faithful_*`` value is wrong in a way that looks plausible.
+    Uses official PhenoBench metrics. ``sizes=None`` includes every available input
+    resolution; optional published baselines use a different test split.
     """
     if df.empty or "faithful_mAP" not in df.columns:
         return pd.DataFrame()
 
-    # `size` is the axis under study here, so it is relaxed rather than pinned;
-    # every other axis of the reference configuration still holds.
+    # Leave ``size`` open; pin the remaining reference axes.
     sel = reference_config_slice(df[df["platform"] == platform], size=None)
     if sizes is not None:
         wanted = {sizes} if isinstance(sizes, str) else set(sizes)
@@ -3860,8 +3025,7 @@ def baseline_table(
                 }
             )
 
-    # Detector, then resolution ascending -- `size` is a string token, so sort
-    # it numerically or 1024 lands between 320 and 512.
+    # Sort the string-valued input size numerically.
     order = sel.assign(_px=pd.to_numeric(sel["size"], errors="coerce")).sort_values(
         ["arch_label", "_px"]
     )
@@ -3885,20 +3049,10 @@ def baseline_table(
 
 
 def _preparation_stages(nms: str = DEFAULT_NMS) -> tuple[tuple, ...]:
-    """
-    The rungs of model preparation, in the order they are applied.
+    """Return preparation stages as ``(label, scheme, nms, delta_base)`` tuples.
 
-    Each entry is ``(label, scheme, nms, delta_base)``; ``delta_base`` names the
-    row the delta is quoted against -- ``"prev"`` for the float rung, a
-    successive transformation, and ``"float"`` for the INT8 rows, which are
-    alternative exports of the *same* deployed float model and are therefore
-    quoted against it rather than against each other.
-
-    The whole chain runs at **one** post-processing variant, so conversion and
-    quantization are priced at matched suppression and neither absorbs the
-    other's cost. Choosing the variant is a separate axis with its own
-    accuracy/latency trade-off, priced by :func:`nms_substitution_summary` and
-    :func:`nms_latency_tradeoff_table`.
+    INT8 stages are compared with the deployed float TFLite stage, not with one
+    another.
     """
     float_stage = f"Float TFLite, {NMS_LABELS.get(nms, nms)}"
 
@@ -3923,28 +3077,10 @@ def preparation_ladder_table(
     percent: bool = True,
     nms: str = DEFAULT_NMS,
 ) -> pd.DataFrame:
-    """
-    **Steps 2 and 3** -- what preparing the model for deployment costs.
+    """Build conversion and quantization stages at the reference configuration.
 
-    Stage rows, architecture columns, which is the shape the thesis table uses
-    and the transpose of :func:`degradation_ladder_table` (that one spans
-    *configurations* and continues onto the accelerator; this one stays at the
-    reference configuration and stops at the exported file).
-
-    Every rung runs the post-processing given by ``nms``, so the float step
-    prices the format conversion alone and the INT8 steps price precision
-    alone. Substituting one suppressor for the other is a different axis and is
-    priced separately -- see :func:`_preparation_stages`.
-
-    ``include_qat=False`` gives the step-2 (PTQ) table; the default includes
-    the step-3 rows so the whole preparation chain can be shown at once.
-
-    Args:
-        nms: Post-processing variant the whole ladder is built at. Must be
-            present in the frame; the SavedModel rung carries no NMS token and
-            is unaffected.
-        percent: Report AP in upstream percentage units (the thesis
-            convention) rather than 0-1 fractions.
+    All TFLite stages use the selected ``nms`` variant. ``include_qat=False`` keeps
+    only the PTQ path.
     """
     if df.empty or metric not in df.columns:
         return pd.DataFrame()
@@ -4007,21 +3143,14 @@ def preparation_ladder_table(
             )
 
         rows.append(row)
-        # Only the successive float rungs advance the running reference; the
-        # INT8 rows are siblings, not a chain.
+        # Only successive float stages update the running reference.
         if delta_base is None or delta_base == "prev":
             previous = current
 
     return pd.DataFrame(rows)
 
 
-#: Smallest PTQ deficit (AP points) worth expressing a reclaim as a percentage
-#: of. Below it the denominator is noise and the ratio explodes -- FPNLite
-#: per-channel loses 0.0997 and reclaims 0.45, which would report 451 %. The
-#: cell is left empty instead, and ``Reclaimed`` still carries the absolute
-#: change. Applied to the unrounded cost, so a row displaying -0.10 can be
-#: suppressed; ``Reclaimed %`` empty next to a small ``PTQ cost`` means the
-#: deficit was under this bar, not that the measurement is missing.
+#: Minimum PTQ AP deficit used as the denominator for ``Reclaimed %``.
 QAT_RECLAIM_MIN_DEFICIT = 0.1
 
 
@@ -4033,21 +3162,10 @@ def qat_reclaim_table(
     percent: bool = True,
     nms: str | None = DEFAULT_NMS,
 ) -> pd.DataFrame:
-    """
-    **Step 3** -- how much of the quantization cost QAT gets back.
+    """Compare QAT with PTQ per architecture and weight granularity.
 
-    One row per (architecture, weight granularity), because that is the axis
-    the answer depends on. QAT is not a general accuracy technique here: it is
-    a targeted repair for the shared-scale constraint of per-tensor
-    quantization. Where that constraint does not bind -- per-channel weights,
-    which already lose almost nothing -- there is nothing to reclaim and QAT
-    can come out *behind* the post-training export.
-
-    ``Reclaimed`` is the QAT-minus-PTQ difference; ``Reclaimed %`` expresses it
-    as a share of the PTQ cost, so a value near 100 means the deficit was
-    repaired and a negative value means QAT made it worse. It is left empty
-    where PTQ had no deficit to repair, since a percentage of roughly zero is
-    noise amplified, not a result.
+    ``Reclaimed %`` is omitted when the PTQ deficit is below
+    :data:`QAT_RECLAIM_MIN_DEFICIT`.
     """
     if df.empty or metric not in df.columns:
         return pd.DataFrame()
@@ -4089,11 +3207,7 @@ def qat_reclaim_table(
                     "PTQ cost": None if ptq_cost is None else round(ptq_cost, 2),
                     "QAT cost": None if qat_cost is None else round(qat_cost, 2),
                     "Reclaimed": None if reclaimed is None else round(reclaimed, 2),
-                    # A share of a deficit that never existed is meaningless.
-                    # Tested on the unrounded cost, so a value displayed as
-                    # -0.10 can still be suppressed: FPNLite per-channel is
-                    # -0.0997, and its +0.45 reclaim over that would print
-                    # 451 %.
+                    # Suppress percentage reclaim when the PTQ deficit is below the threshold.
                     "Reclaimed %": (
                         None
                         if reclaimed is None
@@ -4108,22 +3222,10 @@ def qat_reclaim_table(
 
 
 def discover_board_pairs(df: pd.DataFrame) -> list[tuple[str, str]]:
-    """
-    ``(delegated_tree, cpu_tree)`` for every board that has both.
+    """Return ``(delegate_tree, cpu_tree)`` pairs for boards with both backends.
 
-    A ``<board>_cpu`` tree is the same board with the delegate switched off, so
-    the pair is a controlled CPU-vs-NPU comparison on identical hardware --
-    which is the only honest way to state an acceleration factor. Control
-    trees such as ``_unpatched`` are excluded: they are a different delegate
-    build, not a different backend.
-
-    The naming convention alone is not enough to identify a pair. The dev host
-    may carry a delegated/CPU split of its own (``x86`` / ``x86_cpu``) while
-    having no accelerator at all
-    -- the difference there is whether the run *asked* for a delegate, not
-    whether it got one. Pairing those would report an "acceleration factor"
-    for a machine with nothing to accelerate on, so the delegated side is
-    additionally required to contain runs that actually executed on a delegate.
+    The delegated tree must contain runs executed with the delegate; control
+    builds such as ``_unpatched`` are excluded.
     """
     if df.empty or "platform" not in df.columns:
         return []
@@ -4151,24 +3253,9 @@ def device_latency_table(
     deployable_only: bool = True,
     nms: str | None = DEFAULT_NMS,
 ) -> pd.DataFrame:
-    """
-    **Step 5** -- what the surviving exports cost on each board, CPU vs NPU.
+    """Compare CPU and NPU latency on the same board for reference configurations.
 
-    Restricted to configurations step 4 found the accelerator executes
-    *correctly*. That restriction is the point rather than a convenience: a
-    delegate that returns ``NaN`` boxes or collapses to near-zero AP still
-    produces perfectly real timings, and it is usually **fast**, so an
-    unfiltered latency table ranks the broken configurations at the top. Pass
-    ``deployable_only=False`` only to demonstrate that.
-
-    The CPU column is the same board with the delegate switched off, not a
-    host, so ``Speedup`` is a property of the accelerator and not of the two
-    machines. Note that the CPU baseline is XNNPACK-accelerated, which makes
-    the reported speedup conservative.
-
-    ``dAP`` is carried alongside because acceleration is only worth having if
-    the answer survives it: a large speedup next to a large accuracy drop is a
-    finding, not a win.
+    Failed deployments are excluded by default. Includes speedup, FPS and AP delta.
     """
     if df.empty or "median_latency_ms" not in df.columns:
         return pd.DataFrame()
@@ -4240,7 +3327,7 @@ def device_latency_table(
 
 
 def plot_device_latency(df: pd.DataFrame, **kwargs):
-    """CPU vs NPU median latency per board, architecture and export scheme."""
+    """Plot CPU and NPU median latency by board, architecture and scheme."""
     table = device_latency_table(df, **kwargs)
     if table.empty:
         return None
@@ -4278,9 +3365,7 @@ def plot_device_latency(df: pd.DataFrame, **kwargs):
     return fig
 
 
-#: The single-axis deviations from the reference configuration that step 6
-#: contrasts against it. One axis at a time, because crossing them would make
-#: an effect impossible to attribute.
+#: Reference deviations used by the ablation table.
 ABLATION_AXES = (
     ("Reference (mc, trained full, eval full)", {}),
     ("Single-class", {"classes": "sc"}),
@@ -4289,11 +3374,7 @@ ABLATION_AXES = (
     ("Tiled end to end", {"dataset": "phenobench-tiled", "eval_tiling": "tiled"}),
 )
 
-#: The tiling square. Training tiling and evaluation tiling are *not* two
-#: independent one-axis deviations, and reporting them that way is misleading:
-#: each alone costs about 4 AP, while doing both gains 8.6 (MNv2, fp32, CPU
-#: reference). The matched cell is a different pipeline, not the sum of two
-#: perturbations, so :func:`tiling_cross_table` reports all four.
+#: Four training/evaluation tiling combinations used to expose their interaction.
 TILING_CELLS = (
     ("trained full / eval full", "phenobench", "untiled"),
     ("trained full / eval tiled", "phenobench", "tiled"),
@@ -4318,24 +3399,10 @@ def tiling_cross_table(
     ),
     percent: bool = True,
 ) -> pd.DataFrame:
-    """
-    All four training x evaluation tiling combinations, per architecture.
+    """Tabulate all training-tiling and evaluation-tiling combinations.
 
-    The two axes interact, so the one-at-a-time ablation cannot describe them.
-    Each cell answers a different question:
-
-    ==========================  =========================================
-    cell                        question
-    ==========================  =========================================
-    trained full / eval full    the reference
-    trained full / eval tiled   does tiling only at inference help?
-    trained tiled / eval full   does tile-training transfer to full frames?
-    trained tiled / eval tiled  the matched tiled pipeline
-    ==========================  =========================================
-
-    ``d`` is against the reference cell of the same architecture, so a
-    mismatched pair and the matched pipeline can be read off directly rather
-    than inferred from two separate deltas that do not add up.
+    Each metric delta is relative to full-frame training and full-frame evaluation
+    for the same architecture.
     """
     if df.empty or "dataset" not in df.columns:
         return pd.DataFrame()
@@ -4393,35 +3460,10 @@ def story_ablation_table(
     metric: str = "AP",
     percent: bool = True,
 ) -> pd.DataFrame:
-    """
-    **Step 6** -- how single-class and tiling move each of the earlier steps.
+    """Compare single-class and tiling deviations across the deployment stages.
 
-    One row per (deviation, architecture), one column per step, so the question
-    "does this dimension change the conclusion, or only the number" is
-    answerable by reading across. Deviations are single-axis: crossing them
-    would make any effect impossible to attribute.
-
-    Reading guide, since the columns are not all the same kind of quantity:
-
-    * ``Float AP`` is a level -- how good the detector is at all;
-    * ``Conversion`` / ``NMS swap`` / ``PTQ`` are costs against the preceding
-      rung, so they answer "does preparation behave differently here";
-    * ``QAT reclaim`` is QAT minus PTQ at per-tensor weights;
-    * ``NPU (ms)`` is cost on the accelerator.
-
-    The one prediction worth checking against this table is that ``NMS swap``
-    must be **exactly zero** on the single-class row: at one class the fast and
-    per-class suppressors are the same algorithm.
-
-    Cells whose rung was never benchmarked are left empty rather than dropping
-    the row, so an incomplete sweep is visible instead of silently narrowing
-    the comparison.
-
-    .. warning::
-
-       As with :func:`preparation_ladder_table`, pass a frame that still has
-       both post-processing variants; :func:`select_nms` output empties the
-       ``Conversion`` and ``NMS swap`` columns without complaining.
+    Requires both NMS variants for conversion and NMS-swap columns. Missing rungs
+    remain empty.
     """
     if df.empty or metric not in df.columns:
         return pd.DataFrame()
@@ -4489,22 +3531,19 @@ def story_ablation_table(
 
 
 def master_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Full benchmark matrix with renamed, rounded thesis-ready columns."""
+    """Format the full benchmark matrix with thesis column names and rounding."""
     cols = [
         ("platform", "Platform"),
         ("arch_label", "Architecture"),
         ("classes", "Classes"),
-        # Trained-on dataset and evaluated-on input regime are independent now
-        # (every model is swept over both regimes), so both have to be shown or
-        # otherwise identical-looking rows differ by an invisible field.
+        # Keep training dataset and evaluation input as separate columns.
         ("dataset", "Trained on"),
         ("size", "Input"),
         ("eval_tiling", "Eval input"),
         ("precision", "Precision"),
         ("quant", "Quant"),
         ("granularity", "Granularity"),
-        # Without this column the default export and its algorithm-matched
-        # control are two rows that differ in nothing the reader can see.
+        # Keep NMS visible because each variant is a separate export.
         ("nms", "NMS"),
         ("AP", "AP"),
         ("AP50", "AP50"),
@@ -4532,11 +3571,7 @@ def master_table(df: pd.DataFrame) -> pd.DataFrame:
 # Coverage / completeness
 # =========================================================
 
-#: The deployable exports that make up a *full run* for one model variant, as
-#: ``(precision, quant, granularity)`` -- the FP32 baseline plus one INT8 export
-#: per quantization scheme and weight granularity, mirroring the conversion
-#: targets in :mod:`agri_vision_edge.conversion.tflite`. FP32 has no
-#: granularity; QAT is INT8-only by construction.
+#: Export schemes expected for each model variant in the default-NMS coverage matrix.
 DEFAULT_SCHEMES = (
     ("fp32", "ptq", None),
     ("int8", "ptq", "per-tensor"),
@@ -4545,8 +3580,7 @@ DEFAULT_SCHEMES = (
     ("int8", "qat", "per-channel"),
 )
 
-#: Every model is benchmarked on both input regimes, so both belong in the
-#: expected matrix.
+#: Evaluation regimes expected for every model.
 DEFAULT_EVAL_TILINGS = ("untiled", "tiled")
 
 #: Platforms a full run targets: the dev host plus the two embedded NPU boards.
@@ -4554,17 +3588,7 @@ DEFAULT_EXPECTED_PLATFORMS = (CPU_REFERENCE_PLATFORM, "frdm-imx8mp", "frdm-imx93
 
 
 def scheme_label(scheme: str) -> str:
-    """
-    Short display name for an export scheme.
-
-    Two changes to the raw token. ``int8_`` is dropped, since every scheme but
-    the float one is INT8 and the prefix only costs width. And ``fp32_ptq``
-    becomes plain ``fp32``: the quant field records *which path exported the
-    float graph*, not a quantization that was applied, so the suffix reads as
-    though the float model were post-training quantized. Where both float
-    exports are present the QAT one keeps a marker, because then the path is
-    the thing that distinguishes them.
-    """
+    """Return a compact display label for an export scheme."""
     if scheme == "fp32_ptq":
         return "fp32"
     if scheme == "fp32_qat":
@@ -4574,12 +3598,7 @@ def scheme_label(scheme: str) -> str:
 
 
 def scheme_name(precision, quant, granularity=None) -> str:
-    """
-    Canonical short name of one export, e.g. ``int8_qat_per-channel``.
-
-    Matches the artifact filename suffix so a scheme in a table can be traced
-    back to the exact ``.tflite`` it came from.
-    """
+    """Return the canonical export-scheme token used in artifact names."""
     parts = [str(precision), str(quant)]
     if granularity and str(granularity) != "nan":
         parts.append(str(granularity))
@@ -4587,7 +3606,7 @@ def scheme_name(precision, quant, granularity=None) -> str:
 
 
 def add_scheme(df: pd.DataFrame) -> pd.DataFrame:
-    """Return ``df`` with a ``scheme`` column (see :func:`scheme_name`)."""
+    """Return a copy of ``df`` with a canonical ``scheme`` column."""
     if df.empty:
         return df
     out = df.copy()
@@ -4610,16 +3629,7 @@ _VARIANT_KEYS = ("arch", "classes", "dataset", "size")
 def discover_model_variants(
     artifacts_tf_dir: str | Path = "artifacts/tf",
 ) -> pd.DataFrame:
-    """
-    Enumerate trained model variants from the ``artifacts/tf`` folders.
-
-    Each subdirectory is a finetuned model named ``<arch>_<classes>_<dataset>_<size>``;
-    these define the rows of the expected benchmark matrix.
-
-    Returns:
-        One row per variant with its parsed config fields, or an empty frame
-        if the directory is absent.
-    """
+    """Enumerate trained variants from ``artifacts/tf`` directory names."""
     artifacts_tf_dir = Path(artifacts_tf_dir)
     if not artifacts_tf_dir.is_dir():
         return pd.DataFrame()
@@ -4638,15 +3648,7 @@ def discover_model_variants(
     return pd.DataFrame(rows)
 
 
-#: Trees that are not part of the conversion matrix at all. The SavedModel rung
-#: is the checkpoint's own TensorFlow graph: every export scheme in
-#: `DEFAULT_SCHEMES` is produced by `ave convert` *downstream* of it, so none of
-#: them is a thing that tree can be missing -- not the INT8 ones, and not
-#: `fp32_ptq` either, whose `ptq` token records which training path emitted the
-#: float graph rather than any quantization applied to it. Crossed with the
-#: schemes anyway, the tree reported 22 of 110 cells done (20 %) when it was
-#: complete for everything it can hold. It is produced by
-#: `scripts/benchmark_reference_models.py`, not by the sweep this matrix counts.
+#: Trees outside the TFLite conversion coverage matrix.
 NON_MATRIX_PLATFORMS = (REFERENCE_PLATFORM, "tf-savedmodel-nms0")
 
 
@@ -4659,33 +3661,10 @@ def build_coverage(
     nms: str | None = DEFAULT_NMS,
     exclude_platforms: Iterable[str] = NON_MATRIX_PLATFORMS,
 ) -> pd.DataFrame:
-    """
-    Cross variants × schemes × eval regimes × platforms into a long coverage
-    frame, flagging which expected runs are already benchmarked.
+    """Build expected benchmark coverage across variants, schemes, input regimes and platforms.
 
-    A cell is one benchmarked artifact, so the key has to carry everything that
-    distinguishes one: the variant, the export scheme *including its weight
-    granularity*, and the input regime it was evaluated on. Leaving the
-    granularity out (as an earlier version did) makes the per-tensor and
-    per-channel exports indistinguishable and reports a matrix that is both
-    incomplete and satisfied by half the runs.
-
-    Coverage is counted over the **default export** -- the ``fastnms``
-    variants. The per-class variant is equally deployable and was swept on the
-    boards, but only there: it is not converted for the CPU-only and unpatched
-    control trees, so treating it as an expected cell would invent gaps that
-    are deliberate. Treating it as *satisfying* a cell would be worse, letting
-    a per-class run stand in for the default export. The NMS axis therefore
-    gets its own completeness view rather than a column here.
-
-    ``exclude_platforms`` drops trees the conversion matrix does not describe.
-    No export scheme is a thing the SavedModel rung can be missing -- it holds
-    the pre-conversion graph, and every scheme is produced downstream of it --
-    so crossing it with them reported phantom gaps and understated its coverage
-    fivefold. It still appears in §8's per-platform tables, where it belongs.
-
-    Other platforms present in ``runs_df`` are always included, so unexpected
-    ones still surface. Matching ignores the split token.
+    Coverage tracks the default NMS export. ``exclude_platforms`` removes trees
+    outside the conversion matrix.
     """
     if variants_df.empty:
         return pd.DataFrame()
@@ -4693,8 +3672,7 @@ def build_coverage(
     runs_df = select_nms(runs_df, nms)
 
     def _granularity(value):
-        # fp32 has no granularity; normalise NaN/"" to None so the expected
-        # matrix and the loaded runs use the same key.
+        # Normalize missing FP32 granularity to ``None`` for coverage keys.
         if value is None or (isinstance(value, float) and np.isnan(value)):
             return None
         return value or None
@@ -4752,10 +3730,7 @@ def build_coverage(
 
 
 def coverage_matrix(coverage_long: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pivot the long coverage frame to a variant×(platform/scheme) ASCII grid
-    ("x" = done, "-" = missing) suitable for a table / LaTeX export.
-    """
+    """Pivot coverage to a variant by platform/scheme grid using ``x`` and ``-``."""
     if coverage_long.empty:
         return pd.DataFrame()
     grid = coverage_long.assign(
@@ -4771,7 +3746,7 @@ def coverage_matrix(coverage_long: pd.DataFrame) -> pd.DataFrame:
 
 
 def coverage_summary(coverage_long: pd.DataFrame) -> pd.DataFrame:
-    """Per-platform done / total / percent counts."""
+    """Summarize completed and expected coverage per platform."""
     if coverage_long.empty:
         return pd.DataFrame()
     g = coverage_long.groupby("platform")["present"]
@@ -4784,9 +3759,7 @@ def coverage_summary(coverage_long: pd.DataFrame) -> pd.DataFrame:
 # Resource / power sweeps (a separate measurement path)
 # =========================================================
 
-#: Metrics a resource sweep reports, as ``(column, label)``. Energy leads: it
-#: is the quantity latency alone cannot answer, and the reason the i.MX93 can
-#: lose on speed and still win a deployment.
+#: Resource metrics reported by power sweeps; energy is listed first.
 RESOURCE_METRICS = (
     ("net mJ/inf", "Net energy per inference (mJ)", True),
     ("net P (W)", "Net power (W)", True),
@@ -4796,15 +3769,7 @@ RESOURCE_METRICS = (
 
 
 def annotate_resource_runs(power_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add the configuration columns parsed out of each resource run's name.
-
-    A resource sweep records the *model stem*, not a benchmark run directory,
-    so it carries no ``<tiling>`` prefix -- the sweep feeds one image set and
-    input regime is not an axis it varies. Everything else in the name follows
-    the same grammar, which is what lets these rows be scoped with the same
-    vocabulary as the rest of the notebook.
-    """
+    """Parse model configuration fields from resource-run names and add ``scheme``."""
     if power_df.empty or "run" not in power_df.columns:
         return power_df
 
@@ -4828,21 +3793,105 @@ def annotate_resource_runs(power_df: pd.DataFrame) -> pd.DataFrame:
     return add_scheme(out)
 
 
+def accelerator_latency_table(
+    power_frame: pd.DataFrame,
+    *,
+    nms: str | None = None,
+    size: str | None = None,
+    schemes: Iterable[str] | None = None,
+    verdicts: Iterable[str] | None = ("ok",),
+    exclude_devices: str = "_unpatched|_no-concat",
+) -> pd.DataFrame:
+    """Compare whole-call and graph-invoke CPU/NPU speedups from resource sweeps.
+
+    ``CPU-side (ms)`` is preprocess plus postprocess. Rows without phase timing or
+    outside the requested verdict set are excluded.
+    """
+    needed = {"device", "invoke med (ms)", "lat med (ms)"}
+    if power_frame.empty or not needed.issubset(power_frame.columns):
+        return pd.DataFrame()
+
+    sel = power_frame
+    if exclude_devices:
+        sel = sel[~sel["device"].str.contains(exclude_devices, na=False)]
+    if nms is not None and "nms" in sel.columns:
+        sel = sel[sel["nms"] == nms]
+    if size is not None and "size" in sel.columns:
+        sel = sel[sel["size"].astype(str) == str(size)]
+    if schemes is not None and "scheme" in sel.columns:
+        sel = sel[sel["scheme"].isin(set(schemes))]
+    if verdicts is not None and "verdict" in sel.columns:
+        sel = sel[sel["verdict"].isin(set(verdicts))]
+    # Phase comparison requires invoke timing.
+    sel = sel[sel["invoke med (ms)"].notna()]
+    if sel.empty:
+        return pd.DataFrame()
+
+    rows = []
+    boards = sorted({d for d in sel["device"].unique() if not str(d).endswith("_cpu")})
+    for board in boards:
+        npu = sel[sel["device"] == board]
+        cpu = sel[sel["device"] == f"{board}_cpu"]
+        if npu.empty or cpu.empty:
+            continue
+        keys = [k for k in ("arch_label", "scheme") if k in sel.columns]
+        if not keys:
+            continue
+        for key, group in npu.groupby(keys, dropna=False):
+            key = key if isinstance(key, tuple) else (key,)
+            match = cpu
+            for column, value in zip(keys, key, strict=False):
+                match = match[match[column] == value]
+            if match.empty:
+                continue
+            n_inv = float(group["invoke med (ms)"].median())
+            c_inv = float(match["invoke med (ms)"].median())
+            n_all = float(group["lat med (ms)"].median())
+            c_all = float(match["lat med (ms)"].median())
+            # Resize is included in preprocess; CPU-side time is preprocess plus postprocess.
+            fixed = sum(
+                float(group[col].median())
+                for col in ("pre med (ms)", "post med (ms)")
+                if col in group.columns and group[col].notna().any()
+            )
+            row = dict(zip(keys, key, strict=False))
+            row.update(
+                {
+                    "Board": board,
+                    "CPU invoke (ms)": round(c_inv, 1),
+                    "NPU invoke (ms)": round(n_inv, 1),
+                    "Speedup (invoke)": round(c_inv / n_inv, 2) if n_inv else None,
+                    "CPU predict (ms)": round(c_all, 1),
+                    "NPU predict (ms)": round(n_all, 1),
+                    "Speedup (predict)": round(c_all / n_all, 2) if n_all else None,
+                    "CPU-side (ms)": round(fixed, 1),
+                }
+            )
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).rename(
+        columns={"arch_label": "Architecture", "scheme": "Scheme"}
+    )
+    lead = [c for c in ("Board", "Architecture", "Scheme") if c in out.columns]
+    return (
+        out[lead + [c for c in out.columns if c not in lead]]
+        .sort_values(lead)
+        .reset_index(drop=True)
+    )
+
+
 def plot_resource_summary(
     power_df: pd.DataFrame,
     *,
     metrics: Iterable[tuple[str, str, bool]] = RESOURCE_METRICS,
     verified_only: bool = True,
 ):
-    """
-    One panel per resource metric, grouped by export scheme, coloured by device.
+    """Plot resource metrics by export scheme, device and architecture.
 
-    ``verified_only`` is applied **per metric**, not to the frame. Only power
-    and energy are joined to the meter trace; latency, CPU and memory are
-    recorded by the board itself and are unaffected by whether the join could
-    be checked. Gating them too punched holes in a matrix for a reason that
-    does not apply to them, so each panel drops only the rows its own metric
-    depends on -- and the panel title says when that happened.
+    ``verified_only`` applies only to metrics joined to the external power trace.
     """
     if power_df.empty:
         return None
@@ -4852,7 +3901,7 @@ def plot_resource_summary(
         return None
 
     def _rows_for(joined: bool) -> pd.DataFrame:
-        """Rows a metric may use: joined ones need a checked alignment."""
+        """Filter joined metrics to runs with verified trace alignment."""
         if not (joined and verified_only) or "state" not in sel.columns:
             return sel
         return sel[sel["state"] == "verified"]
@@ -4869,10 +3918,7 @@ def plot_resource_summary(
     if not schemes:
         return None
 
-    # Series are device *and* architecture. Folding the detectors together
-    # averages a ~40% latency difference into one bar and hides the thing a
-    # reader compares: FPNLite's extra neck costs energy on one board and
-    # almost nothing on the other.
+    # Keep device and architecture as separate series.
     series = sorted(
         {
             (str(d), str(a))
@@ -4938,19 +3984,7 @@ def plot_class_regime_quantization(
     nms: str | None = DEFAULT_NMS,
     percent: bool = True,
 ):
-    """
-    Per-class AP across export schemes, multi-class beside single-class.
-
-    Three series per scheme: the two classes a multi-class model reports, and
-    the weed AP of the single-class model trained on the same data. Read across
-    a panel, the question is whether quantization-aware training helps the same
-    amount in both class regimes -- and it does not. The single-class weed bar
-    is *not* a slice of the multi-class one; it is a different model, which is
-    why it needs its own series rather than a facet.
-
-    One panel per architecture, because the two detectors answer this
-    differently and pooling them would average an effect that reverses sign.
-    """
+    """Plot per-class AP across export schemes for multi-class and single-class models."""
     if df.empty or "weed_AP" not in df.columns:
         return None
 
@@ -5020,22 +4054,9 @@ def plot_resolution_tradeoff(
     percent: bool = True,
     latency_ticks: Iterable[float] = (30, 50, 100, 200, 500),
 ):
-    """
-    What a resolution rung buys against what it costs, on the target.
+    """Plot AP against target-device latency across input resolutions.
 
-    Accuracy against **device** latency, with the resolution rungs of one
-    detector on one board joined into a line. A rung is worth taking only if
-    its step up the y axis justifies its step along x, and that is a question
-    about the board -- the CPU reference answers a different one, so it is not
-    drawn here.
-
-    Latency is log-scaled: the ladder spans 30 ms to several seconds, and on a
-    linear axis every rung below 1024 collapses onto the origin.
-
-    Pinned to one ``scheme``. Granularity alone moves latency eightfold on the
-    Vivante NPU, so a line mixing schemes would trace that rather than
-    resolution. Points are labelled with their input size; a rung not yet
-    benchmarked on a board simply does not appear.
+    One export scheme is used per line; latency uses a logarithmic axis.
     """
     if df.empty or metric not in df.columns:
         return None
@@ -5104,7 +4125,7 @@ def plot_resolution_tradeoff(
 
     ax.set_xlabel("median latency on device (ms, log scale)")
     ax.set_ylabel(f"{metric} (%)" if percent else metric)
-    ax.set_title(f"Resolution trade-off on device — {scheme_label(scheme)}")
+    ax.set_title(f"Resolution trade-off on device: {scheme_label(scheme)}")
     _prepare_axis(ax)
 
     fig.tight_layout()
@@ -5125,24 +4146,7 @@ def plot_resolution_ap(
     ),
     percent: bool = True,
 ):
-    """
-    AP against input resolution, one line per detector.
-
-    Colour is the architecture and the line is its ladder, so the question the
-    figure answers -- does more input resolution buy accuracy, and does it buy
-    the same for both detectors -- is read off the slopes.
-
-    ``schemes`` are drawn as separate line styles, and are listed rather than
-    summarised by precision on purpose. An earlier version drew one "INT8" line
-    per detector, which averaged per-tensor with per-channel and so hid up to
-    2.4 AP (FPNLite at 320) of the granularity effect §2 exists to report --
-    the same silent collapse this figure is meant to rule out for resolution.
-    QAT is omitted by default to keep the line count readable; the table beside
-    the figure carries every scheme.
-
-    A detector with no run at some resolution simply ends early; the ladder is
-    ragged while rungs are still training.
-    """
+    """Plot AP against input resolution by architecture and export scheme."""
     if df.empty or metric not in df.columns:
         return None
 
@@ -5207,7 +4211,7 @@ def plot_resolution_ap(
 
 
 def plot_coverage(coverage_long: pd.DataFrame):
-    """Heatmap of benchmark coverage: rows = variant, cols = platform/scheme."""
+    """Plot benchmark coverage as a variant by platform/scheme heatmap."""
     if coverage_long.empty:
         return None
     from matplotlib.colors import ListedColormap
@@ -5253,23 +4257,184 @@ def plot_coverage(coverage_long: pd.DataFrame):
 # =========================================================
 
 
+#: Fixed gallery colours for crop and weed boxes.
+GALLERY_CLASS_COLORS = {"crop": "#3B8EDE", "weed": "#F2C300"}
+
+
+def _gallery_boxes(records, image_id, categories, score_threshold):
+    """Return score-filtered ``(x, y, w, h, class_name)`` boxes for one image."""
+    out = []
+    for r in records.get(image_id, ()):
+        if r.get("score") is not None and float(r["score"]) < score_threshold:
+            continue
+        name = categories.get(r.get("category_id"))
+        if name is None:
+            continue
+        out.append((*r["bbox"], name))
+    return out
+
+
+def plot_detection_gallery(
+    annotations_path: str | Path,
+    image_root: str | Path,
+    predictions: dict[str, str | Path],
+    *,
+    n_images: int = 8,
+    score_threshold: float = 0.5,
+    max_px: int = 384,
+    figure_width: float = 9.0,
+):
+    """Plot ground truth and detector outputs on the same deterministic frame sample.
+
+    Frames are stratified by weed count. Returns ``None`` if required images,
+    annotations or predictions are unavailable.
+    """
+    annotations_path = Path(annotations_path)
+    image_root = Path(image_root)
+    if not annotations_path.is_file() or not image_root.is_dir():
+        return None
+
+    available = {
+        label: Path(path) for label, path in predictions.items() if Path(path).is_file()
+    }
+    if not available:
+        return None
+
+    try:
+        import matplotlib.image as mpimg
+        from matplotlib.patches import Rectangle
+    except ImportError:  # pragma: no cover
+        return None
+
+    with open(annotations_path) as handle:
+        coco = json.load(handle)
+
+    categories = {c["id"]: c["name"] for c in coco.get("categories", ())}
+    images = {img["id"]: img for img in coco.get("images", ())}
+
+    truth: dict[int, list] = {}
+    weeds: dict[int, int] = dict.fromkeys(images, 0)
+    for ann in coco.get("annotations", ()):
+        truth.setdefault(ann["image_id"], []).append(ann)
+        if categories.get(ann["category_id"]) == "weed":
+            weeds[ann["image_id"]] = weeds.get(ann["image_id"], 0) + 1
+
+    # Only existing image files can be drawn.
+    usable = [
+        i for i in sorted(images) if (image_root / images[i]["file_name"]).is_file()
+    ]
+    if not usable:
+        return None
+
+    # Stratify on weed count; `id` breaks ties so the choice is reproducible.
+    usable.sort(key=lambda i: (weeds.get(i, 0), i))
+    n_images = max(1, min(n_images, len(usable)))
+    step = len(usable) / n_images
+    chosen = [usable[min(len(usable) - 1, int(k * step))] for k in range(n_images)]
+
+    detections: dict[str, dict[int, list]] = {}
+    for label, path in available.items():
+        with open(path) as handle:
+            payload = json.load(handle)
+        per_image: dict[int, list] = {}
+        for record in payload if isinstance(payload, list) else ():
+            per_image.setdefault(record["image_id"], []).append(record)
+        detections[label] = per_image
+
+    columns = ["Ground truth", *detections]
+    n_cols = len(columns)
+    fig, axes = plt.subplots(
+        n_images,
+        n_cols,
+        figsize=(figure_width, figure_width / n_cols * n_images),
+        squeeze=False,
+    )
+
+    for row, image_id in enumerate(chosen):
+        meta = images[image_id]
+        frame = mpimg.imread(image_root / meta["file_name"])
+        # Plain striding is sufficient for gallery thumbnails.
+        stride = max(1, int(max(frame.shape[:2]) / max_px))
+        shown = frame[::stride, ::stride]
+        scale = 1.0 / stride
+
+        for col, column in enumerate(columns):
+            ax = axes[row][col]
+            ax.imshow(shown)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#999999")
+                spine.set_linewidth(0.5)
+
+            if column == "Ground truth":
+                boxes = [
+                    (*a["bbox"], categories.get(a["category_id"]))
+                    for a in truth.get(image_id, ())
+                ]
+            else:
+                boxes = _gallery_boxes(
+                    detections[column], image_id, categories, score_threshold
+                )
+
+            for x, y, w, h, name in boxes:
+                ax.add_patch(
+                    Rectangle(
+                        (x * scale, y * scale),
+                        w * scale,
+                        h * scale,
+                        fill=False,
+                        edgecolor=GALLERY_CLASS_COLORS.get(name, "#FFFFFF"),
+                        linewidth=0.8,
+                    )
+                )
+
+            if row == 0:
+                ax.set_title(column, fontsize=9)
+            if col == 0:
+                # Label each row with frame id and class counts.
+                _crop = sum(
+                    1
+                    for a in truth.get(image_id, ())
+                    if categories.get(a["category_id"]) == "crop"
+                )
+                ax.set_ylabel(
+                    f"{meta['file_name'].split('_')[-1][:-4]}\n"
+                    f"{_crop} crop  {weeds.get(image_id, 0)} weed",
+                    fontsize=6,
+                )
+
+    handles = [
+        plt.Line2D([], [], color=color, linewidth=2, label=name)
+        for name, color in GALLERY_CLASS_COLORS.items()
+    ]
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        ncol=len(handles),
+        frameon=False,
+        fontsize=9,
+        bbox_to_anchor=(0.5, 0.0),
+    )
+    fig.tight_layout(rect=(0, 0.025, 1, 1))
+    return fig
+
+
 def save_figure(
     fig,
     stem: str,
     fig_dir: str | Path,
     formats: Iterable[str] = ("pdf", "png"),
+    dpi: float | None = None,
 ) -> None:
-    """Export ``fig`` as ``<stem>.<ext>`` for each format into ``fig_dir``."""
+    """Save a figure under each requested format and optional DPI."""
     if fig is None:
         return
     fig_dir = Path(fig_dir)
     fig_dir.mkdir(parents=True, exist_ok=True)
     for ext in formats:
-        # `bbox_inches="tight"` grows the canvas to include artists placed
-        # outside the axes. Legends are put there deliberately (they would sit
-        # on the data otherwise), and without this they are cropped at the
-        # figure edge in the exported file.
-        fig.savefig(fig_dir / f"{stem}.{ext}", bbox_inches="tight")
+        # Include legends and other artists placed outside the axes.
+        fig.savefig(fig_dir / f"{stem}.{ext}", bbox_inches="tight", dpi=dpi)
 
 
 # Unicode -> ASCII fallbacks so exported .tex compiles under plain pdflatex.
@@ -5280,13 +4445,13 @@ _ASCII_REPLACEMENTS = {
     "≥": ">=",  # greater-or-equal
     "Δ": "d",  # capital delta
     "²": "^2",  # superscript two
-    "–": "-",  # en dash
-    "—": "--",  # em dash
+    "\u2013": "-",  # en dash
+    "\u2014": "--",  # em dash
 }
 
 
 def _ascii(value):
-    """Coerce a string to ASCII, applying known replacements first."""
+    """Convert a string to ASCII using known symbol replacements."""
     if not isinstance(value, str):
         return value
     for uni, repl in _ASCII_REPLACEMENTS.items():
@@ -5300,17 +4465,13 @@ def save_latex_table(
     *,
     caption: str = "",
     label: str | None = None,
+    split_by: str | None = None,
     **to_latex_kwargs,
 ) -> None:
-    """
-    Write ``df`` as a (optionally wrapped) booktabs LaTeX table (ASCII-only).
+    """Write a DataFrame as an ASCII-safe booktabs LaTeX table.
 
-    The index is dropped only when it carries no information. A default
-    ``RangeIndex`` is row numbering and belongs nowhere near a thesis table,
-    but a frame indexed by its configuration keys -- the degradation ladder is
-    one -- loses its row labels entirely if the index is discarded, and a table
-    of unlabelled numbers is worse than no table. Pass ``index=`` explicitly to
-    override.
+    Non-default indexes are preserved as columns. ``split_by`` emits one continued
+    table panel per group.
     """
     if df.empty:
         return
@@ -5319,8 +4480,7 @@ def save_latex_table(
 
     keep_index = not isinstance(df.index, pd.RangeIndex)
     if keep_index:
-        # Flatten to plain columns rather than relying on to_latex's multirow
-        # handling, which needs \multirow in the preamble to compile.
+        # Flatten non-default indexes so LaTeX needs no multirow support.
         df = df.reset_index()
         keep_index = False
 
@@ -5330,6 +4490,15 @@ def save_latex_table(
     if len(obj_cols):
         df[obj_cols] = df[obj_cols].apply(lambda c: c.map(_ascii))
 
+    if split_by is not None:
+        if not caption:
+            raise ValueError("split_by requires a caption")
+        if split_by not in df.columns:
+            raise ValueError(f"split column not found: {split_by}")
+        groups = list(df.groupby(split_by, sort=False, dropna=False))
+    else:
+        groups = [(None, df)]
+
     kwargs = {
         "index": keep_index,
         "escape": True,
@@ -5337,27 +4506,34 @@ def save_latex_table(
         "float_format": "%.4g",
     }
     kwargs.update(to_latex_kwargs)
-    body = _ascii(df.to_latex(**kwargs))
+    table_bodies = [
+        (group, _ascii(group_df.to_latex(**kwargs))) for group, group_df in groups
+    ]
 
     if caption:
         label = label or path.stem
-        # `max width` scales the tabular only when it would overrun the text
-        # block, so narrow tables keep the body font while the wide sweeps
-        # (device_latency at 11 columns, nms_substitution_summary at 15) fit
-        # instead of running into the margin. Unconditional \resizebox would
-        # shrink every table, including the ones that already fit.
-        body = (
-            # [htbp] rather than [t]: top-only placement cannot satisfy a
-            # chapter carrying ~19 floats over ~18 pages, because a table that
-            # misses the top of the current page defers to the next one and the
-            # backlog cascades for the rest of the chapter. Allowing `h` lets a
-            # table set in the prose that discusses it, and `p` gives the wide
-            # sweeps somewhere to go instead of displacing body text.
-            "\\begin{table}[htbp]\n\\centering\n"
-            f"\\caption{{{_ascii(caption)}}}\n\\label{{tab:{label}}}\n"
-            "\\begin{adjustbox}{max width=\\linewidth}\n"
-            f"{body}"
-            "\\end{adjustbox}\n"
-            "\\end{table}\n"
-        )
+        # Scale only tables wider than the text block.
+        panels = []
+        for panel_index, (group, table_body) in enumerate(table_bodies):
+            if panel_index == 0:
+                heading = f"\\caption{{{_ascii(caption)}}}\n\\label{{tab:{label}}}\n"
+            else:
+                group_label = _ascii(str(group)).replace("_", "\\_")
+                heading = (
+                    "{\\centering\\small\\textbf{\\tablename~\\thetable:} "
+                    f"(continued) \\texttt{{{group_label}}}.\\par}}\n"
+                    "\\vspace{\\belowcaptionskip}\n"
+                )
+            panels.append(
+                # Allow normal, top, bottom and float-page placement.
+                "\\begin{table}[htbp]\n\\centering\n"
+                f"{heading}"
+                "\\begin{adjustbox}{max width=\\linewidth}\n"
+                f"{table_body}"
+                "\\end{adjustbox}\n"
+                "\\end{table}\n"
+            )
+        body = "\\clearpage\n".join(panels)
+    else:
+        body = table_bodies[0][1]
     path.write_text(body)
