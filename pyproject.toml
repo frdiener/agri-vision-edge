@@ -124,3 +124,9 @@ extend-exclude = ["third_party", "notebooks/attic"]
 # E/F = pyflakes+pycodestyle, I = isort, UP = pyupgrade, B = bugbear, C4 = comprehensions
 select = ["E", "F", "I", "UP", "B", "C4"]
 ignore = ["E501"]  # line length handled by the formatter
+
+[tool.pytest.ini_options]
+# Keep the default test command within this project; the working-tree archive
+# also contains vendored TensorFlow Models and Yocto source trees with their own
+# environment-specific suites.
+testpaths = ["tests"]
