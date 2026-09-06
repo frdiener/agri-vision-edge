@@ -1,0 +1,2139 @@
+#+title: Experiments
+
+* Remote runs
+#+name: image
+#+begin_src emacs-lisp :results value raw
+;; "phenoBench_00007.png"
+"05-15_00062_P0030859.png"
+#+end_src
+
+#+name: model-local
+#+begin_src emacs-lisp :results value raw
+;; "../artifacts/tflite/ssd-mn2-fpnlite_mc_phenobench_320_int8_qat_per-channel_fastnms.tflite" 
+;; "../artifacts/tflite/ssd-mn2-fpnlite_mc_phenobench_320_int8_qat_fastnms.tflite" 
+;; "../artifacts/tflite/yolov7-tiny_mc_phenobench-tiled_512_int8_ptq.tflite"
+"../artifacts/tflite/yolov7-tiny_mc_phenobench-tiled_512_int8_ptq_per-channel.tflite"
+;; "../../mesa/src/gallium/targets/teflon/tests/models/yolox/yolox_nano_full_integer_quant.tflite"
+#+end_src
+
+#+name: upload-model
+#+header: :var model=model-local()
+#+begin_src sh :results output
+rsync $model dude06:/ptx/work/WORK_ALPHO/fdi/YOCTO.BSP-AVE/build/agri-vision-edge/artifacts/tflite/uploaded.tflite && \
+  echo "uploaded $model"
+#+end_src
+
+#+RESULTS: upload-model
+: uploaded ../artifacts/tflite/yolov7-tiny_mc_phenobench-tiled_512_int8_ptq_per-channel.tflite
+
+#+name: run-inference
+#+begin_src sh :var model="" :var image=image() :var unsupported_ops="" :var unsupported_nodes="" :results output verbatim
+TEFLON_DEBUG=verbose \
+ETHOSU_DEBUG=debug_msgs,dump_bos,zero_bos,disable_nhcwb16 \
+ETNA_MESA_DEBUG=ml_msgs \
+TEFLON_UNSUPPORTED_OPS="${unsupported_ops}" \
+TEFLON_UNSUPPORTED_NODES="${unsupported_nodes}" \
+./scripts/ave infer \
+  -t 0.3 \
+  "artifacts/tflite/${model}.tflite" \
+  "datasets/test-bundle/images/${image}" \
+  2>&1 | grep -v 'ReLU6 check'
+#+end_src
+
+#+name: teflon-op-graph
+#+header: :var run_output="" :var graph_name=""
+#+begin_src emacs-lisp :results value raw
+(require 'cl-lib)
+(require 'subr-x)
+
+(defun fdi/tflite-dot-escape (s)
+  "Escape S for a Graphviz double-quoted string."
+  (apply
+   #'concat
+   (mapcar
+    (lambda (ch)
+      (cond
+       ;; DOT string escape sequences.
+       ((eq ch ?\\) "\\\\")
+       ((eq ch ?\") "\\\"")
+       ;; Graphviz uses a literal backslash-n for a label line break.
+       ((eq ch ?\n) "\\n")
+       ((eq ch ?\r) "")
+       (t (char-to-string ch))))
+    (string-to-list (or s "")))))
+
+(defun fdi/tflite-parse-ops (text)
+  "Parse the initial numbered TFLite op listing from TEXT.
+
+Return a list of plists containing:
+  :idx :kind :supported :inputs :output :dtype :activation"
+  (let ((ops nil)
+        (lines (split-string text "\n" t))
+        ;; The first listing has global operation numbers.  Stop before the
+        ;; later per-partition reports, whose operation indices restart at 0.
+        (stop-re "^teflon: ===== subgraph"))
+    (catch 'done
+      (dolist (line lines)
+        (when (string-match-p stop-re line)
+          (throw 'done nil))
+
+        ;; Example:
+        ;;
+        ;;  20 op:  0 ADD v2  🟢 supported in: 174(i8) 183(i8) out: 184(i8)
+        ;;
+        (when
+            (string-match
+             (concat
+              "^[[:space:]]*\\([0-9]+\\)[[:space:]]+op:"
+              "[[:space:]]*[0-9]+[[:space:]]+"
+              "\\([^[:space:]]+\\)"
+              ".*?"
+              "\\(🟢 supported\\|🔴 unsupported\\)"
+              ".*in:[[:space:]]*"
+              "\\(.*\\)"
+              "[[:space:]]+out:[[:space:]]*"
+              ;; t184(i8): capture 184 and i8.
+              "\\([0-9]+\\)(\\([^)]*\\))"
+              "\\(.*\\)$")
+             line)
+          (let* ((idx        (string-to-number (match-string 1 line)))
+                 (kind       (match-string 2 line))
+                 (supported  (string= (match-string 3 line)
+                                      "🟢 supported"))
+                 (input-text (match-string 4 line))
+                 (output     (string-to-number (match-string 5 line)))
+                 (dtype      (match-string 6 line))
+                 (activation (string-trim (match-string 7 line)))
+                 (inputs nil)
+                 (pos 0))
+
+            ;; Extract all references such as 174(i8), 183(i8), 186(i32).
+            ;;
+            ;; Group 1: tensor number
+            ;; Group 2: type, unused here
+            (while (string-match
+                    "\\([0-9]+\\)(\\([^)]*\\))"
+                    input-text
+                    pos)
+              (push (string-to-number (match-string 1 input-text))
+                    inputs)
+              (setq pos (match-end 0)))
+
+            (push (list :idx idx
+                        :kind kind
+                        :supported supported
+                        :inputs (nreverse inputs)
+                        :output output
+                        :dtype dtype
+                        :activation activation)
+                  ops)))))
+    (nreverse ops)))
+
+(defun fdi/tflite-parse-subgraph-outputs (text)
+  "Return all tensors reported as Teflon subgraph outputs in TEXT."
+  (let (outputs)
+    (dolist (line (split-string text "\n" t))
+      ;; Example:
+      ;; teflon:   out: 184,252,293
+      (when (string-match
+             "^teflon:[[:space:]]+out:[[:space:]]*\\(.+\\)$"
+             line)
+        (dolist (item (split-string (match-string 1 line)
+                                    "[,[:space:]]+"
+                                    t))
+          (when (string-match-p "^[0-9]+$" item)
+            (push (string-to-number item) outputs)))))
+    (delete-dups outputs)))
+
+(defun fdi/tflite-op-label (op)
+  "Return a compact multi-line DOT label for OP."
+  (let ((activation (plist-get op :activation)))
+    ;; These are real newlines.  fdi/tflite-dot-escape converts them to \n
+    ;; for Graphviz after escaping the rest of the string.
+    (format "#%d  %s\nout t%d (%s)%s"
+            (plist-get op :idx)
+            (plist-get op :kind)
+            (plist-get op :output)
+            (plist-get op :dtype)
+            (if (string-empty-p activation)
+                ""
+              (concat "\n" activation)))))
+
+(defun fdi/tflite-output-path (graph-name extension)
+  "Return output path for GRAPH-NAME.EXT next to the current Org file."
+  (let* ((base-dir
+          (file-name-directory
+           (or (buffer-file-name) default-directory)))
+         (graph-dir (expand-file-name "graphs" base-dir)))
+    (make-directory graph-dir t)
+    (expand-file-name
+     (format "%s.%s" graph-name extension)
+     graph-dir)))
+
+(defun fdi/tflite-write-graph (run-output graph-name)
+  "Create a DOT and SVG graph directly from RUN-OUTPUT.
+
+Colours:
+  green           supported operation
+  red             unsupported operation
+  purple outline  Teflon subgraph output
+  orange dashed   delegated producer -> CPU consumer
+  thick orange    mixed fan-out: delegated producer feeds NPU and CPU"
+  (unless (executable-find "dot")
+    (user-error "Graphviz 'dot' is not available in exec-path"))
+
+  (let* ((ops (fdi/tflite-parse-ops run-output))
+         (subgraph-outs (fdi/tflite-parse-subgraph-outputs run-output))
+         ;; tensor ID -> op producing it
+         (producer (make-hash-table :test #'eql))
+         ;; tensor ID -> ops consuming it
+         (consumers (make-hash-table :test #'eql))
+         (dotfile (fdi/tflite-output-path graph-name "dot"))
+         (svgfile (fdi/tflite-output-path graph-name "svg")))
+
+    (unless ops
+      (user-error
+       "No initial numbered TFLite operator listing found in run output"))
+
+    (dolist (op ops)
+      (puthash (plist-get op :output) op producer)
+      (dolist (tensor (plist-get op :inputs))
+        (push op (gethash tensor consumers))))
+
+    (with-temp-file dotfile
+      (insert "digraph tflite {\n")
+      (insert "  graph [rankdir=TB, bgcolor=\"#1e1e1e\", "
+              "fontname=\"sans\", pad=\"0.35\", nodesep=\"0.28\", "
+              "ranksep=\"0.55\", concentrate=false];\n")
+      (insert "  node [shape=box, style=\"rounded,filled\", "
+              "fontname=\"sans\", fontsize=10, margin=\"0.10,0.07\", "
+              "fontcolor=\"#eeeeee\", color=\"#9a9a9a\"];\n")
+      (insert "  edge [fontname=\"sans\", fontsize=8, arrowsize=0.7, "
+              "fontcolor=\"#dddddd\", color=\"#9a9a9a\"];\n\n")
+
+      (insert "  label=\"TFLite / Teflon operator data flow\\n"
+              "green: supported · red: unsupported · "
+              "purple: Teflon subgraph output · "
+              "orange: delegated → CPU boundary\";\n")
+      (insert "  labelloc=t; fontsize=18; fontcolor=\"#eeeeee\";\n\n")
+
+      ;; Operation nodes.
+      (dolist (op ops)
+        (let* ((idx (plist-get op :idx))
+               (supported (plist-get op :supported))
+               (out-tensor (plist-get op :output))
+               (subgraph-output-p (member out-tensor subgraph-outs))
+               (fillcolor (if supported "#246b45" "#7a3030"))
+               (border (if subgraph-output-p "#b67cff" "#9a9a9a"))
+               (penwidth (if subgraph-output-p "2.6" "1.0")))
+          (insert
+           (format
+            "  op%d [label=\"%s\", fillcolor=\"%s\", color=\"%s\", penwidth=%s];\n"
+            idx
+            (fdi/tflite-dot-escape (fdi/tflite-op-label op))
+            fillcolor
+            border
+            penwidth))))
+
+      (insert "\n")
+
+      ;; Sort tensor IDs to make DOT output stable between runs.
+      (let (tensor-ids)
+        (maphash
+         (lambda (tensor _producer-op)
+           (push tensor tensor-ids))
+         producer)
+
+        (dolist (tensor (sort tensor-ids #'<))
+          (let* ((producer-op (gethash tensor producer))
+                 (producer-supported
+                  (plist-get producer-op :supported))
+                 (all-consumers
+                  (sort
+                   (delete-dups
+                    (copy-sequence (gethash tensor consumers)))
+                   (lambda (a b)
+                     (< (plist-get a :idx)
+                        (plist-get b :idx)))))
+                 (has-supported-consumer
+                  (cl-some
+                   (lambda (op) (plist-get op :supported))
+                   all-consumers))
+                 (has-unsupported-consumer
+                  (cl-some
+                   (lambda (op) (not (plist-get op :supported)))
+                   all-consumers))
+                 ;; The interesting case: e.g. t184/t252 in your graph.
+                 ;; A native-layout delegate result continues on NPU but must
+                 ;; also be exposed in ordinary TFLite logical layout to CPU.
+                 (mixed-fanout
+                  (and producer-supported
+                       has-supported-consumer
+                       has-unsupported-consumer)))
+
+            (dolist (consumer all-consumers)
+              (let* ((consumer-supported
+                      (plist-get consumer :supported))
+                     (delegated-to-cpu
+                      (and producer-supported
+                           (not consumer-supported)))
+                     (attrs
+                      (cond
+                       (mixed-fanout
+                        (list
+                         "color=\"#ffad42\""
+                         "fontcolor=\"#ffcf86\""
+                         "penwidth=2.8"
+                         (format
+                          "label=\"t%d%s\""
+                          tensor
+                          (if delegated-to-cpu
+                              "  export → CPU"
+                            "  stays delegated"))))
+
+                       (delegated-to-cpu
+                        (list
+                         "color=\"#ffad42\""
+                         "fontcolor=\"#ffcf86\""
+                         "style=dashed"
+                         "penwidth=2.0"
+                         (format
+                          "label=\"t%d  export → CPU\""
+                          tensor)))
+
+                       ((member tensor subgraph-outs)
+                        (list
+                         "color=\"#b67cff\""
+                         "fontcolor=\"#d3b5ff\""
+                         "penwidth=1.8"
+                         (format
+                          "label=\"t%d  subgraph output\""
+                          tensor))))))
+
+                (insert
+                 (format
+                  "  op%d -> op%d%s;\n"
+                  (plist-get producer-op :idx)
+                  (plist-get consumer :idx)
+                  (if attrs
+                      (format " [%s]" (string-join attrs ", "))
+                    ""))))))))
+
+      (insert "\n")
+      (insert "  subgraph cluster_legend {\n")
+      (insert "    label=\"Legend\"; color=\"#666666\"; "
+              "fontcolor=\"#dddddd\"; fontsize=10;\n")
+      (insert "    key_supported [label=\"supported\", fillcolor=\"#246b45\"];\n")
+      (insert "    key_unsupported [label=\"unsupported\", fillcolor=\"#7a3030\"];\n")
+      (insert "    key_output [label=\"Teflon subgraph output\", "
+              "fillcolor=\"#333333\", color=\"#b67cff\", penwidth=2.6];\n")
+      (insert "  }\n")
+      (insert "}\n"))
+
+    (let ((status
+           (call-process "dot" nil nil nil
+                         "-Tsvg" dotfile "-o" svgfile)))
+      (unless (zerop status)
+        (error "Graphviz failed while rendering %s" dotfile)))
+
+    svgfile))
+
+(fdi/tflite-write-graph run_output graph_name)
+
+run_output
+#+end_src
+
+#+name: fetch-inference-image
+#+begin_src sh :var model="" :var image=image() :var out_file="" :results raw
+scp \
+  "dude06:/ptx/work/WORK_ALPHO/fdi/YOCTO.BSP-AVE/build/agri-vision-edge/${model}-output/${image}" \
+  "${out_file}" &&
+printf '[[file:%s]]\n' "${out_file}"
+#+end_src
+
+#+name: inference-report
+#+header: :var log=""
+#+header: :var rendered_image=""
+#+begin_src emacs-lisp :results raw drawer
+(format
+ "*Rendered image:*
+#+begin_drawer
+:%s
+#+end_drawer
+
+*Full inference log:*
+#+begin_example
+%s
+#+end_example"
+ rendered_image
+ log)
+#+end_src
+
+** i.MX93
+#+name: run-inference-93
+#+call: run-inference[:dir /ssh:fdi@dude06|ssh:root@192.168.11.121:/tmp/agri-vision-edge](
+  unsupported_ops=unsupported-ops-93(),
+  unsupported_nodes=unsupported-nodes-93(),
+  model=model-93
+ )
+
+#+name: fetch-inference-image-93
+#+call: fetch-inference-image(
+  model=model-93,
+  out_file="./out93.png"
+)
+
+#+name: inference-report-93
+#+call: inference-report(
+  log=teflon-op-graph(run_output=run-inference-93(), graph_name="teflon-op-graph-93"),
+  rendered_image=fetch-inference-image-93()
+)
+
+#+name: model-93
+#+begin_src emacs-lisp :results value raw
+;; "ssd-mn2-fpnlite_sc_phenobench_320_int8_qat_per-channel_fastnms" 
+;; "uploaded"
+"ssd-mn2-fpnlite_mc_phenobench_320_int8_qat_per-channel_fastnms" 
+#+end_src
+
+#+name: unsupported-ops-93
+#+begin_src emacs-lisp :results value raw
+(string-join
+ (list
+  ;; "22"    ; RESHAPE
+  ;; "34"    ; PAD (halfbaked custom implementation)
+  ;; "2"     ; CONCAT
+  ;; "17"    ; MAXPOOL
+  ;; "83"    ;
+  ;; "98"    ; LEAKY_RELU
+  )
+ ",")
+#+end_src
+
+#+name: unsupported-nodes-93
+#+begin_src emacs-lisp :results value raw
+(string-join
+ (list
+  ;; "63-68,78-80,82-90,99-102,104-112,121-128,137-144"
+  ;; "64-70,83-89,99-108,118-123,132-139"
+  ;; "0-117,136-138,142-144"
+  ;; "28-147" make yolo work
+  ;; "0-147"
+  
+  ;; "42,43"  ; these crash ethosu?
+  ;; "60"  ; relu feeding into maxpool (yolo)
+  ;; "134,140,146"  ; lone reshapes (yolo)
+  ;; "99,114" ; relus feeding into conv and pad (yolo) 
+  ;; "136,142"  ; convs fomr pad branching (yolo)
+  )
+ ",")
+#+end_src
+
+#+call: inference-report-93()
+
+#+RESULTS:
+:results:
+*Rendered image:*
+#+begin_drawer
+:[[file:./out93.png]]
+
+#+end_drawer
+
+*Full inference log:*
+#+begin_example
+/usr/lib/python3.14/site-packages/tflite_runtime/interpreter.py:457: UserWarning:     Warning: tf.lite.Interpreter is deprecated and is scheduled for deletion in
+    TF 2.20. Please use the LiteRT interpreter from the ai_edge_litert package.
+    See the [migration guide](https://ai.google.dev/edge/litert/migration)
+    for details.
+    
+  warnings.warn(_INTERPRETER_DELETION_WARNING)
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+Teflon delegate: loaded ethosu driver
+unsupported_nodes=0x55931f9530
+unsupported_ops=0x5592fd11f0
+idx type            ver support        inputs
+================================================================================================
+  0 op:  3 CONV            v3  🟢 supported in: 0(i8) 251(i8) 250(i32) out: 252(i8) ReLU6
+  1 op:  4 DWCONV          v3  🟢 supported in: 252(i8) 249(i8) 248(i32) out: 253(i8) ReLU6
+  2 op:  3 CONV            v3  🟢 supported in: 253(i8) 247(i8) 246(i32) out: 254(i8)
+  3 op:  3 CONV            v3  🟢 supported in: 254(i8) 245(i8) 244(i32) out: 255(i8) ReLU6
+  4 op:  4 DWCONV          v3  🟢 supported in: 255(i8) 243(i8) 242(i32) out: 256(i8) ReLU6
+  5 op:  3 CONV            v3  🟢 supported in: 256(i8) 241(i8) 240(i32) out: 257(i8)
+  6 op:  3 CONV            v3  🟢 supported in: 257(i8) 239(i8) 238(i32) out: 258(i8) ReLU6
+  7 op:  4 DWCONV          v3  🟢 supported in: 258(i8) 237(i8) 236(i32) out: 259(i8) ReLU6
+  8 op:  3 CONV            v3  🟢 supported in: 259(i8) 235(i8) 234(i32) out: 260(i8)
+  9 op:  0 ADD             v2  🟢 supported in: 257(i8) 260(i8) out: 261(i8)
+ 10 op:  3 CONV            v3  🟢 supported in: 261(i8) 233(i8) 232(i32) out: 262(i8) ReLU6
+ 11 op:  4 DWCONV          v3  🟢 supported in: 262(i8) 231(i8) 230(i32) out: 263(i8) ReLU6
+ 12 op:  3 CONV            v3  🟢 supported in: 263(i8) 229(i8) 228(i32) out: 264(i8)
+ 13 op:  3 CONV            v3  🟢 supported in: 264(i8) 227(i8) 226(i32) out: 265(i8) ReLU6
+ 14 op:  4 DWCONV          v3  🟢 supported in: 265(i8) 225(i8) 224(i32) out: 266(i8) ReLU6
+ 15 op:  3 CONV            v3  🟢 supported in: 266(i8) 223(i8) 222(i32) out: 267(i8)
+ 16 op:  0 ADD             v2  🟢 supported in: 264(i8) 267(i8) out: 268(i8)
+ 17 op:  3 CONV            v3  🟢 supported in: 268(i8) 221(i8) 220(i32) out: 269(i8) ReLU6
+ 18 op:  4 DWCONV          v3  🟢 supported in: 269(i8) 219(i8) 218(i32) out: 270(i8) ReLU6
+ 19 op:  3 CONV            v3  🟢 supported in: 270(i8) 217(i8) 216(i32) out: 271(i8)
+ 20 op:  0 ADD             v2  🟢 supported in: 268(i8) 271(i8) out: 272(i8)
+ 21 op:  3 CONV            v3  🟢 supported in: 272(i8) 215(i8) 214(i32) out: 273(i8) ReLU6
+ 22 op:  4 DWCONV          v3  🟢 supported in: 273(i8) 213(i8) 212(i32) out: 274(i8) ReLU6
+ 23 op:  3 CONV            v3  🟢 supported in: 274(i8) 211(i8) 210(i32) out: 275(i8)
+ 24 op:  3 CONV            v3  🟢 supported in: 275(i8) 209(i8) 208(i32) out: 276(i8) ReLU6
+ 25 op:  4 DWCONV          v3  🟢 supported in: 276(i8) 207(i8) 206(i32) out: 277(i8) ReLU6
+ 26 op:  3 CONV            v3  🟢 supported in: 277(i8) 205(i8) 204(i32) out: 278(i8)
+ 27 op:  0 ADD             v2  🟢 supported in: 275(i8) 278(i8) out: 279(i8)
+ 28 op:  3 CONV            v3  🟢 supported in: 279(i8) 203(i8) 202(i32) out: 280(i8) ReLU6
+ 29 op:  4 DWCONV          v3  🟢 supported in: 280(i8) 201(i8) 200(i32) out: 281(i8) ReLU6
+ 30 op:  3 CONV            v3  🟢 supported in: 281(i8) 199(i8) 198(i32) out: 282(i8)
+ 31 op:  0 ADD             v2  🟢 supported in: 279(i8) 282(i8) out: 283(i8)
+ 32 op:  3 CONV            v3  🟢 supported in: 283(i8) 197(i8) 196(i32) out: 284(i8) ReLU6
+ 33 op:  4 DWCONV          v3  🟢 supported in: 284(i8) 195(i8) 194(i32) out: 285(i8) ReLU6
+ 34 op:  3 CONV            v3  🟢 supported in: 285(i8) 193(i8) 192(i32) out: 286(i8)
+ 35 op:  0 ADD             v2  🟢 supported in: 283(i8) 286(i8) out: 287(i8)
+ 36 op:  3 CONV            v3  🟢 supported in: 287(i8) 191(i8) 190(i32) out: 288(i8) ReLU6
+ 37 op:  4 DWCONV          v3  🟢 supported in: 288(i8) 189(i8) 188(i32) out: 289(i8) ReLU6
+ 38 op:  3 CONV            v3  🟢 supported in: 289(i8) 187(i8) 186(i32) out: 290(i8)
+ 39 op:  3 CONV            v3  🟢 supported in: 290(i8) 185(i8) 184(i32) out: 291(i8) ReLU6
+ 40 op:  4 DWCONV          v3  🟢 supported in: 291(i8) 183(i8) 182(i32) out: 292(i8) ReLU6
+ 41 op:  3 CONV            v3  🟢 supported in: 292(i8) 181(i8) 180(i32) out: 293(i8)
+ 42 op:  0 ADD             v2  🟢 supported in: 290(i8) 293(i8) out: 294(i8)
+ 43 op:  3 CONV            v3  🟢 supported in: 294(i8) 179(i8) 178(i32) out: 295(i8) ReLU6
+ 44 op:  4 DWCONV          v3  🟢 supported in: 295(i8) 177(i8) 176(i32) out: 296(i8) ReLU6
+ 45 op:  3 CONV            v3  🟢 supported in: 296(i8) 175(i8) 174(i32) out: 297(i8)
+ 46 op:  0 ADD             v2  🟢 supported in: 294(i8) 297(i8) out: 298(i8)
+ 47 op:  3 CONV            v3  🟢 supported in: 298(i8) 173(i8) 172(i32) out: 299(i8) ReLU6
+ 48 op:  4 DWCONV          v3  🟢 supported in: 299(i8) 171(i8) 170(i32) out: 300(i8) ReLU6
+ 49 op:  3 CONV            v3  🟢 supported in: 300(i8) 169(i8) 168(i32) out: 301(i8)
+ 50 op:  3 CONV            v3  🟢 supported in: 301(i8) 167(i8) 166(i32) out: 302(i8) ReLU6
+ 51 op:  4 DWCONV          v3  🟢 supported in: 302(i8) 165(i8) 164(i32) out: 303(i8) ReLU6
+ 52 op:  3 CONV            v3  🟢 supported in: 303(i8) 163(i8) 162(i32) out: 304(i8)
+ 53 op:  0 ADD             v2  🟢 supported in: 301(i8) 304(i8) out: 305(i8)
+ 54 op:  3 CONV            v3  🟢 supported in: 305(i8) 161(i8) 160(i32) out: 306(i8) ReLU6
+ 55 op:  4 DWCONV          v3  🟢 supported in: 306(i8) 159(i8) 158(i32) out: 307(i8) ReLU6
+ 56 op:  3 CONV            v3  🟢 supported in: 307(i8) 157(i8) 156(i32) out: 308(i8)
+ 57 op:  0 ADD             v2  🟢 supported in: 305(i8) 308(i8) out: 309(i8)
+ 58 op:  3 CONV            v3  🟢 supported in: 309(i8) 155(i8) 154(i32) out: 310(i8) ReLU6
+ 59 op:  4 DWCONV          v3  🟢 supported in: 310(i8) 153(i8) 152(i32) out: 311(i8) ReLU6
+ 60 op:  3 CONV            v3  🟢 supported in: 311(i8) 151(i8) 150(i32) out: 312(i8)
+ 61 op:  3 CONV            v3  🟢 supported in: 312(i8) 149(i8) 148(i32) out: 313(i8) ReLU6
+ 62 op:  3 CONV            v3  🟢 supported in: 313(i8) 147(i8) 146(i32) out: 314(i8)
+ 63 op: 97 RESIZE          v2  🟢 supported in: 314(i8) 2(i32) out: 315(i8)
+ 64 op:  4 DWCONV          v3  🟢 supported in: 314(i8) 145(i8) 111(i32) out: 316(i8)
+ 65 op:  3 CONV            v3  🟢 supported in: 316(i8) 110(i8) 109(i32) out: 317(i8) ReLU6
+ 66 op:  4 DWCONV          v3  🟢 supported in: 317(i8) 108(i8) 112(i32) out: 318(i8)
+ 67 op:  3 CONV            v3  🟢 supported in: 318(i8) 107(i8) 106(i32) out: 319(i8) ReLU6
+ 68 op:  4 DWCONV          v3  🟢 supported in: 319(i8) 105(i8) 113(i32) out: 320(i8)
+ 69 op:  3 CONV            v3  🟢 supported in: 320(i8) 104(i8) 103(i32) out: 321(i8) ReLU6
+ 70 op:  4 DWCONV          v3  🟢 supported in: 321(i8) 102(i8) 114(i32) out: 322(i8)
+ 71 op:  3 CONV            v3  🟢 supported in: 322(i8) 101(i8) 100(i32) out: 323(i8) ReLU6
+ 72 op:  4 DWCONV          v3  🟢 supported in: 323(i8) 99(i8) 115(i32) out: 324(i8)
+ 73 op:  3 CONV            v3  🟢 supported in: 324(i8) 98(i8) 97(i32) out: 325(i8)
+ 74 op: 22 RESHAPE         v1  🟢 supported in: 325(i8) 3(i32) out: 326(i8)
+ 75 op:  4 DWCONV          v3  🟢 supported in: 323(i8) 96(i8) 116(i32) out: 327(i8)
+ 76 op:  3 CONV            v3  🟢 supported in: 327(i8) 95(i8) 94(i32) out: 328(i8)
+ 77 op: 22 RESHAPE         v1  🟢 supported in: 328(i8) 4(i32) out: 329(i8)
+ 78 op:  4 DWCONV          v3  🟢 supported in: 314(i8) 93(i8) 117(i32) out: 330(i8)
+ 79 op:  3 CONV            v3  🟢 supported in: 330(i8) 92(i8) 91(i32) out: 331(i8) ReLU6
+ 80 op:  4 DWCONV          v3  🟢 supported in: 331(i8) 90(i8) 118(i32) out: 332(i8)
+ 81 op:  3 CONV            v3  🟢 supported in: 332(i8) 89(i8) 88(i32) out: 333(i8) ReLU6
+ 82 op:  4 DWCONV          v3  🟢 supported in: 333(i8) 87(i8) 119(i32) out: 334(i8)
+ 83 op:  3 CONV            v3  🟢 supported in: 334(i8) 86(i8) 85(i32) out: 335(i8) ReLU6
+ 84 op:  4 DWCONV          v3  🟢 supported in: 335(i8) 84(i8) 120(i32) out: 336(i8)
+ 85 op:  3 CONV            v3  🟢 supported in: 336(i8) 83(i8) 82(i32) out: 337(i8) ReLU6
+ 86 op:  4 DWCONV          v3  🟢 supported in: 337(i8) 81(i8) 121(i32) out: 338(i8)
+ 87 op:  3 CONV            v3  🟢 supported in: 338(i8) 80(i8) 79(i32) out: 339(i8) ReLU6
+ 88 op:  4 DWCONV          v3  🟢 supported in: 339(i8) 78(i8) 122(i32) out: 340(i8)
+ 89 op:  3 CONV            v3  🟢 supported in: 340(i8) 77(i8) 76(i32) out: 341(i8)
+ 90 op: 22 RESHAPE         v1  🟢 supported in: 341(i8) 3(i32) out: 342(i8)
+ 91 op:  4 DWCONV          v3  🟢 supported in: 339(i8) 75(i8) 123(i32) out: 343(i8)
+ 92 op:  3 CONV            v3  🟢 supported in: 343(i8) 74(i8) 73(i32) out: 344(i8)
+ 93 op: 22 RESHAPE         v1  🟢 supported in: 344(i8) 4(i32) out: 345(i8)
+ 94 op:  4 DWCONV          v3  🟢 supported in: 331(i8) 72(i8) 124(i32) out: 346(i8)
+ 95 op:  3 CONV            v3  🟢 supported in: 346(i8) 71(i8) 70(i32) out: 347(i8) ReLU6
+ 96 op:  4 DWCONV          v3  🟢 supported in: 347(i8) 69(i8) 125(i32) out: 348(i8)
+ 97 op:  3 CONV            v3  🟢 supported in: 348(i8) 68(i8) 67(i32) out: 349(i8) ReLU6
+ 98 op:  4 DWCONV          v3  🟢 supported in: 349(i8) 66(i8) 126(i32) out: 350(i8)
+ 99 op:  3 CONV            v3  🟢 supported in: 350(i8) 65(i8) 64(i32) out: 351(i8) ReLU6
+100 op:  4 DWCONV          v3  🟢 supported in: 351(i8) 63(i8) 127(i32) out: 352(i8)
+101 op:  3 CONV            v3  🟢 supported in: 352(i8) 62(i8) 61(i32) out: 353(i8) ReLU6
+102 op:  4 DWCONV          v3  🟢 supported in: 353(i8) 60(i8) 128(i32) out: 354(i8)
+103 op:  3 CONV            v3  🟢 supported in: 354(i8) 59(i8) 58(i32) out: 355(i8) ReLU6
+104 op:  4 DWCONV          v3  🟢 supported in: 355(i8) 57(i8) 129(i32) out: 356(i8)
+105 op:  3 CONV            v3  🟢 supported in: 356(i8) 56(i8) 55(i32) out: 357(i8)
+106 op: 22 RESHAPE         v1  🟢 supported in: 357(i8) 3(i32) out: 358(i8)
+107 op:  4 DWCONV          v3  🟢 supported in: 355(i8) 54(i8) 130(i32) out: 359(i8)
+108 op:  3 CONV            v3  🟢 supported in: 359(i8) 53(i8) 52(i32) out: 360(i8)
+109 op: 22 RESHAPE         v1  🟢 supported in: 360(i8) 4(i32) out: 361(i8)
+110 op:  3 CONV            v3  🟢 supported in: 298(i8) 51(i8) 50(i32) out: 362(i8)
+111 op:  0 ADD             v2  🟢 supported in: 315(i8) 362(i8) out: 363(i8)
+112 op:  4 DWCONV          v3  🟢 supported in: 363(i8) 49(i8) 131(i32) out: 364(i8)
+113 op:  3 CONV            v3  🟢 supported in: 364(i8) 48(i8) 47(i32) out: 365(i8) ReLU6
+114 op: 97 RESIZE          v2  🟢 supported in: 365(i8) 5(i32) out: 366(i8)
+115 op:  4 DWCONV          v3  🟢 supported in: 365(i8) 46(i8) 132(i32) out: 367(i8)
+116 op:  3 CONV            v3  🟢 supported in: 367(i8) 45(i8) 44(i32) out: 368(i8) ReLU6
+117 op:  4 DWCONV          v3  🟢 supported in: 368(i8) 43(i8) 133(i32) out: 369(i8)
+118 op:  3 CONV            v3  🟢 supported in: 369(i8) 42(i8) 41(i32) out: 370(i8) ReLU6
+119 op:  4 DWCONV          v3  🟢 supported in: 370(i8) 40(i8) 134(i32) out: 371(i8)
+120 op:  3 CONV            v3  🟢 supported in: 371(i8) 39(i8) 38(i32) out: 372(i8) ReLU6
+121 op:  4 DWCONV          v3  🟢 supported in: 372(i8) 37(i8) 135(i32) out: 373(i8)
+122 op:  3 CONV            v3  🟢 supported in: 373(i8) 36(i8) 35(i32) out: 374(i8) ReLU6
+123 op:  4 DWCONV          v3  🟢 supported in: 374(i8) 34(i8) 136(i32) out: 375(i8)
+124 op:  3 CONV            v3  🟢 supported in: 375(i8) 33(i8) 32(i32) out: 376(i8)
+125 op: 22 RESHAPE         v1  🟢 supported in: 376(i8) 3(i32) out: 377(i8)
+126 op:  4 DWCONV          v3  🟢 supported in: 374(i8) 31(i8) 137(i32) out: 378(i8)
+127 op:  3 CONV            v3  🟢 supported in: 378(i8) 30(i8) 29(i32) out: 379(i8)
+128 op: 22 RESHAPE         v1  🟢 supported in: 379(i8) 4(i32) out: 380(i8)
+129 op:  3 CONV            v3  🟢 supported in: 272(i8) 28(i8) 27(i32) out: 381(i8)
+130 op:  0 ADD             v2  🟢 supported in: 366(i8) 381(i8) out: 382(i8)
+131 op:  4 DWCONV          v3  🟢 supported in: 382(i8) 26(i8) 138(i32) out: 383(i8)
+132 op:  3 CONV            v3  🟢 supported in: 383(i8) 25(i8) 24(i32) out: 384(i8) ReLU6
+133 op:  4 DWCONV          v3  🟢 supported in: 384(i8) 23(i8) 139(i32) out: 385(i8)
+134 op:  3 CONV            v3  🟢 supported in: 385(i8) 22(i8) 21(i32) out: 386(i8) ReLU6
+135 op:  4 DWCONV          v3  🟢 supported in: 386(i8) 20(i8) 140(i32) out: 387(i8)
+136 op:  3 CONV            v3  🟢 supported in: 387(i8) 19(i8) 18(i32) out: 388(i8) ReLU6
+137 op:  4 DWCONV          v3  🟢 supported in: 388(i8) 17(i8) 141(i32) out: 389(i8)
+138 op:  3 CONV            v3  🟢 supported in: 389(i8) 16(i8) 15(i32) out: 390(i8) ReLU6
+139 op:  4 DWCONV          v3  🟢 supported in: 390(i8) 14(i8) 142(i32) out: 391(i8)
+140 op:  3 CONV            v3  🟢 supported in: 391(i8) 13(i8) 12(i32) out: 392(i8) ReLU6
+141 op:  4 DWCONV          v3  🟢 supported in: 392(i8) 11(i8) 143(i32) out: 393(i8)
+142 op:  3 CONV            v3  🟢 supported in: 393(i8) 10(i8) 9(i32) out: 394(i8)
+143 op: 22 RESHAPE         v1  🟢 supported in: 394(i8) 3(i32) out: 395(i8)
+144 op:  2 CONCAT          v2  🟢 supported in: 395(i8) 377(i8) 326(i8) 342(i8) 358(i8) out: 396(i8)
+145 op:  6 DEQUANT         v2  🔴 unsupported in: 396(i8) out: 397(f32)
+146 op:  4 DWCONV          v3  🟢 supported in: 392(i8) 8(i8) 144(i32) out: 398(i8)
+147 op:  3 CONV            v3  🟢 supported in: 398(i8) 7(i8) 6(i32) out: 399(i8)
+148 op: 22 RESHAPE         v1  🟢 supported in: 399(i8) 4(i32) out: 400(i8)
+149 op:  2 CONCAT          v2  🟢 supported in: 400(i8) 380(i8) 329(i8) 345(i8) 361(i8) out: 401(i8)
+150 op: 14 LOG             v2  🟢 supported in: 401(i8) out: 402(i8)
+151 op:  6 DEQUANT         v2  🔴 unsupported in: 402(i8) out: 403(f32)
+152 op: 32 unknown         v1  🔴 unsupported in: 397(f32) 403(f32) 1(f32) out: 404(f32) 405(f32) 406(f32) 407(f32)
+
+teflon: ===== subgraph #0: 150 operations, 410 tensors =====
+teflon:   in:  0
+teflon:   out: 396,402
+
+teflon:   idx op        inputs     outputs    out-dims             scale  zp data
+teflon:   --- --------- ---------- ---------- ---------------- --------- --- ----
+teflon:     0 CONV      0,251,250  252        1x160x160x32      0.023529 ffffff80 -
+teflon:     1 DWCONV    252,249,248 253        1x160x160x32      0.023529 ffffff80 -
+teflon:     2 CONV      253,247,246 254        1x160x160x16      0.225848   9 -
+teflon:     3 CONV      254,245,244 255        1x160x160x96      0.023529 ffffff80 -
+teflon:     4 DWCONV    255,243,242 256        1x80x80x96        0.023529 ffffff80 -
+teflon:     5 CONV      256,241,240 257        1x80x80x24        0.240505   8 -
+teflon:     6 CONV      257,239,238 258        1x80x80x144       0.023529 ffffff80 -
+teflon:     7 DWCONV    258,237,236 259        1x80x80x144       0.023529 ffffff80 -
+teflon:     8 CONV      259,235,234 260        1x80x80x24        0.451500 fffffff3 -
+teflon:     9 ADD       257,260    261        1x80x80x24        0.313589 fffffff6 -
+teflon:    10 CONV      261,233,232 262        1x80x80x144       0.023529 ffffff80 -
+teflon:    11 DWCONV    262,231,230 263        1x40x40x144       0.023529 ffffff80 -
+teflon:    12 CONV      263,229,228 264        1x40x40x32        0.203176   4 -
+teflon:    13 CONV      264,227,226 265        1x40x40x192       0.023529 ffffff80 -
+teflon:    14 DWCONV    265,225,224 266        1x40x40x192       0.023529 ffffff80 -
+teflon:    15 CONV      266,223,222 267        1x40x40x32        0.185878 fffffffd -
+teflon:    16 ADD       264,267    268        1x40x40x32        0.162792   1 -
+teflon:    17 CONV      268,221,220 269        1x40x40x192       0.023529 ffffff80 -
+teflon:    18 DWCONV    269,219,218 270        1x40x40x192       0.023529 ffffff80 -
+teflon:    19 CONV      270,217,216 271        1x40x40x32        0.279972 fffffff7 -
+teflon:    20 ADD       268,271    272        1x40x40x32        0.238890 fffffffa -
+teflon:    21 CONV      272,215,214 273        1x40x40x192       0.023529 ffffff80 -
+teflon:    22 DWCONV    273,213,212 274        1x20x20x192       0.023529 ffffff80 -
+teflon:    23 CONV      274,211,210 275        1x20x20x64        0.167638 fffffffc -
+teflon:    24 CONV      275,209,208 276        1x20x20x384       0.023529 ffffff80 -
+teflon:    25 DWCONV    276,207,206 277        1x20x20x384       0.023529 ffffff80 -
+teflon:    26 CONV      277,205,204 278        1x20x20x64        0.175888 fffffffb -
+teflon:    27 ADD       275,278    279        1x20x20x64        0.136387   0 -
+teflon:    28 CONV      279,203,202 280        1x20x20x384       0.023529 ffffff80 -
+teflon:    29 DWCONV    280,201,200 281        1x20x20x384       0.023529 ffffff80 -
+teflon:    30 CONV      281,199,198 282        1x20x20x64        0.130687   7 -
+teflon:    31 ADD       279,282    283        1x20x20x64        0.141460   7 -
+teflon:    32 CONV      283,197,196 284        1x20x20x384       0.023529 ffffff80 -
+teflon:    33 DWCONV    284,195,194 285        1x20x20x384       0.023529 ffffff80 -
+teflon:    34 CONV      285,193,192 286        1x20x20x64        0.155585 ffffffee -
+teflon:    35 ADD       283,286    287        1x20x20x64        0.159239   4 -
+teflon:    36 CONV      287,191,190 288        1x20x20x384       0.023529 ffffff80 -
+teflon:    37 DWCONV    288,189,188 289        1x20x20x384       0.023529 ffffff80 -
+teflon:    38 CONV      289,187,186 290        1x20x20x96        0.163438   b -
+teflon:    39 CONV      290,185,184 291        1x20x20x576       0.023529 ffffff80 -
+teflon:    40 DWCONV    291,183,182 292        1x20x20x576       0.023529 ffffff80 -
+teflon:    41 CONV      292,181,180 293        1x20x20x96        0.123645   0 -
+teflon:    42 ADD       290,293    294        1x20x20x96        0.132168   6 -
+teflon:    43 CONV      294,179,178 295        1x20x20x576       0.023529 ffffff80 -
+teflon:    44 DWCONV    295,177,176 296        1x20x20x576       0.023529 ffffff80 -
+teflon:    45 CONV      296,175,174 297        1x20x20x96        0.146046   5 -
+teflon:    46 ADD       294,297    298        1x20x20x96        0.152961   3 -
+teflon:    47 CONV      298,173,172 299        1x20x20x576       0.023529 ffffff80 -
+teflon:    48 DWCONV    299,171,170 300        1x10x10x576       0.023529 ffffff80 -
+teflon:    49 CONV      300,169,168 301        1x10x10x160       0.105762   7 -
+teflon:    50 CONV      301,167,166 302        1x10x10x960       0.023529 ffffff80 -
+teflon:    51 DWCONV    302,165,164 303        1x10x10x960       0.023529 ffffff80 -
+teflon:    52 CONV      303,163,162 304        1x10x10x160       0.081692 fffffff7 -
+teflon:    53 ADD       301,304    305        1x10x10x160       0.088822 fffffffe -
+teflon:    54 CONV      305,161,160 306        1x10x10x960       0.023529 ffffff80 -
+teflon:    55 DWCONV    306,159,158 307        1x10x10x960       0.023529 ffffff80 -
+teflon:    56 CONV      307,157,156 308        1x10x10x160       0.170214 fffffffd -
+teflon:    57 ADD       305,308    309        1x10x10x160       0.136307   1 -
+teflon:    58 CONV      309,155,154 310        1x10x10x960       0.023529 ffffff80 -
+teflon:    59 DWCONV    310,153,152 311        1x10x10x960       0.023529 ffffff80 -
+teflon:    60 CONV      311,151,150 312        1x10x10x320       0.092781 fffffff9 -
+teflon:    61 CONV      312,149,148 313        1x10x10x1280      0.023529 ffffff80 -
+teflon:    62 CONV      313,147,146 314        1x10x10x128       0.145811 ffffffef -
+teflon:    63 RESIZE    314,2      315        1x20x20x128       0.145811 ffffffef -
+teflon:    64 DWCONV    314,145,111 316        1x10x10x128       0.027717   0 -
+teflon:    65 CONV      316,110,109 317        1x10x10x128       0.023529 ffffff80 -
+teflon:    66 DWCONV    317,108,112 318        1x10x10x128       0.012406   0 -
+teflon:    67 CONV      318,107,106 319        1x10x10x128       0.023440 ffffff80 -
+teflon:    68 DWCONV    319,105,113 320        1x10x10x128       0.013949 ffffffec -
+teflon:    69 CONV      320,104,103 321        1x10x10x128       0.023529 ffffff80 -
+teflon:    70 DWCONV    321,102,114 322        1x10x10x128       0.013285 ffffffe7 -
+teflon:    71 CONV      322,101,100 323        1x10x10x128       0.023529 ffffff80 -
+teflon:    72 DWCONV    323,99,115 324        1x10x10x128       0.040295   d -
+teflon:    73 CONV      324,98,97  325        1x10x10x40        0.071081  1f -
+teflon:    74 RESHAPE   325,3      326        1x1x1000x4        0.071081  1f -
+teflon:    75 DWCONV    323,96,116 327        1x10x10x128       0.049409   d -
+teflon:    76 CONV      327,95,94  328        1x10x10x30        0.049756  1f -
+teflon:    77 RESHAPE   328,4      329        1x1x1000x3        0.049756  1f -
+teflon:    78 DWCONV    314,93,117 330        1x5x5x128         0.046163  1b -
+teflon:    79 CONV      330,92,91  331        1x5x5x128         0.023529 ffffff80 -
+teflon:    80 DWCONV    331,90,118 332        1x5x5x128         0.009137   5 -
+teflon:    81 CONV      332,89,88  333        1x5x5x128         0.017872 ffffff80 -
+teflon:    82 DWCONV    333,87,119 334        1x5x5x128         0.011009   5 -
+teflon:    83 CONV      334,86,85  335        1x5x5x128         0.020026 ffffff80 -
+teflon:    84 DWCONV    335,84,120 336        1x5x5x128         0.011992 fffffff6 -
+teflon:    85 CONV      336,83,82  337        1x5x5x128         0.021741 ffffff80 -
+teflon:    86 DWCONV    337,81,121 338        1x5x5x128         0.012212 ffffffef -
+teflon:    87 CONV      338,80,79  339        1x5x5x128         0.023529 ffffff80 -
+teflon:    88 DWCONV    339,78,122 340        1x5x5x128         0.045818 fffffffd -
+teflon:    89 CONV      340,77,76  341        1x5x5x40          0.071081  1f -
+teflon:    90 RESHAPE   341,3      342        1x1x250x4         0.071081  1f -
+teflon:    91 DWCONV    339,75,123 343        1x5x5x128         0.056276  20 -
+teflon:    92 CONV      343,74,73  344        1x5x5x30          0.049756  1f -
+teflon:    93 RESHAPE   344,4      345        1x1x250x3         0.049756  1f -
+teflon:    94 DWCONV    331,72,124 346        1x3x3x128         0.004478 ffffffd9 -
+teflon:    95 CONV      346,71,70  347        1x3x3x128         0.016091 ffffff80 -
+teflon:    96 DWCONV    347,69,125 348        1x3x3x128         0.007370 fffffff1 -
+teflon:    97 CONV      348,68,67  349        1x3x3x128         0.020592 ffffff80 -
+teflon:    98 DWCONV    349,66,126 350        1x3x3x128         0.012906  1d -
+teflon:    99 CONV      350,65,64  351        1x3x3x128         0.022278 ffffff80 -
+teflon:   100 DWCONV    351,63,127 352        1x3x3x128         0.011330 ffffffee -
+teflon:   101 CONV      352,62,61  353        1x3x3x128         0.022261 ffffff80 -
+teflon:   102 DWCONV    353,60,128 354        1x3x3x128         0.010282 ffffffdb -
+teflon:   103 CONV      354,59,58  355        1x3x3x128         0.023529 ffffff80 -
+teflon:   104 DWCONV    355,57,129 356        1x3x3x128         0.030865   e -
+teflon:   105 CONV      356,56,55  357        1x3x3x40          0.071081  1f -
+teflon:   106 RESHAPE   357,3      358        1x1x90x4          0.071081  1f -
+teflon:   107 DWCONV    355,54,130 359        1x3x3x128         0.054295  2c -
+teflon:   108 CONV      359,53,52  360        1x3x3x30          0.049756  1f -
+teflon:   109 RESHAPE   360,4      361        1x1x90x3          0.049756  1f -
+teflon:   110 CONV      298,51,50  362        1x20x20x128       0.186140 ffffffdf -
+teflon:   111 ADD       315,362    363        1x20x20x128       0.136733 ffffffe2 -
+teflon:   112 DWCONV    363,49,131 364        1x20x20x128       0.087963   2 -
+teflon:   113 CONV      364,48,47  365        1x20x20x128       0.023529 ffffff80 -
+teflon:   114 RESIZE    365,5      366        1x40x40x128       0.023529 ffffff80 -
+teflon:   115 DWCONV    365,46,132 367        1x20x20x128       0.019881 fffffff9 -
+teflon:   116 CONV      367,45,44  368        1x20x20x128       0.023529 ffffff80 -
+teflon:   117 DWCONV    368,43,133 369        1x20x20x128       0.016747 fffffff9 -
+teflon:   118 CONV      369,42,41  370        1x20x20x128       0.023529 ffffff80 -
+teflon:   119 DWCONV    370,40,134 371        1x20x20x128       0.016101 fffffff7 -
+teflon:   120 CONV      371,39,38  372        1x20x20x128       0.023529 ffffff80 -
+teflon:   121 DWCONV    372,37,135 373        1x20x20x128       0.014603 ffffffe5 -
+teflon:   122 CONV      373,36,35  374        1x20x20x128       0.023529 ffffff80 -
+teflon:   123 DWCONV    374,34,136 375        1x20x20x128       0.044395   d -
+teflon:   124 CONV      375,33,32  376        1x20x20x40        0.071081  1f -
+teflon:   125 RESHAPE   376,3      377        1x1x4000x4        0.071081  1f -
+teflon:   126 DWCONV    374,31,137 378        1x20x20x128       0.044634   1 -
+teflon:   127 CONV      378,30,29  379        1x20x20x30        0.049756  1f -
+teflon:   128 RESHAPE   379,4      380        1x1x4000x3        0.049756  1f -
+teflon:   129 CONV      272,28,27  381        1x40x40x128       0.144953 ffffffe5 -
+teflon:   130 ADD       366,381    382        1x40x40x128       0.101218 ffffffe4 -
+teflon:   131 DWCONV    382,26,138 383        1x40x40x128       0.058547  22 -
+teflon:   132 CONV      383,25,24  384        1x40x40x128       0.023529 ffffff80 -
+teflon:   133 DWCONV    384,23,139 385        1x40x40x128       0.017438 fffffff9 -
+teflon:   134 CONV      385,22,21  386        1x40x40x128       0.023529 ffffff80 -
+teflon:   135 DWCONV    386,20,140 387        1x40x40x128       0.018055   3 -
+teflon:   136 CONV      387,19,18  388        1x40x40x128       0.023529 ffffff80 -
+teflon:   137 DWCONV    388,17,141 389        1x40x40x128       0.018810 ffffffe7 -
+teflon:   138 CONV      389,16,15  390        1x40x40x128       0.023529 ffffff80 -
+teflon:   139 DWCONV    390,14,142 391        1x40x40x128       0.016284 fffffff4 -
+teflon:   140 CONV      391,13,12  392        1x40x40x128       0.023529 ffffff80 -
+teflon:   141 DWCONV    392,11,143 393        1x40x40x128       0.057599  17 -
+teflon:   142 CONV      393,10,9   394        1x40x40x40        0.071081  1f -
+teflon:   143 RESHAPE   394,3      395        1x1x16000x4       0.071081  1f -
+teflon:   144 CONCAT    395,377,326,342,358 396        1x1x21340x4       0.071081  1f -
+teflon:   145 DWCONV    392,8,144  398        1x40x40x128       0.043016   8 -
+teflon:   146 CONV      398,7,6    399        1x40x40x30        0.049756  1f -
+teflon:   147 RESHAPE   399,4      400        1x1x16000x3       0.049756  1f -
+teflon:   148 CONCAT    400,380,329,345,361 401        1x1x21340x3       0.049756  1f -
+teflon:   149 LOG       401        402        1x1x21340x3       0.003906 ffffff80 -
+
+teflon: compiled graph, took 897 ms
+teflon: invoked graph, took 1826 ms
+Found 1 image(s)
+[metadata] ssd-mn2-fpnlite_mc_phenobench_320_int8_qat_per-channel_fastnms.tflite: labels=['crop', 'weed'] norm(mean=[127.5], std=[127.5]) score_threshold=0.05000000074505806 iou=0.5 max_detections=100 nms=fast [labels:embedded, normalization:sidecar, postprocessing:sidecar]
+[runtime] loaded delegate: /usr/lib/libteflon.so
+
+=== OUTPUT DETAILS ===
+StatefulPartitionedCall:1 <class 'numpy.float32'> (0.0, 0) [  1 100]
+StatefulPartitionedCall:3 <class 'numpy.float32'> (0.0, 0) [  1 100   4]
+StatefulPartitionedCall:0 <class 'numpy.float32'> (0.0, 0) [1]
+StatefulPartitionedCall:2 <class 'numpy.float32'> (0.0, 0) [  1 100]
+[infer] input size: 320
+
+=== 05-15_00062_P0030859.png ===
+crop  score=0.965 box=[0, 54, 173, 223]
+crop  score=0.953 box=[606, 377, 720, 576]
+crop  score=0.922 box=[592, 623, 745, 836]
+crop  score=0.887 box=[22, 289, 168, 456]
+crop  score=0.867 box=[602, 0, 693, 106]
+crop  score=0.852 box=[612, 184, 688, 243]
+weed  score=0.785 box=[787, 81, 884, 175]
+crop  score=0.750 box=[625, 847, 721, 992]
+crop  score=0.699 box=[3, 519, 172, 686]
+weed  score=0.539 box=[90, 236, 126, 262]
+weed  score=0.320 box=[752, 488, 767, 502]
+Rendered 11 detection(s) -> ssd-mn2-fpnlite_mc_phenobench_320_int8_qat_per-channel_fastnms-output/05-15_00062_P0030859.png
+
+Done. Outputs saved to: /tmp/agri-vision-edge/ssd-mn2-fpnlite_mc_phenobench_320_int8_qat_per-channel_fastnms-output
+
+#+end_example
+:end:
+
+
+** i.MX8MP
+#+name: run-inference-8mp
+#+call: run-inference[:dir /ssh:fdi@dude06|ssh:root@192.168.11.127:/tmp/agri-vision-edge](
+  unsupported_ops=unsupported-ops-8mp(),
+  unsupported_nodes=unsupported-nodes-8mp(),
+  model=model-8mp
+ )
+
+#+name: fetch-inference-image-8mp
+#+call: fetch-inference-image(
+  model=model-8mp,
+  out_file="./out8mp.png"
+)
+
+#+name: inference-report-8mp
+#+call: inference-report(
+  log=teflon-op-graph(run_output=run-inference-8mp(), graph_name="teflon-op-graph-8mp"),
+  rendered_image=fetch-inference-image-8mp()
+)
+
+#+name: model-8mp
+#+begin_src emacs-lisp :results value raw
+;; "uploaded"
+;; "ssd-mn2-fpnlite_mc_phenobench_320_int8_qat_per-tensor_fastnms" 
+;; "ssd-mn2-fpnlite_mc_phenobench_320_int8_qat_per-channel_fastnms" 
+"ssd-mn2-fpnlite_mc_phenobench_320_int8_ptq_per-tensor_regnms_no-native-resize"
+#+end_src
+
+#+name: unsupported-ops-8mp
+#+begin_src emacs-lisp :results value raw
+(string-join
+ (list
+  ;; "22"    ; RESHAPE
+  ;; "34"    ; PAD (halfbaked custom implementation)
+  ;; "2"     ; CONCAT
+  "17"    ; MAXPOOL (not functional yet)
+  ;; "83"    ;
+  ;; "97"    ; RESIZE
+  ;; "98"    ; LEAKY_RELU
+  ;; "22"    ; RESHAPE
+  )
+ ",")
+#+end_src
+
+#+RESULTS: unsupported-ops-8mp
+17
+
+#+name: unsupported-nodes-8mp
+#+begin_src emacs-lisp :results value raw
+(string-join
+ (list
+  ;; "63-68,78-80,82-90,99-102,104-112,121-128,137-144"
+  ;; "64-70,83-89,99-108,118-123,132-139"
+  ;; "0-117,136-138,142-144"
+  ;; "28-147"
+  ;; "64,66-68"
+  "66,68,73,75"
+  "48-76"
+  )
+ ",")
+#+end_src
+
+#+call: inference-report-8mp()
+
+#+RESULTS:
+:results:
+*Rendered image:*
+#+begin_drawer
+:[[file:./out8mp.png]]
+
+#+end_drawer
+
+*Full inference log:*
+#+begin_example
+/usr/lib/python3.14/site-packages/tflite_runtime/interpreter.py:457: UserWarning:     Warning: tf.lite.Interpreter is deprecated and is scheduled for deletion in
+    TF 2.20. Please use the LiteRT interpreter from the ai_edge_litert package.
+    See the [migration guide](https://ai.google.dev/edge/litert/migration)
+    for details.
+    
+  warnings.warn(_INTERPRETER_DELETION_WARNING)
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+Teflon delegate: loaded etnaviv driver
+Failed to create /root/.cache for shader cache (Read-only file system)---disabling.
+unsupported_nodes=0x55a0f8ba80
+unsupported_ops=0x55a0def720
+idx type            ver support        inputs
+================================================================================================
+  0 op:  3 CONV            v3  🟢 supported in: 0(i8) 221(i8) 220(i32) out: 222(i8) ReLU6
+  1 op:  4 DWCONV          v3  🟢 supported in: 222(i8) 219(i8) 218(i32) out: 223(i8) ReLU6
+  2 op:  3 CONV            v3  🟢 supported in: 223(i8) 217(i8) 216(i32) out: 224(i8)
+  3 op:  3 CONV            v3  🟢 supported in: 224(i8) 215(i8) 214(i32) out: 225(i8) ReLU6
+  4 op:  4 DWCONV          v3  🟢 supported in: 225(i8) 213(i8) 212(i32) out: 226(i8) ReLU6
+  5 op:  3 CONV            v3  🟢 supported in: 226(i8) 211(i8) 210(i32) out: 227(i8)
+  6 op:  3 CONV            v3  🟢 supported in: 227(i8) 209(i8) 208(i32) out: 228(i8) ReLU6
+  7 op:  4 DWCONV          v3  🟢 supported in: 228(i8) 207(i8) 206(i32) out: 229(i8) ReLU6
+  8 op:  3 CONV            v3  🟢 supported in: 229(i8) 205(i8) 204(i32) out: 230(i8)
+  9 op:  0 ADD             v2  🟢 supported in: 227(i8) 230(i8) out: 231(i8)
+ 10 op:  3 CONV            v3  🟢 supported in: 231(i8) 203(i8) 202(i32) out: 232(i8) ReLU6
+ 11 op:  4 DWCONV          v3  🟢 supported in: 232(i8) 201(i8) 200(i32) out: 233(i8) ReLU6
+ 12 op:  3 CONV            v3  🟢 supported in: 233(i8) 199(i8) 198(i32) out: 234(i8)
+ 13 op:  3 CONV            v3  🟢 supported in: 234(i8) 197(i8) 196(i32) out: 235(i8) ReLU6
+ 14 op:  4 DWCONV          v3  🟢 supported in: 235(i8) 195(i8) 194(i32) out: 236(i8) ReLU6
+ 15 op:  3 CONV            v3  🟢 supported in: 236(i8) 193(i8) 192(i32) out: 237(i8)
+ 16 op:  0 ADD             v2  🟢 supported in: 234(i8) 237(i8) out: 238(i8)
+ 17 op:  3 CONV            v3  🟢 supported in: 238(i8) 191(i8) 190(i32) out: 239(i8) ReLU6
+ 18 op:  4 DWCONV          v3  🟢 supported in: 239(i8) 189(i8) 188(i32) out: 240(i8) ReLU6
+ 19 op:  3 CONV            v3  🟢 supported in: 240(i8) 187(i8) 186(i32) out: 241(i8)
+ 20 op:  0 ADD             v2  🟢 supported in: 238(i8) 241(i8) out: 242(i8)
+ 21 op:  3 CONV            v3  🟢 supported in: 242(i8) 185(i8) 184(i32) out: 243(i8)
+ 22 op:  3 CONV            v3  🟢 supported in: 242(i8) 183(i8) 182(i32) out: 244(i8) ReLU6
+ 23 op:  4 DWCONV          v3  🟢 supported in: 244(i8) 181(i8) 180(i32) out: 245(i8) ReLU6
+ 24 op:  3 CONV            v3  🟢 supported in: 245(i8) 179(i8) 178(i32) out: 246(i8)
+ 25 op:  3 CONV            v3  🟢 supported in: 246(i8) 177(i8) 176(i32) out: 247(i8) ReLU6
+ 26 op:  4 DWCONV          v3  🟢 supported in: 247(i8) 175(i8) 174(i32) out: 248(i8) ReLU6
+ 27 op:  3 CONV            v3  🟢 supported in: 248(i8) 173(i8) 172(i32) out: 249(i8)
+ 28 op:  0 ADD             v2  🟢 supported in: 246(i8) 249(i8) out: 250(i8)
+ 29 op:  3 CONV            v3  🟢 supported in: 250(i8) 171(i8) 170(i32) out: 251(i8) ReLU6
+ 30 op:  4 DWCONV          v3  🟢 supported in: 251(i8) 169(i8) 168(i32) out: 252(i8) ReLU6
+ 31 op:  3 CONV            v3  🟢 supported in: 252(i8) 167(i8) 166(i32) out: 253(i8)
+ 32 op:  0 ADD             v2  🟢 supported in: 250(i8) 253(i8) out: 254(i8)
+ 33 op:  3 CONV            v3  🟢 supported in: 254(i8) 165(i8) 164(i32) out: 255(i8) ReLU6
+ 34 op:  4 DWCONV          v3  🟢 supported in: 255(i8) 163(i8) 162(i32) out: 256(i8) ReLU6
+ 35 op:  3 CONV            v3  🟢 supported in: 256(i8) 161(i8) 160(i32) out: 257(i8)
+ 36 op:  0 ADD             v2  🟢 supported in: 254(i8) 257(i8) out: 258(i8)
+ 37 op:  3 CONV            v3  🟢 supported in: 258(i8) 159(i8) 158(i32) out: 259(i8) ReLU6
+ 38 op:  4 DWCONV          v3  🟢 supported in: 259(i8) 157(i8) 156(i32) out: 260(i8) ReLU6
+ 39 op:  3 CONV            v3  🟢 supported in: 260(i8) 155(i8) 154(i32) out: 261(i8)
+ 40 op:  3 CONV            v3  🟢 supported in: 261(i8) 153(i8) 152(i32) out: 262(i8) ReLU6
+ 41 op:  4 DWCONV          v3  🟢 supported in: 262(i8) 151(i8) 150(i32) out: 263(i8) ReLU6
+ 42 op:  3 CONV            v3  🟢 supported in: 263(i8) 149(i8) 148(i32) out: 264(i8)
+ 43 op:  0 ADD             v2  🟢 supported in: 261(i8) 264(i8) out: 265(i8)
+ 44 op:  3 CONV            v3  🟢 supported in: 265(i8) 147(i8) 146(i32) out: 266(i8) ReLU6
+ 45 op:  4 DWCONV          v3  🟢 supported in: 266(i8) 145(i8) 144(i32) out: 267(i8) ReLU6
+ 46 op:  3 CONV            v3  🟢 supported in: 267(i8) 143(i8) 142(i32) out: 268(i8)
+ 47 op:  0 ADD             v2  🟢 supported in: 265(i8) 268(i8) out: 269(i8)
+ 48 op:  3 CONV            v3  🔴 unsupported in: 269(i8) 141(i8) 140(i32) out: 270(i8)
+ 49 op:  3 CONV            v3  🔴 unsupported in: 269(i8) 139(i8) 138(i32) out: 271(i8) ReLU6
+ 50 op:  4 DWCONV          v3  🔴 unsupported in: 271(i8) 137(i8) 136(i32) out: 272(i8) ReLU6
+ 51 op:  3 CONV            v3  🔴 unsupported in: 272(i8) 135(i8) 134(i32) out: 273(i8)
+ 52 op:  3 CONV            v3  🔴 unsupported in: 273(i8) 133(i8) 132(i32) out: 274(i8) ReLU6
+ 53 op:  4 DWCONV          v3  🔴 unsupported in: 274(i8) 131(i8) 130(i32) out: 275(i8) ReLU6
+ 54 op:  3 CONV            v3  🔴 unsupported in: 275(i8) 129(i8) 128(i32) out: 276(i8)
+ 55 op:  0 ADD             v2  🔴 unsupported in: 273(i8) 276(i8) out: 277(i8)
+ 56 op:  3 CONV            v3  🔴 unsupported in: 277(i8) 127(i8) 126(i32) out: 278(i8) ReLU6
+ 57 op:  4 DWCONV          v3  🔴 unsupported in: 278(i8) 125(i8) 124(i32) out: 279(i8) ReLU6
+ 58 op:  3 CONV            v3  🔴 unsupported in: 279(i8) 123(i8) 122(i32) out: 280(i8)
+ 59 op:  0 ADD             v2  🔴 unsupported in: 277(i8) 280(i8) out: 281(i8)
+ 60 op:  3 CONV            v3  🔴 unsupported in: 281(i8) 121(i8) 120(i32) out: 282(i8) ReLU6
+ 61 op:  4 DWCONV          v3  🔴 unsupported in: 282(i8) 119(i8) 118(i32) out: 283(i8) ReLU6
+ 62 op:  3 CONV            v3  🔴 unsupported in: 283(i8) 117(i8) 116(i32) out: 284(i8)
+ 63 op:  3 CONV            v3  🔴 unsupported in: 284(i8) 115(i8) 114(i32) out: 285(i8) ReLU6
+ 64 op:  3 CONV            v3  🔴 unsupported in: 285(i8) 113(i8) 112(i32) out: 286(i8)
+ 65 op: 83 unknown         v2  🔴 unsupported in: 286(i8) 286(i8) out: 287(i8)
+ 66 op: 22 RESHAPE         v1  🔴 unsupported in: 287(i8) 2(i32) out: 288(i8)
+ 67 op: 83 unknown         v2  🔴 unsupported in: 288(i8) 288(i8) out: 289(i8)
+ 68 op: 22 RESHAPE         v1  🔴 unsupported in: 289(i8) 3(i32) out: 290(i8)
+ 69 op:  0 ADD             v2  🔴 unsupported in: 290(i8) 270(i8) out: 291(i8)
+ 70 op:  4 DWCONV          v3  🔴 unsupported in: 291(i8) 111(i8) 77(i32) out: 292(i8)
+ 71 op:  3 CONV            v3  🔴 unsupported in: 292(i8) 76(i8) 75(i32) out: 293(i8) ReLU6
+ 72 op: 83 unknown         v2  🔴 unsupported in: 293(i8) 293(i8) out: 294(i8)
+ 73 op: 22 RESHAPE         v1  🔴 unsupported in: 294(i8) 4(i32) out: 295(i8)
+ 74 op: 83 unknown         v2  🔴 unsupported in: 295(i8) 295(i8) out: 296(i8)
+ 75 op: 22 RESHAPE         v1  🔴 unsupported in: 296(i8) 5(i32) out: 297(i8)
+ 76 op:  0 ADD             v2  🔴 unsupported in: 297(i8) 243(i8) out: 298(i8)
+ 77 op:  4 DWCONV          v3  🟢 supported in: 298(i8) 74(i8) 78(i32) out: 299(i8)
+ 78 op:  3 CONV            v3  🟢 supported in: 299(i8) 73(i8) 72(i32) out: 300(i8) ReLU6
+ 79 op:  4 DWCONV          v3  🟢 supported in: 286(i8) 71(i8) 79(i32) out: 301(i8)
+ 80 op:  3 CONV            v3  🟢 supported in: 301(i8) 70(i8) 69(i32) out: 302(i8) ReLU6
+ 81 op:  4 DWCONV          v3  🟢 supported in: 302(i8) 68(i8) 80(i32) out: 303(i8)
+ 82 op:  3 CONV            v3  🟢 supported in: 303(i8) 67(i8) 66(i32) out: 304(i8) ReLU6
+ 83 op:  4 DWCONV          v3  🟢 supported in: 300(i8) 65(i8) 81(i32) out: 305(i8)
+ 84 op:  3 CONV            v3  🟢 supported in: 305(i8) 64(i8) 63(i32) out: 306(i8) ReLU6
+ 85 op:  4 DWCONV          v3  🟢 supported in: 293(i8) 65(i8) 82(i32) out: 307(i8)
+ 86 op:  3 CONV            v3  🟢 supported in: 307(i8) 62(i8) 61(i32) out: 308(i8) ReLU6
+ 87 op:  4 DWCONV          v3  🟢 supported in: 286(i8) 65(i8) 83(i32) out: 309(i8)
+ 88 op:  3 CONV            v3  🟢 supported in: 309(i8) 60(i8) 59(i32) out: 310(i8) ReLU6
+ 89 op:  4 DWCONV          v3  🟢 supported in: 302(i8) 65(i8) 84(i32) out: 311(i8)
+ 90 op:  3 CONV            v3  🟢 supported in: 311(i8) 58(i8) 57(i32) out: 312(i8) ReLU6
+ 91 op:  4 DWCONV          v3  🟢 supported in: 304(i8) 65(i8) 85(i32) out: 313(i8)
+ 92 op:  3 CONV            v3  🟢 supported in: 313(i8) 56(i8) 55(i32) out: 314(i8) ReLU6
+ 93 op:  4 DWCONV          v3  🟢 supported in: 306(i8) 54(i8) 86(i32) out: 315(i8)
+ 94 op:  3 CONV            v3  🟢 supported in: 315(i8) 53(i8) 52(i32) out: 316(i8) ReLU6
+ 95 op:  4 DWCONV          v3  🟢 supported in: 308(i8) 54(i8) 87(i32) out: 317(i8)
+ 96 op:  3 CONV            v3  🟢 supported in: 317(i8) 51(i8) 50(i32) out: 318(i8) ReLU6
+ 97 op:  4 DWCONV          v3  🟢 supported in: 310(i8) 54(i8) 88(i32) out: 319(i8)
+ 98 op:  3 CONV            v3  🟢 supported in: 319(i8) 49(i8) 48(i32) out: 320(i8) ReLU6
+ 99 op:  4 DWCONV          v3  🟢 supported in: 312(i8) 54(i8) 89(i32) out: 321(i8)
+100 op:  3 CONV            v3  🟢 supported in: 321(i8) 47(i8) 46(i32) out: 322(i8) ReLU6
+101 op:  4 DWCONV          v3  🟢 supported in: 314(i8) 54(i8) 90(i32) out: 323(i8)
+102 op:  3 CONV            v3  🟢 supported in: 323(i8) 45(i8) 44(i32) out: 324(i8) ReLU6
+103 op:  4 DWCONV          v3  🟢 supported in: 316(i8) 43(i8) 91(i32) out: 325(i8)
+104 op:  3 CONV            v3  🟢 supported in: 325(i8) 42(i8) 41(i32) out: 326(i8) ReLU6
+105 op:  4 DWCONV          v3  🟢 supported in: 318(i8) 43(i8) 92(i32) out: 327(i8)
+106 op:  3 CONV            v3  🟢 supported in: 327(i8) 40(i8) 39(i32) out: 328(i8) ReLU6
+107 op:  4 DWCONV          v3  🟢 supported in: 320(i8) 43(i8) 93(i32) out: 329(i8)
+108 op:  3 CONV            v3  🟢 supported in: 329(i8) 38(i8) 37(i32) out: 330(i8) ReLU6
+109 op:  4 DWCONV          v3  🟢 supported in: 322(i8) 43(i8) 94(i32) out: 331(i8)
+110 op:  3 CONV            v3  🟢 supported in: 331(i8) 36(i8) 35(i32) out: 332(i8) ReLU6
+111 op:  4 DWCONV          v3  🟢 supported in: 324(i8) 43(i8) 95(i32) out: 333(i8)
+112 op:  3 CONV            v3  🟢 supported in: 333(i8) 34(i8) 33(i32) out: 334(i8) ReLU6
+113 op:  4 DWCONV          v3  🟢 supported in: 326(i8) 32(i8) 96(i32) out: 335(i8)
+114 op:  3 CONV            v3  🟢 supported in: 335(i8) 31(i8) 30(i32) out: 336(i8) ReLU6
+115 op:  4 DWCONV          v3  🟢 supported in: 328(i8) 32(i8) 97(i32) out: 337(i8)
+116 op:  3 CONV            v3  🟢 supported in: 337(i8) 29(i8) 28(i32) out: 338(i8) ReLU6
+117 op:  4 DWCONV          v3  🟢 supported in: 330(i8) 32(i8) 98(i32) out: 339(i8)
+118 op:  3 CONV            v3  🟢 supported in: 339(i8) 27(i8) 26(i32) out: 340(i8) ReLU6
+119 op:  4 DWCONV          v3  🟢 supported in: 332(i8) 32(i8) 99(i32) out: 341(i8)
+120 op:  3 CONV            v3  🟢 supported in: 341(i8) 25(i8) 24(i32) out: 342(i8) ReLU6
+121 op:  4 DWCONV          v3  🟢 supported in: 334(i8) 32(i8) 100(i32) out: 343(i8)
+122 op:  3 CONV            v3  🟢 supported in: 343(i8) 23(i8) 22(i32) out: 344(i8) ReLU6
+123 op:  4 DWCONV          v3  🟢 supported in: 336(i8) 21(i8) 101(i32) out: 345(i8)
+124 op:  3 CONV            v3  🟢 supported in: 345(i8) 20(i8) 15(i32) out: 346(i8)
+125 op: 22 RESHAPE         v1  🟢 supported in: 346(i8) 6(i32) out: 347(i8)
+126 op:  4 DWCONV          v3  🟢 supported in: 338(i8) 21(i8) 102(i32) out: 348(i8)
+127 op:  3 CONV            v3  🟢 supported in: 348(i8) 20(i8) 16(i32) out: 349(i8)
+128 op: 22 RESHAPE         v1  🟢 supported in: 349(i8) 6(i32) out: 350(i8)
+129 op:  4 DWCONV          v3  🟢 supported in: 340(i8) 21(i8) 103(i32) out: 351(i8)
+130 op:  3 CONV            v3  🟢 supported in: 351(i8) 20(i8) 17(i32) out: 352(i8)
+131 op: 22 RESHAPE         v1  🟢 supported in: 352(i8) 6(i32) out: 353(i8)
+132 op:  4 DWCONV          v3  🟢 supported in: 342(i8) 21(i8) 104(i32) out: 354(i8)
+133 op:  3 CONV            v3  🟢 supported in: 354(i8) 20(i8) 18(i32) out: 355(i8)
+134 op: 22 RESHAPE         v1  🟢 supported in: 355(i8) 6(i32) out: 356(i8)
+135 op:  4 DWCONV          v3  🟢 supported in: 344(i8) 21(i8) 105(i32) out: 357(i8)
+136 op:  3 CONV            v3  🟢 supported in: 357(i8) 20(i8) 19(i32) out: 358(i8)
+137 op: 22 RESHAPE         v1  🟢 supported in: 358(i8) 6(i32) out: 359(i8)
+138 op:  2 CONCAT          v2  🟢 supported in: 347(i8) 350(i8) 353(i8) 356(i8) 359(i8) out: 360(i8)
+139 op:  6 DEQUANT         v2  🔴 unsupported in: 360(i8) out: 361(f32)
+140 op:  4 DWCONV          v3  🟢 supported in: 336(i8) 14(i8) 106(i32) out: 362(i8)
+141 op:  3 CONV            v3  🟢 supported in: 362(i8) 13(i8) 8(i32) out: 363(i8)
+142 op: 22 RESHAPE         v1  🟢 supported in: 363(i8) 7(i32) out: 364(i8)
+143 op:  4 DWCONV          v3  🟢 supported in: 338(i8) 14(i8) 107(i32) out: 365(i8)
+144 op:  3 CONV            v3  🟢 supported in: 365(i8) 13(i8) 9(i32) out: 366(i8)
+145 op: 22 RESHAPE         v1  🟢 supported in: 366(i8) 7(i32) out: 367(i8)
+146 op:  4 DWCONV          v3  🟢 supported in: 340(i8) 14(i8) 108(i32) out: 368(i8)
+147 op:  3 CONV            v3  🟢 supported in: 368(i8) 13(i8) 10(i32) out: 369(i8)
+148 op: 22 RESHAPE         v1  🟢 supported in: 369(i8) 7(i32) out: 370(i8)
+149 op:  4 DWCONV          v3  🟢 supported in: 342(i8) 14(i8) 109(i32) out: 371(i8)
+150 op:  3 CONV            v3  🟢 supported in: 371(i8) 13(i8) 11(i32) out: 372(i8)
+151 op: 22 RESHAPE         v1  🟢 supported in: 372(i8) 7(i32) out: 373(i8)
+152 op:  4 DWCONV          v3  🟢 supported in: 344(i8) 14(i8) 110(i32) out: 374(i8)
+153 op:  3 CONV            v3  🟢 supported in: 374(i8) 13(i8) 12(i32) out: 375(i8)
+154 op: 22 RESHAPE         v1  🟢 supported in: 375(i8) 7(i32) out: 376(i8)
+155 op:  2 CONCAT          v2  🟢 supported in: 364(i8) 367(i8) 370(i8) 373(i8) 376(i8) out: 377(i8)
+156 op: 14 LOG             v2  🟢 supported in: 377(i8) out: 378(i8)
+157 op:  6 DEQUANT         v2  🔴 unsupported in: 378(i8) out: 379(f32)
+158 op: 32 unknown         v1  🔴 unsupported in: 361(f32) 379(f32) 1(f32) out: 380(f32) 381(f32) 382(f32) 383(f32)
+
+teflon: ===== subgraph #0: 48 operations, 386 tensors =====
+teflon:   in:  0
+teflon:   out: 243,269
+
+teflon:   idx op        inputs     outputs    out-dims             scale  zp data
+teflon:   --- --------- ---------- ---------- ---------------- --------- --- ----
+teflon:     0 CONV      0,221,220  222        1x160x160x32      0.023529 ffffff80 -
+teflon:     1 DWCONV    222,219,218 223        1x160x160x32      0.023529 ffffff80 -
+teflon:     2 CONV      223,217,216 224        1x160x160x16      0.226384   6 -
+teflon:     3 CONV      224,215,214 225        1x160x160x96      0.023529 ffffff80 -
+teflon:     4 DWCONV    225,213,212 226        1x80x80x96        0.023529 ffffff80 -
+teflon:     5 CONV      226,211,210 227        1x80x80x24        0.236165   7 -
+teflon:     6 CONV      227,209,208 228        1x80x80x144       0.023529 ffffff80 -
+teflon:     7 DWCONV    228,207,206 229        1x80x80x144       0.023529 ffffff80 -
+teflon:     8 CONV      229,205,204 230        1x80x80x24        0.467036 ffffffee -
+teflon:     9 ADD       227,230    231        1x80x80x24        0.461344 fffffff2 -
+teflon:    10 CONV      231,203,202 232        1x80x80x144       0.023529 ffffff80 -
+teflon:    11 DWCONV    232,201,200 233        1x40x40x144       0.023529 ffffff80 -
+teflon:    12 CONV      233,199,198 234        1x40x40x32        0.208529 ffffffff -
+teflon:    13 CONV      234,197,196 235        1x40x40x192       0.023529 ffffff80 -
+teflon:    14 DWCONV    235,195,194 236        1x40x40x192       0.023529 ffffff80 -
+teflon:    15 CONV      236,193,192 237        1x40x40x32        0.196188   0 -
+teflon:    16 ADD       234,237    238        1x40x40x32        0.226842 fffffffc -
+teflon:    17 CONV      238,191,190 239        1x40x40x192       0.023529 ffffff80 -
+teflon:    18 DWCONV    239,189,188 240        1x40x40x192       0.023529 ffffff80 -
+teflon:    19 CONV      240,187,186 241        1x40x40x32        0.281147 fffffff5 -
+teflon:    20 ADD       238,241    242        1x40x40x32        0.372835   0 -
+teflon:    21 CONV      242,185,184 243        1x40x40x128       0.152680 ffffffe2 -
+teflon:    22 CONV      242,183,182 244        1x40x40x192       0.023529 ffffff80 -
+teflon:    23 DWCONV    244,181,180 245        1x20x20x192       0.023529 ffffff80 -
+teflon:    24 CONV      245,179,178 246        1x20x20x64        0.174301 fffffffe -
+teflon:    25 CONV      246,177,176 247        1x20x20x384       0.023529 ffffff80 -
+teflon:    26 DWCONV    247,175,174 248        1x20x20x384       0.023529 ffffff80 -
+teflon:    27 CONV      248,173,172 249        1x20x20x64        0.176190 fffffffc -
+teflon:    28 ADD       246,249    250        1x20x20x64        0.190597 fffffffe -
+teflon:    29 CONV      250,171,170 251        1x20x20x384       0.023529 ffffff80 -
+teflon:    30 DWCONV    251,169,168 252        1x20x20x384       0.023529 ffffff80 -
+teflon:    31 CONV      252,167,166 253        1x20x20x64        0.133777   6 -
+teflon:    32 ADD       250,253    254        1x20x20x64        0.217676   6 -
+teflon:    33 CONV      254,165,164 255        1x20x20x384       0.023529 ffffff80 -
+teflon:    34 DWCONV    255,163,162 256        1x20x20x384       0.023529 ffffff80 -
+teflon:    35 CONV      256,161,160 257        1x20x20x64        0.160509 ffffffed -
+teflon:    36 ADD       254,257    258        1x20x20x64        0.271288   1 -
+teflon:    37 CONV      258,159,158 259        1x20x20x384       0.023529 ffffff80 -
+teflon:    38 DWCONV    259,157,156 260        1x20x20x384       0.023529 ffffff80 -
+teflon:    39 CONV      260,155,154 261        1x20x20x96        0.178470   f -
+teflon:    40 CONV      261,153,152 262        1x20x20x576       0.023529 ffffff80 -
+teflon:    41 DWCONV    262,151,150 263        1x20x20x576       0.023529 ffffff80 -
+teflon:    42 CONV      263,149,148 264        1x20x20x96        0.127582 fffffffc -
+teflon:    43 ADD       261,264    265        1x20x20x96        0.198830   4 -
+teflon:    44 CONV      265,147,146 266        1x20x20x576       0.023529 ffffff80 -
+teflon:    45 DWCONV    266,145,144 267        1x20x20x576       0.023529 ffffff80 -
+teflon:    46 CONV      267,143,142 268        1x20x20x96        0.151611   6 -
+teflon:    47 ADD       265,268    269        1x20x20x96        0.235020 fffffffe -
+
+Adding transpose NHWC -> NCHW.
+operation 1 input tensor 270 layouts NHWC NCHW.
+Adding reshuffle for convolution operation.
+Adding convolution.
+type 1 i 0 tensor 222 layout NHWC == NCHW (3d)
+operation 1 input tensor 222 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 223 layout NHWC == NCHW (3d)
+operation 1 input tensor 223 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 224 layout NHWC == NCHW (3d)
+operation 1 input tensor 224 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 225 layout NHWC == NCHW (3d)
+operation 1 input tensor 225 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 226 layout NHWC == NCHW (3d)
+operation 1 input tensor 226 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 227 layout NHWC == NCHW (3d)
+operation 1 input tensor 227 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 228 layout NHWC == NCHW (3d)
+operation 1 input tensor 228 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 229 layout NHWC == NCHW (3d)
+operation 1 input tensor 229 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 230 layout NHWC == NCHW (3d)
+operation 0 input tensor 227 layouts NHWC NCHW.
+operation 0 input tensor 230 layouts NHWC NCHW.
+Copying layout to output tensor 231.
+type 0 i 0 tensor 231 layout NHWC == NCHW (3d)
+operation 1 input tensor 231 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 232 layout NHWC == NCHW (3d)
+operation 1 input tensor 232 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 233 layout NHWC == NCHW (3d)
+operation 1 input tensor 233 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 234 layout NHWC == NCHW (3d)
+operation 1 input tensor 234 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 235 layout NHWC == NCHW (3d)
+operation 1 input tensor 235 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 236 layout NHWC == NCHW (3d)
+operation 1 input tensor 236 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 237 layout NHWC == NCHW (3d)
+operation 0 input tensor 234 layouts NHWC NCHW.
+operation 0 input tensor 237 layouts NHWC NCHW.
+Copying layout to output tensor 238.
+type 0 i 0 tensor 238 layout NHWC == NCHW (3d)
+operation 1 input tensor 238 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 239 layout NHWC == NCHW (3d)
+operation 1 input tensor 239 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 240 layout NHWC == NCHW (3d)
+operation 1 input tensor 240 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 241 layout NHWC == NCHW (3d)
+operation 0 input tensor 238 layouts NHWC NCHW.
+operation 0 input tensor 241 layouts NHWC NCHW.
+Copying layout to output tensor 242.
+type 0 i 0 tensor 242 layout NHWC == NCHW (3d)
+operation 1 input tensor 242 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 243 layout NHWC == NCHW (out) (3d)
+Adding detranspose NCHW -> NHWC.
+operation 1 input tensor 242 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 244 layout NHWC == NCHW (3d)
+operation 1 input tensor 244 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 245 layout NHWC == NCHW (3d)
+operation 1 input tensor 245 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 246 layout NHWC == NCHW (3d)
+operation 1 input tensor 246 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 247 layout NHWC == NCHW (3d)
+operation 1 input tensor 247 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 248 layout NHWC == NCHW (3d)
+operation 1 input tensor 248 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 249 layout NHWC == NCHW (3d)
+operation 0 input tensor 246 layouts NHWC NCHW.
+operation 0 input tensor 249 layouts NHWC NCHW.
+Copying layout to output tensor 250.
+type 0 i 0 tensor 250 layout NHWC == NCHW (3d)
+operation 1 input tensor 250 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 251 layout NHWC == NCHW (3d)
+operation 1 input tensor 251 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 252 layout NHWC == NCHW (3d)
+operation 1 input tensor 252 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 253 layout NHWC == NCHW (3d)
+operation 0 input tensor 250 layouts NHWC NCHW.
+operation 0 input tensor 253 layouts NHWC NCHW.
+Copying layout to output tensor 254.
+type 0 i 0 tensor 254 layout NHWC == NCHW (3d)
+operation 1 input tensor 254 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 255 layout NHWC == NCHW (3d)
+operation 1 input tensor 255 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 256 layout NHWC == NCHW (3d)
+operation 1 input tensor 256 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 257 layout NHWC == NCHW (3d)
+operation 0 input tensor 254 layouts NHWC NCHW.
+operation 0 input tensor 257 layouts NHWC NCHW.
+Copying layout to output tensor 258.
+type 0 i 0 tensor 258 layout NHWC == NCHW (3d)
+operation 1 input tensor 258 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 259 layout NHWC == NCHW (3d)
+operation 1 input tensor 259 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 260 layout NHWC == NCHW (3d)
+operation 1 input tensor 260 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 261 layout NHWC == NCHW (3d)
+operation 1 input tensor 261 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 262 layout NHWC == NCHW (3d)
+operation 1 input tensor 262 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 263 layout NHWC == NCHW (3d)
+operation 1 input tensor 263 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 264 layout NHWC == NCHW (3d)
+operation 0 input tensor 261 layouts NHWC NCHW.
+operation 0 input tensor 264 layouts NHWC NCHW.
+Copying layout to output tensor 265.
+type 0 i 0 tensor 265 layout NHWC == NCHW (3d)
+operation 1 input tensor 265 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 266 layout NHWC == NCHW (3d)
+operation 1 input tensor 266 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 267 layout NHWC == NCHW (3d)
+operation 1 input tensor 267 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 268 layout NHWC == NCHW (3d)
+operation 0 input tensor 265 layouts NHWC NCHW.
+operation 0 input tensor 268 layouts NHWC NCHW.
+Copying layout to output tensor 269.
+type 0 i 0 tensor 269 layout NHWC == NCHW (out) (3d)
+Adding detranspose NCHW -> NHWC.
+allocated tensor 0 at offset 0 with size 307200
+allocated tensor 270 at offset 307200 with size 307200
+allocated tensor 271 at offset 614400 with size 311052
+allocated tensor 222 at offset 925504 with size 819200
+allocated tensor 223 at offset 1744704 with size 819200
+allocated tensor 224 at offset 2563904 with size 409600
+allocated tensor 225 at offset 2973504 with size 2457600
+allocated tensor 226 at offset 5431104 with size 614400
+allocated tensor 227 at offset 6045504 with size 153600
+allocated tensor 228 at offset 6199104 with size 921600
+allocated tensor 229 at offset 7120704 with size 921600
+allocated tensor 227 at offset 8042304 with size 307200
+src_tensor 227 dst_tensor 230 offset 153600 size 153600
+allocated tensor 231 at offset 8349504 with size 153600
+allocated tensor 232 at offset 8503104 with size 921600
+allocated tensor 233 at offset 9424704 with size 230400
+allocated tensor 234 at offset 9655104 with size 51200
+allocated tensor 235 at offset 9706304 with size 307200
+allocated tensor 236 at offset 10013504 with size 307200
+allocated tensor 234 at offset 10320704 with size 102400
+src_tensor 234 dst_tensor 237 offset 51200 size 51200
+allocated tensor 238 at offset 10423104 with size 51200
+allocated tensor 239 at offset 10474304 with size 307200
+allocated tensor 240 at offset 10781504 with size 307200
+allocated tensor 238 at offset 11088704 with size 102400
+src_tensor 238 dst_tensor 241 offset 51200 size 51200
+allocated tensor 242 at offset 11191104 with size 51200
+allocated tensor 272 at offset 11242304 with size 204800
+allocated tensor 244 at offset 11447104 with size 307200
+allocated tensor 245 at offset 11754304 with size 76800
+allocated tensor 246 at offset 11831104 with size 25600
+allocated tensor 247 at offset 11856704 with size 153600
+allocated tensor 248 at offset 12010304 with size 153600
+allocated tensor 246 at offset 12163904 with size 51200
+src_tensor 246 dst_tensor 249 offset 25600 size 25600
+allocated tensor 250 at offset 12215104 with size 25600
+allocated tensor 251 at offset 12240704 with size 153600
+allocated tensor 252 at offset 12394304 with size 153600
+allocated tensor 250 at offset 12547904 with size 51200
+src_tensor 250 dst_tensor 253 offset 25600 size 25600
+allocated tensor 254 at offset 12599104 with size 25600
+allocated tensor 255 at offset 12624704 with size 153600
+allocated tensor 256 at offset 12778304 with size 153600
+allocated tensor 254 at offset 12931904 with size 51200
+src_tensor 254 dst_tensor 257 offset 25600 size 25600
+allocated tensor 258 at offset 12983104 with size 25600
+allocated tensor 259 at offset 13008704 with size 153600
+allocated tensor 260 at offset 13162304 with size 153600
+allocated tensor 261 at offset 13315904 with size 38400
+allocated tensor 262 at offset 13354304 with size 230400
+allocated tensor 263 at offset 13584704 with size 230400
+allocated tensor 261 at offset 13815104 with size 76800
+src_tensor 261 dst_tensor 264 offset 38400 size 38400
+allocated tensor 265 at offset 13891904 with size 38400
+allocated tensor 266 at offset 13930304 with size 230400
+allocated tensor 267 at offset 14160704 with size 230400
+allocated tensor 265 at offset 14391104 with size 76800
+src_tensor 265 dst_tensor 268 offset 38400 size 38400
+allocated tensor 273 at offset 14467904 with size 38400
+Ensuring all output tensors have their memory backing.
+allocated tensor 243 at offset 14506304 with size 204800
+allocated tensor 269 at offset 14711104 with size 38400
+
+===== lowered subgraph: 52 jobs (NN:48 TP:4 CONCAT:0 SPLIT:0 BYPASS:0) =====
+
+idx type   in -> out     shape (WxHxC)          details
+-------------------------------------------------------------------------------------
+  0 TP     0 ->          320x320x3 -> 320x320x3 transpose
+  1 TP     270 -> 271    320x320x3 -> 161x161x12 reshuffle
+  2 NN     271 -> 222    161x161x12 -> 160x160x32 conv stride=2 pad-same relu
+  3 NN     222 -> 223    160x160x32 -> 160x160x32 dwconv stride=1 pad-same relu
+  4 NN     223 -> 224    160x160x32 -> 160x160x16 pwconv stride=1
+  5 NN     224 -> 225    160x160x16 -> 160x160x96 conv stride=1 relu
+  6 NN     225 -> 226    160x160x96 -> 80x80x96 dwconv stride=2 pad-same relu
+  7 NN     226 -> 227    80x80x96 -> 80x80x24   pwconv stride=1
+  8 NN     227 -> 228    80x80x24 -> 80x80x144  conv stride=1 relu
+  9 NN     228 -> 229    80x80x144 -> 80x80x144 dwconv stride=1 pad-same relu
+ 10 NN     229 -> 230    80x80x144 -> 80x80x24  pwconv stride=1
+ 11 NN     227,230 -> 231 4x1920x40 -> 1x1920x80 conv stride=1
+ 12 NN     231 -> 232    80x80x24 -> 80x80x144  conv stride=1 relu
+ 13 NN     232 -> 233    80x80x144 -> 40x40x144 dwconv stride=2 pad-same relu
+ 14 NN     233 -> 234    40x40x144 -> 40x40x32  pwconv stride=1
+ 15 NN     234 -> 235    40x40x32 -> 40x40x192  conv stride=1 relu
+ 16 NN     235 -> 236    40x40x192 -> 40x40x192 dwconv stride=1 pad-same relu
+ 17 NN     236 -> 237    40x40x192 -> 40x40x32  pwconv stride=1
+ 18 NN     234,237 -> 238 4x1280x20 -> 1x1280x40 conv stride=1
+ 19 NN     238 -> 239    40x40x32 -> 40x40x192  conv stride=1 relu
+ 20 NN     239 -> 240    40x40x192 -> 40x40x192 dwconv stride=1 pad-same relu
+ 21 NN     240 -> 241    40x40x192 -> 40x40x32  pwconv stride=1
+ 22 NN     238,241 -> 242 4x1280x20 -> 1x1280x40 conv stride=1
+ 23 NN     242 -> 272    40x40x32 -> 40x40x128  pwconv stride=1
+ 24 TP     272 ->        40x40x128 -> 40x40x128 detranspose
+ 25 NN     242 -> 244    40x40x32 -> 40x40x192  conv stride=1 relu
+ 26 NN     244 -> 245    40x40x192 -> 20x20x192 dwconv stride=2 pad-same relu
+ 27 NN     245 -> 246    20x20x192 -> 20x20x64  pwconv stride=1
+ 28 NN     246 -> 247    20x20x64 -> 20x20x384  conv stride=1 relu
+ 29 NN     247 -> 248    20x20x384 -> 20x20x384 dwconv stride=1 pad-same relu
+ 30 NN     248 -> 249    20x20x384 -> 20x20x64  pwconv stride=1
+ 31 NN     246,249 -> 250 4x1280x10 -> 1x1280x20 conv stride=1
+ 32 NN     250 -> 251    20x20x64 -> 20x20x384  conv stride=1 relu
+ 33 NN     251 -> 252    20x20x384 -> 20x20x384 dwconv stride=1 pad-same relu
+ 34 NN     252 -> 253    20x20x384 -> 20x20x64  pwconv stride=1
+ 35 NN     250,253 -> 254 4x1280x10 -> 1x1280x20 conv stride=1
+ 36 NN     254 -> 255    20x20x64 -> 20x20x384  conv stride=1 relu
+ 37 NN     255 -> 256    20x20x384 -> 20x20x384 dwconv stride=1 pad-same relu
+ 38 NN     256 -> 257    20x20x384 -> 20x20x64  pwconv stride=1
+ 39 NN     254,257 -> 258 4x1280x10 -> 1x1280x20 conv stride=1
+ 40 NN     258 -> 259    20x20x64 -> 20x20x384  conv stride=1 relu
+ 41 NN     259 -> 260    20x20x384 -> 20x20x384 dwconv stride=1 pad-same relu
+ 42 NN     260 -> 261    20x20x384 -> 20x20x96  pwconv stride=1
+ 43 NN     261 -> 262    20x20x96 -> 20x20x576  conv stride=1 relu
+ 44 NN     262 -> 263    20x20x576 -> 20x20x576 dwconv stride=1 pad-same relu
+ 45 NN     263 -> 264    20x20x576 -> 20x20x96  pwconv stride=1
+ 46 NN     261,264 -> 265 4x1920x10 -> 1x1920x20 conv stride=1
+ 47 NN     265 -> 266    20x20x96 -> 20x20x576  conv stride=1 relu
+ 48 NN     266 -> 267    20x20x576 -> 20x20x576 dwconv stride=1 pad-same relu
+ 49 NN     267 -> 268    20x20x576 -> 20x20x96  pwconv stride=1
+ 50 NN     265,268 -> 273 4x1920x10 -> 1x1920x20 conv stride=1
+ 51 TP     273 ->        20x20x96 -> 20x20x96   detranspose
+
+reshuffle: input_width 320 tp_cores_used 1
+map->in_image_z_size 3 in_dims[2] 3 split_dim 0
+coefficients_size 0x4c0 (1216) image_size 0x0 (0)
+coefficients_size 0x240 (576) image_size 0x0 (0)
+coefficients_size 0x300 (768) image_size 0x0 (0)
+coefficients_size 0x740 (1856) image_size 0x1000 (4096)
+image_cache_end_address 8064 image_cache_start_address 3968 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x4c0 (1216) image_size 0x9600 (38400)
+image_cache_end_address 41728 image_cache_start_address 3328 image_cache_size 38400 oc_sram_size 262144
+coefficients_size 0x9a0 (2464) image_size 0x0 (0)
+coefficients_size 0xf00 (3840) image_size 0x1800 (6144)
+image_cache_end_address 12032 image_cache_start_address 5888 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x580 (1408) image_size 0xe100 (57600)
+image_cache_end_address 61056 image_cache_start_address 3456 image_cache_size 57600 oc_sram_size 262144
+coefficients_size 0xca0 (3232) image_size 0x0 (0)
+coefficients_size 0x1580 (5504) image_size 0x0 (0)
+coefficients_size 0xe80 (3712) image_size 0x1800 (6144)
+image_cache_end_address 11904 image_cache_start_address 5760 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x700 (1792) image_size 0xe100 (57600)
+image_cache_end_address 61440 image_cache_start_address 3840 image_cache_size 57600 oc_sram_size 262144
+coefficients_size 0xf80 (3968) image_size 0x0 (0)
+coefficients_size 0x1980 (6528) image_size 0x1400 (5120)
+image_cache_end_address 13696 image_cache_start_address 8576 image_cache_size 5120 oc_sram_size 262144
+coefficients_size 0x7c0 (1984) image_size 0xc000 (49152)
+image_cache_end_address 53248 image_cache_start_address 4096 image_cache_size 49152 oc_sram_size 262144
+coefficients_size 0x1580 (5504) image_size 0x0 (0)
+coefficients_size 0x660 (1632) image_size 0x0 (0)
+coefficients_size 0x16c0 (5824) image_size 0x1400 (5120)
+image_cache_end_address 13056 image_cache_start_address 7936 image_cache_size 5120 oc_sram_size 262144
+coefficients_size 0x800 (2048) image_size 0xc000 (49152)
+image_cache_end_address 53248 image_cache_start_address 4096 image_cache_size 49152 oc_sram_size 262144
+coefficients_size 0x13c0 (5056) image_size 0x0 (0)
+coefficients_size 0x660 (1632) image_size 0x0 (0)
+coefficients_size 0x1240 (4672) image_size 0x1400 (5120)
+image_cache_end_address 11904 image_cache_start_address 6784 image_cache_size 5120 oc_sram_size 262144
+coefficients_size 0x19c0 (6592) image_size 0x1400 (5120)
+image_cache_end_address 13824 image_cache_start_address 8704 image_cache_size 5120 oc_sram_size 262144
+coefficients_size 0x7c0 (1984) image_size 0xc000 (49152)
+image_cache_end_address 53248 image_cache_start_address 4096 image_cache_size 49152 oc_sram_size 262144
+coefficients_size 0x2880 (10368) image_size 0x0 (0)
+coefficients_size 0x5c80 (23680) image_size 0x1400 (5120)
+image_cache_end_address 30848 image_cache_start_address 25728 image_cache_size 5120 oc_sram_size 262144
+coefficients_size 0x1180 (4480) image_size 0xd800 (55296)
+image_cache_end_address 61824 image_cache_start_address 6528 image_cache_size 55296 oc_sram_size 262144
+coefficients_size 0x4540 (17728) image_size 0x0 (0)
+coefficients_size 0x290 (656) image_size 0x0 (0)
+coefficients_size 0x5c40 (23616) image_size 0x1400 (5120)
+image_cache_end_address 30848 image_cache_start_address 25728 image_cache_size 5120 oc_sram_size 262144
+coefficients_size 0xf40 (3904) image_size 0xd800 (55296)
+image_cache_end_address 61312 image_cache_start_address 6016 image_cache_size 55296 oc_sram_size 262144
+coefficients_size 0x4900 (18688) image_size 0x0 (0)
+coefficients_size 0x290 (656) image_size 0x0 (0)
+coefficients_size 0x5dc0 (24000) image_size 0x1400 (5120)
+image_cache_end_address 31232 image_cache_start_address 26112 image_cache_size 5120 oc_sram_size 262144
+coefficients_size 0x10c0 (4288) image_size 0xd800 (55296)
+image_cache_end_address 61696 image_cache_start_address 6400 image_cache_size 55296 oc_sram_size 262144
+coefficients_size 0x4d80 (19840) image_size 0x0 (0)
+coefficients_size 0x290 (656) image_size 0x0 (0)
+coefficients_size 0x5400 (21504) image_size 0x1400 (5120)
+image_cache_end_address 28672 image_cache_start_address 23552 image_cache_size 5120 oc_sram_size 262144
+coefficients_size 0x1080 (4224) image_size 0xd800 (55296)
+image_cache_end_address 61568 image_cache_start_address 6272 image_cache_size 55296 oc_sram_size 262144
+coefficients_size 0x6ec0 (28352) image_size 0x0 (0)
+coefficients_size 0xb940 (47424) image_size 0x1e00 (7680)
+image_cache_end_address 57216 image_cache_start_address 49536 image_cache_size 7680 oc_sram_size 262144
+coefficients_size 0x19c0 (6592) image_size 0x14400 (82944)
+image_cache_end_address 91648 image_cache_start_address 8704 image_cache_size 82944 oc_sram_size 262144
+coefficients_size 0xa7c0 (42944) image_size 0x0 (0)
+coefficients_size 0x290 (656) image_size 0x0 (0)
+coefficients_size 0xb080 (45184) image_size 0x1e00 (7680)
+image_cache_end_address 54912 image_cache_start_address 47232 image_cache_size 7680 oc_sram_size 262144
+coefficients_size 0x1800 (6144) image_size 0x14400 (82944)
+image_cache_end_address 91136 image_cache_start_address 8192 image_cache_size 82944 oc_sram_size 262144
+coefficients_size 0x9c00 (39936) image_size 0x0 (0)
+coefficients_size 0x290 (656) image_size 0x0 (0)
+teflon: compiled graph, took 82 ms
+
+teflon: ===== subgraph #1: 79 operations, 386 tensors =====
+teflon:   in:  286,293,298
+teflon:   out: 360,378
+
+teflon:   idx op        inputs     outputs    out-dims             scale  zp data
+teflon:   --- --------- ---------- ---------- ---------------- --------- --- ----
+teflon:     0 DWCONV    298,74,78  299        1x40x40x128       0.067465  29 -
+teflon:     1 CONV      299,73,72  300        1x40x40x128       0.023529 ffffff80 -
+teflon:     2 DWCONV    286,71,79  301        1x5x5x128         0.054866  1b -
+teflon:     3 CONV      301,70,69  302        1x5x5x128         0.023529 ffffff80 -
+teflon:     4 DWCONV    302,68,80  303        1x3x3x128         0.004586 ffffffd2 -
+teflon:     5 CONV      303,67,66  304        1x3x3x128         0.015486 ffffff80 -
+teflon:     6 DWCONV    300,65,81  305        1x40x40x128       0.017654 fffffff7 -
+teflon:     7 CONV      305,64,63  306        1x40x40x128       0.023529 ffffff80 -
+teflon:     8 DWCONV    293,65,82  307        1x20x20x128       0.019988 fffffffa -
+teflon:     9 CONV      307,62,61  308        1x20x20x128       0.023529 ffffff80 -
+teflon:    10 DWCONV    286,65,83  309        1x10x10x128       0.027889 fffffffd -
+teflon:    11 CONV      309,60,59  310        1x10x10x128       0.023529 ffffff80 -
+teflon:    12 DWCONV    302,65,84  311        1x5x5x128         0.009322 fffffffe -
+teflon:    13 CONV      311,58,57  312        1x5x5x128         0.018578 ffffff80 -
+teflon:    14 DWCONV    304,65,85  313        1x3x3x128         0.007194 fffffff0 -
+teflon:    15 CONV      313,56,55  314        1x3x3x128         0.020535 ffffff80 -
+teflon:    16 DWCONV    306,54,86  315        1x40x40x128       0.017470   4 -
+teflon:    17 CONV      315,53,52  316        1x40x40x128       0.023529 ffffff80 -
+teflon:    18 DWCONV    308,54,87  317        1x20x20x128       0.017179 fffffffe -
+teflon:    19 CONV      317,51,50  318        1x20x20x128       0.023529 ffffff80 -
+teflon:    20 DWCONV    310,54,88  319        1x10x10x128       0.011779 fffffff4 -
+teflon:    21 CONV      319,49,48  320        1x10x10x128       0.023529 ffffff80 -
+teflon:    22 DWCONV    312,54,89  321        1x5x5x128         0.009716 fffffff6 -
+teflon:    23 CONV      321,47,46  322        1x5x5x128         0.019796 ffffff80 -
+teflon:    24 DWCONV    314,54,90  323        1x3x3x128         0.014027  28 -
+teflon:    25 CONV      323,45,44  324        1x3x3x128         0.022314 ffffff80 -
+teflon:    26 DWCONV    316,43,91  325        1x40x40x128       0.018682 ffffffe6 -
+teflon:    27 CONV      325,42,41  326        1x40x40x128       0.023529 ffffff80 -
+teflon:    28 DWCONV    318,43,92  327        1x20x20x128       0.016154 fffffff6 -
+teflon:    29 CONV      327,40,39  328        1x20x20x128       0.023529 ffffff80 -
+teflon:    30 DWCONV    320,43,93  329        1x10x10x128       0.013873 ffffffef -
+teflon:    31 CONV      329,38,37  330        1x10x10x128       0.023529 ffffff80 -
+teflon:    32 DWCONV    322,43,94  331        1x5x5x128         0.012421 fffffffc -
+teflon:    33 CONV      331,36,35  332        1x5x5x128         0.022456 ffffff80 -
+teflon:    34 DWCONV    324,43,95  333        1x3x3x128         0.011176 ffffffed -
+teflon:    35 CONV      333,34,33  334        1x3x3x128         0.021343 ffffff80 -
+teflon:    36 DWCONV    326,32,96  335        1x40x40x128       0.016186 fffffff4 -
+teflon:    37 CONV      335,31,30  336        1x40x40x128       0.023529 ffffff80 -
+teflon:    38 DWCONV    328,32,97  337        1x20x20x128       0.014740 ffffffe6 -
+teflon:    39 CONV      337,29,28  338        1x20x20x128       0.023529 ffffff80 -
+teflon:    40 DWCONV    330,32,98  339        1x10x10x128       0.013937 ffffffee -
+teflon:    41 CONV      339,27,26  340        1x10x10x128       0.023529 ffffff80 -
+teflon:    42 DWCONV    332,32,99  341        1x5x5x128         0.012916 fffffff1 -
+teflon:    43 CONV      341,25,24  342        1x5x5x128         0.023529 ffffff80 -
+teflon:    44 DWCONV    334,32,100 343        1x3x3x128         0.010637 ffffffdc -
+teflon:    45 CONV      343,23,22  344        1x3x3x128         0.023529 ffffff80 -
+teflon:    46 DWCONV    336,21,101 345        1x40x40x128       0.056704  15 -
+teflon:    47 CONV      345,20,15  346        1x40x40x40        0.069590  19 -
+teflon:    48 RESHAPE   346,6      347        1x1x16000x4       0.069590  19 -
+teflon:    49 DWCONV    338,21,102 348        1x20x20x128       0.043991   e -
+teflon:    50 CONV      348,20,16  349        1x20x20x40        0.069590  19 -
+teflon:    51 RESHAPE   349,6      350        1x1x4000x4        0.069590  19 -
+teflon:    52 DWCONV    340,21,103 351        1x10x10x128       0.040778   b -
+teflon:    53 CONV      351,20,17  352        1x10x10x40        0.069590  19 -
+teflon:    54 RESHAPE   352,6      353        1x1x1000x4        0.069590  19 -
+teflon:    55 DWCONV    342,21,104 354        1x5x5x128         0.043451 fffffffe -
+teflon:    56 CONV      354,20,18  355        1x5x5x40          0.069590  19 -
+teflon:    57 RESHAPE   355,6      356        1x1x250x4         0.069590  19 -
+teflon:    58 DWCONV    344,21,105 357        1x3x3x128         0.030605   c -
+teflon:    59 CONV      357,20,19  358        1x3x3x40          0.069590  19 -
+teflon:    60 RESHAPE   358,6      359        1x1x90x4          0.069590  19 -
+teflon:    61 CONCAT    347,350,353,356,359 360        1x1x21340x4       0.069590  19 -
+teflon:    62 DWCONV    336,14,106 362        1x40x40x128       0.042405   9 -
+teflon:    63 CONV      362,13,8   363        1x40x40x30        0.048711  20 -
+teflon:    64 RESHAPE   363,7      364        1x1x16000x3       0.048711  20 -
+teflon:    65 DWCONV    338,14,107 365        1x20x20x128       0.044568   0 -
+teflon:    66 CONV      365,13,9   366        1x20x20x30        0.048711  20 -
+teflon:    67 RESHAPE   366,7      367        1x1x4000x3        0.048711  20 -
+teflon:    68 DWCONV    340,14,108 368        1x10x10x128       0.050553  10 -
+teflon:    69 CONV      368,13,10  369        1x10x10x30        0.048711  20 -
+teflon:    70 RESHAPE   369,7      370        1x1x1000x3        0.048711  20 -
+teflon:    71 DWCONV    342,14,109 371        1x5x5x128         0.056746  1e -
+teflon:    72 CONV      371,13,11  372        1x5x5x30          0.048711  20 -
+teflon:    73 RESHAPE   372,7      373        1x1x250x3         0.048711  20 -
+teflon:    74 DWCONV    344,14,110 374        1x3x3x128         0.051561  2d -
+teflon:    75 CONV      374,13,12  375        1x3x3x30          0.048711  20 -
+teflon:    76 RESHAPE   375,7      376        1x1x90x3          0.048711  20 -
+teflon:    77 CONCAT    364,367,370,373,376 377        1x1x21340x3       0.048711  20 -
+teflon:    78 LOG       377        378        1x1x21340x3       0.003906 ffffff80 -
+
+Adding transpose NHWC -> NCHW.
+operation 1 input tensor 379 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 299 layout NHWC == NCHW (3d)
+operation 1 input tensor 299 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 300 layout NHWC == NCHW (3d)
+Adding transpose NHWC -> NCHW.
+operation 1 input tensor 380 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 301 layout NHWC == NCHW (3d)
+operation 1 input tensor 301 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 302 layout NHWC == NCHW (3d)
+operation 1 input tensor 302 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 303 layout NHWC == NCHW (3d)
+operation 1 input tensor 303 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 304 layout NHWC == NCHW (3d)
+operation 1 input tensor 300 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 305 layout NHWC == NCHW (3d)
+operation 1 input tensor 305 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 306 layout NHWC == NCHW (3d)
+Adding transpose NHWC -> NCHW.
+operation 1 input tensor 381 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 307 layout NHWC == NCHW (3d)
+operation 1 input tensor 307 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 308 layout NHWC == NCHW (3d)
+Adding transpose NHWC -> NCHW.
+operation 1 input tensor 382 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 309 layout NHWC == NCHW (3d)
+operation 1 input tensor 309 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 310 layout NHWC == NCHW (3d)
+operation 1 input tensor 302 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 311 layout NHWC == NCHW (3d)
+operation 1 input tensor 311 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 312 layout NHWC == NCHW (3d)
+operation 1 input tensor 304 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 313 layout NHWC == NCHW (3d)
+operation 1 input tensor 313 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 314 layout NHWC == NCHW (3d)
+operation 1 input tensor 306 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 315 layout NHWC == NCHW (3d)
+operation 1 input tensor 315 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 316 layout NHWC == NCHW (3d)
+operation 1 input tensor 308 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 317 layout NHWC == NCHW (3d)
+operation 1 input tensor 317 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 318 layout NHWC == NCHW (3d)
+operation 1 input tensor 310 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 319 layout NHWC == NCHW (3d)
+operation 1 input tensor 319 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 320 layout NHWC == NCHW (3d)
+operation 1 input tensor 312 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 321 layout NHWC == NCHW (3d)
+operation 1 input tensor 321 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 322 layout NHWC == NCHW (3d)
+operation 1 input tensor 314 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 323 layout NHWC == NCHW (3d)
+operation 1 input tensor 323 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 324 layout NHWC == NCHW (3d)
+operation 1 input tensor 316 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 325 layout NHWC == NCHW (3d)
+operation 1 input tensor 325 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 326 layout NHWC == NCHW (3d)
+operation 1 input tensor 318 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 327 layout NHWC == NCHW (3d)
+operation 1 input tensor 327 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 328 layout NHWC == NCHW (3d)
+operation 1 input tensor 320 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 329 layout NHWC == NCHW (3d)
+operation 1 input tensor 329 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 330 layout NHWC == NCHW (3d)
+operation 1 input tensor 322 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 331 layout NHWC == NCHW (3d)
+operation 1 input tensor 331 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 332 layout NHWC == NCHW (3d)
+operation 1 input tensor 324 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 333 layout NHWC == NCHW (3d)
+operation 1 input tensor 333 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 334 layout NHWC == NCHW (3d)
+operation 1 input tensor 326 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 335 layout NHWC == NCHW (3d)
+operation 1 input tensor 335 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 336 layout NHWC == NCHW (3d)
+operation 1 input tensor 328 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 337 layout NHWC == NCHW (3d)
+operation 1 input tensor 337 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 338 layout NHWC == NCHW (3d)
+operation 1 input tensor 330 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 339 layout NHWC == NCHW (3d)
+operation 1 input tensor 339 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 340 layout NHWC == NCHW (3d)
+operation 1 input tensor 332 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 341 layout NHWC == NCHW (3d)
+operation 1 input tensor 341 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 342 layout NHWC == NCHW (3d)
+operation 1 input tensor 334 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 343 layout NHWC == NCHW (3d)
+operation 1 input tensor 343 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 344 layout NHWC == NCHW (3d)
+operation 1 input tensor 336 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 345 layout NHWC == NCHW (3d)
+operation 1 input tensor 345 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 346 layout NHWC == NCHW (3d)
+operation 7 input tensor 346 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 347 layout NHWC == NHWC
+operation 1 input tensor 338 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 348 layout NHWC == NCHW (3d)
+operation 1 input tensor 348 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 349 layout NHWC == NCHW (3d)
+operation 7 input tensor 349 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 350 layout NHWC == NHWC
+operation 1 input tensor 340 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 351 layout NHWC == NCHW (3d)
+operation 1 input tensor 351 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 352 layout NHWC == NCHW (3d)
+operation 7 input tensor 352 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 353 layout NHWC == NHWC
+operation 1 input tensor 342 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 354 layout NHWC == NCHW (3d)
+operation 1 input tensor 354 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 355 layout NHWC == NCHW (3d)
+operation 7 input tensor 355 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 356 layout NHWC == NHWC
+operation 1 input tensor 344 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 357 layout NHWC == NCHW (3d)
+operation 1 input tensor 357 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 358 layout NHWC == NCHW (3d)
+operation 7 input tensor 358 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 359 layout NHWC == NHWC
+operation 3 input tensor 347 layouts NHWC NHWC.
+operation 3 input tensor 350 layouts NHWC NHWC.
+operation 3 input tensor 353 layouts NHWC NHWC.
+operation 3 input tensor 356 layouts NHWC NHWC.
+operation 3 input tensor 359 layouts NHWC NHWC.
+Copying layout to output tensor 360.
+type 3 i 0 tensor 360 layout NHWC == NHWC (out)
+operation 1 input tensor 336 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 362 layout NHWC == NCHW (3d)
+operation 1 input tensor 362 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 363 layout NHWC == NCHW (3d)
+operation 7 input tensor 363 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 364 layout NHWC == NHWC
+operation 1 input tensor 338 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 365 layout NHWC == NCHW (3d)
+operation 1 input tensor 365 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 366 layout NHWC == NCHW (3d)
+operation 7 input tensor 366 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 367 layout NHWC == NHWC
+operation 1 input tensor 340 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 368 layout NHWC == NCHW (3d)
+operation 1 input tensor 368 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 369 layout NHWC == NCHW (3d)
+operation 7 input tensor 369 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 370 layout NHWC == NHWC
+operation 1 input tensor 342 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 371 layout NHWC == NCHW (3d)
+operation 1 input tensor 371 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 372 layout NHWC == NCHW (3d)
+operation 7 input tensor 372 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 373 layout NHWC == NHWC
+operation 1 input tensor 344 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 374 layout NHWC == NCHW (3d)
+operation 1 input tensor 374 layouts NHWC NCHW.
+Adding convolution.
+type 1 i 0 tensor 375 layout NHWC == NCHW (3d)
+operation 7 input tensor 375 layouts NHWC NCHW.
+3d->2d reshape detected:
+Adding detranspose NCHW -> NHWC.
+type 7 i 0 tensor 376 layout NHWC == NHWC
+operation 3 input tensor 364 layouts NHWC NHWC.
+operation 3 input tensor 367 layouts NHWC NHWC.
+operation 3 input tensor 370 layouts NHWC NHWC.
+operation 3 input tensor 373 layouts NHWC NHWC.
+operation 3 input tensor 376 layouts NHWC NHWC.
+Copying layout to output tensor 377.
+type 3 i 0 tensor 377 layout NHWC == NHWC
+operation 10 input tensor 377 layouts NHWC NHWC.
+Copying layout to output tensor 378.
+type 10 i 0 tensor 378 layout NHWC == NHWC (out)
+allocated tensor 298 at offset 0 with size 204800
+allocated tensor 379 at offset 204800 with size 204800
+allocated tensor 299 at offset 409600 with size 204800
+allocated tensor 286 at offset 614400 with size 12800
+allocated tensor 380 at offset 627200 with size 12800
+allocated tensor 301 at offset 640000 with size 3200
+allocated tensor 302 at offset 643200 with size 3200
+allocated tensor 303 at offset 646400 with size 1152
+allocated tensor 300 at offset 647552 with size 204800
+allocated tensor 305 at offset 852352 with size 204800
+allocated tensor 293 at offset 1057152 with size 51200
+allocated tensor 381 at offset 1108352 with size 51200
+allocated tensor 307 at offset 1159552 with size 51200
+allocated tensor 382 at offset 1210752 with size 12800
+allocated tensor 309 at offset 1223552 with size 12800
+allocated tensor 311 at offset 1236352 with size 3200
+allocated tensor 304 at offset 1239552 with size 1152
+allocated tensor 313 at offset 1240704 with size 1152
+allocated tensor 306 at offset 1241856 with size 204800
+allocated tensor 315 at offset 1446656 with size 204800
+allocated tensor 308 at offset 1651456 with size 51200
+allocated tensor 317 at offset 1702656 with size 51200
+allocated tensor 310 at offset 1753856 with size 12800
+allocated tensor 319 at offset 1766656 with size 12800
+allocated tensor 312 at offset 1779456 with size 3200
+allocated tensor 321 at offset 1782656 with size 3200
+allocated tensor 314 at offset 1785856 with size 1152
+allocated tensor 323 at offset 1787008 with size 1152
+allocated tensor 316 at offset 1788160 with size 204800
+allocated tensor 325 at offset 1992960 with size 204800
+allocated tensor 318 at offset 2197760 with size 51200
+allocated tensor 327 at offset 2248960 with size 51200
+allocated tensor 320 at offset 2300160 with size 12800
+allocated tensor 329 at offset 2312960 with size 12800
+allocated tensor 322 at offset 2325760 with size 3200
+allocated tensor 331 at offset 2328960 with size 3200
+allocated tensor 324 at offset 2332160 with size 1152
+allocated tensor 333 at offset 2333312 with size 1152
+allocated tensor 326 at offset 2334464 with size 204800
+allocated tensor 335 at offset 2539264 with size 204800
+allocated tensor 328 at offset 2744064 with size 51200
+allocated tensor 337 at offset 2795264 with size 51200
+allocated tensor 330 at offset 2846464 with size 12800
+allocated tensor 339 at offset 2859264 with size 12800
+allocated tensor 332 at offset 2872064 with size 3200
+allocated tensor 341 at offset 2875264 with size 3200
+allocated tensor 334 at offset 2878464 with size 1152
+allocated tensor 343 at offset 2879616 with size 1152
+allocated tensor 336 at offset 2880768 with size 204800
+allocated tensor 345 at offset 3085568 with size 204800
+allocated tensor 346 at offset 3290368 with size 64000
+allocated tensor 338 at offset 3354368 with size 51200
+allocated tensor 348 at offset 3405568 with size 51200
+allocated tensor 349 at offset 3456768 with size 16000
+allocated tensor 340 at offset 3472768 with size 12800
+allocated tensor 351 at offset 3485568 with size 12800
+allocated tensor 352 at offset 3498368 with size 4000
+allocated tensor 342 at offset 3502400 with size 3200
+allocated tensor 354 at offset 3505600 with size 3200
+allocated tensor 355 at offset 3508800 with size 1000
+allocated tensor 344 at offset 3509824 with size 1152
+allocated tensor 357 at offset 3510976 with size 1152
+allocated tensor 358 at offset 3512128 with size 360
+allocated tensor 360 at offset 3512512 with size 85360
+src_tensor 360 dst_tensor 347 offset 0 size 64000
+src_tensor 360 dst_tensor 350 offset 64000 size 16000
+src_tensor 360 dst_tensor 353 offset 80000 size 4000
+src_tensor 360 dst_tensor 356 offset 84000 size 1000
+src_tensor 360 dst_tensor 359 offset 85000 size 360
+allocated tensor 362 at offset 3597888 with size 204800
+allocated tensor 363 at offset 3802688 with size 48000
+allocated tensor 365 at offset 3850688 with size 51200
+allocated tensor 366 at offset 3901888 with size 12000
+allocated tensor 368 at offset 3913920 with size 12800
+allocated tensor 369 at offset 3926720 with size 3000
+allocated tensor 371 at offset 3929728 with size 3200
+allocated tensor 372 at offset 3932928 with size 750
+allocated tensor 374 at offset 3933696 with size 1152
+allocated tensor 375 at offset 3934848 with size 270
+allocated tensor 377 at offset 3935168 with size 64020
+src_tensor 377 dst_tensor 364 offset 0 size 48000
+src_tensor 377 dst_tensor 367 offset 48000 size 12000
+src_tensor 377 dst_tensor 370 offset 60000 size 3000
+src_tensor 377 dst_tensor 373 offset 63000 size 750
+src_tensor 377 dst_tensor 376 offset 63750 size 270
+Ensuring all output tensors have their memory backing.
+allocated tensor 378 at offset 3999232 with size 64020
+
+===== lowered subgraph: 83 jobs (NN:66 TP:15 CONCAT:2 SPLIT:0 BYPASS:0) =====
+
+idx type   in -> out     shape (WxHxC)          details
+-------------------------------------------------------------------------------------
+  0 TP     298 ->        40x40x128 -> 40x40x128 transpose
+  1 NN     379 -> 299    40x40x128 -> 40x40x128 dwconv stride=1 pad-same
+  2 NN     299 -> 300    40x40x128 -> 40x40x128 conv stride=1 relu
+  3 TP     286 ->        10x10x128 -> 10x10x128 transpose
+  4 NN     380 -> 301    10x10x128 -> 5x5x128   dwconv stride=2 pad-same
+  5 NN     301 -> 302    5x5x128 -> 5x5x128     conv stride=1 relu
+  6 NN     302 -> 303    5x5x128 -> 3x3x128     dwconv stride=2 pad-same
+  7 NN     303 -> 304    3x3x128 -> 3x3x128     conv stride=1 relu
+  8 NN     300 -> 305    40x40x128 -> 40x40x128 dwconv stride=1 pad-same
+  9 NN     305 -> 306    40x40x128 -> 40x40x128 conv stride=1 relu
+ 10 TP     293 ->        20x20x128 -> 20x20x128 transpose
+ 11 NN     381 -> 307    20x20x128 -> 20x20x128 dwconv stride=1 pad-same
+ 12 NN     307 -> 308    20x20x128 -> 20x20x128 conv stride=1 relu
+ 13 TP     286 ->        10x10x128 -> 10x10x128 transpose
+ 14 NN     382 -> 309    10x10x128 -> 10x10x128 dwconv stride=1 pad-same
+ 15 NN     309 -> 310    10x10x128 -> 10x10x128 conv stride=1 relu
+ 16 NN     302 -> 311    5x5x128 -> 5x5x128     dwconv stride=1 pad-same
+ 17 NN     311 -> 312    5x5x128 -> 5x5x128     conv stride=1 relu
+ 18 NN     304 -> 313    3x3x128 -> 3x3x128     dwconv stride=1 pad-same
+ 19 NN     313 -> 314    3x3x128 -> 3x3x128     conv stride=1 relu
+ 20 NN     306 -> 315    40x40x128 -> 40x40x128 dwconv stride=1 pad-same
+ 21 NN     315 -> 316    40x40x128 -> 40x40x128 conv stride=1 relu
+ 22 NN     308 -> 317    20x20x128 -> 20x20x128 dwconv stride=1 pad-same
+ 23 NN     317 -> 318    20x20x128 -> 20x20x128 conv stride=1 relu
+ 24 NN     310 -> 319    10x10x128 -> 10x10x128 dwconv stride=1 pad-same
+ 25 NN     319 -> 320    10x10x128 -> 10x10x128 conv stride=1 relu
+ 26 NN     312 -> 321    5x5x128 -> 5x5x128     dwconv stride=1 pad-same
+ 27 NN     321 -> 322    5x5x128 -> 5x5x128     conv stride=1 relu
+ 28 NN     314 -> 323    3x3x128 -> 3x3x128     dwconv stride=1 pad-same
+ 29 NN     323 -> 324    3x3x128 -> 3x3x128     conv stride=1 relu
+ 30 NN     316 -> 325    40x40x128 -> 40x40x128 dwconv stride=1 pad-same
+ 31 NN     325 -> 326    40x40x128 -> 40x40x128 conv stride=1 relu
+ 32 NN     318 -> 327    20x20x128 -> 20x20x128 dwconv stride=1 pad-same
+ 33 NN     327 -> 328    20x20x128 -> 20x20x128 conv stride=1 relu
+ 34 NN     320 -> 329    10x10x128 -> 10x10x128 dwconv stride=1 pad-same
+ 35 NN     329 -> 330    10x10x128 -> 10x10x128 conv stride=1 relu
+ 36 NN     322 -> 331    5x5x128 -> 5x5x128     dwconv stride=1 pad-same
+ 37 NN     331 -> 332    5x5x128 -> 5x5x128     conv stride=1 relu
+ 38 NN     324 -> 333    3x3x128 -> 3x3x128     dwconv stride=1 pad-same
+ 39 NN     333 -> 334    3x3x128 -> 3x3x128     conv stride=1 relu
+ 40 NN     326 -> 335    40x40x128 -> 40x40x128 dwconv stride=1 pad-same
+ 41 NN     335 -> 336    40x40x128 -> 40x40x128 conv stride=1 relu
+ 42 NN     328 -> 337    20x20x128 -> 20x20x128 dwconv stride=1 pad-same
+ 43 NN     337 -> 338    20x20x128 -> 20x20x128 conv stride=1 relu
+ 44 NN     330 -> 339    10x10x128 -> 10x10x128 dwconv stride=1 pad-same
+ 45 NN     339 -> 340    10x10x128 -> 10x10x128 conv stride=1 relu
+ 46 NN     332 -> 341    5x5x128 -> 5x5x128     dwconv stride=1 pad-same
+ 47 NN     341 -> 342    5x5x128 -> 5x5x128     conv stride=1 relu
+ 48 NN     334 -> 343    3x3x128 -> 3x3x128     dwconv stride=1 pad-same
+ 49 NN     343 -> 344    3x3x128 -> 3x3x128     conv stride=1 relu
+ 50 NN     336 -> 345    40x40x128 -> 40x40x128 dwconv stride=1 pad-same
+ 51 NN     345 -> 346    40x40x128 -> 40x40x40  pwconv stride=1
+ 52 TP     346 ->        40x40x40 -> 40x40x40   detranspose
+ 53 NN     338 -> 348    20x20x128 -> 20x20x128 dwconv stride=1 pad-same
+ 54 NN     348 -> 349    20x20x128 -> 20x20x40  pwconv stride=1
+ 55 TP     349 ->        20x20x40 -> 20x20x40   detranspose
+ 56 NN     340 -> 351    10x10x128 -> 10x10x128 dwconv stride=1 pad-same
+ 57 NN     351 -> 352    10x10x128 -> 10x10x40  pwconv stride=1
+ 58 TP     352 ->        10x10x40 -> 10x10x40   detranspose
+ 59 NN     342 -> 354    5x5x128 -> 5x5x128     dwconv stride=1 pad-same
+ 60 NN     354 -> 355    5x5x128 -> 5x5x40      pwconv stride=1
+ 61 TP     355 ->        5x5x40 -> 5x5x40       detranspose
+ 62 NN     344 -> 357    3x3x128 -> 3x3x128     dwconv stride=1 pad-same
+ 63 NN     357 -> 358    3x3x128 -> 3x3x40      pwconv stride=1
+ 64 TP     358 ->        3x3x40 -> 3x3x40       detranspose
+ 65 CONCAT 347,350,353,356,359 ->  0x0x0 -> 1x21340x4     
+ 66 NN     336 -> 362    40x40x128 -> 40x40x128 dwconv stride=1 pad-same
+ 67 NN     362 -> 363    40x40x128 -> 40x40x30  pwconv stride=1
+ 68 TP     363 ->        40x40x30 -> 40x40x30   detranspose
+ 69 NN     338 -> 365    20x20x128 -> 20x20x128 dwconv stride=1 pad-same
+ 70 NN     365 -> 366    20x20x128 -> 20x20x30  pwconv stride=1
+ 71 TP     366 ->        20x20x30 -> 20x20x30   detranspose
+ 72 NN     340 -> 368    10x10x128 -> 10x10x128 dwconv stride=1 pad-same
+ 73 NN     368 -> 369    10x10x128 -> 10x10x30  pwconv stride=1
+ 74 TP     369 ->        10x10x30 -> 10x10x30   detranspose
+ 75 NN     342 -> 371    5x5x128 -> 5x5x128     dwconv stride=1 pad-same
+ 76 NN     371 -> 372    5x5x128 -> 5x5x30      pwconv stride=1
+ 77 TP     372 ->        5x5x30 -> 5x5x30       detranspose
+ 78 NN     344 -> 374    3x3x128 -> 3x3x128     dwconv stride=1 pad-same
+ 79 NN     374 -> 375    3x3x128 -> 3x3x30      pwconv stride=1
+ 80 TP     375 ->        3x3x30 -> 3x3x30       detranspose
+ 81 CONCAT 364,367,370,373,376 ->  0x0x0 -> 1x21340x3     
+ 82 TP     377 -> 378    1x21340x3 -> 1x21340x3 logistic
+
+coefficients_size 0x6c0 (1728) image_size 0x8000 (32768)
+image_cache_end_address 36608 image_cache_start_address 3840 image_cache_size 32768 oc_sram_size 262144
+coefficients_size 0x3dc0 (15808) image_size 0x5000 (20480)
+image_cache_end_address 38400 image_cache_start_address 17920 image_cache_size 20480 oc_sram_size 262144
+coefficients_size 0x6c0 (1728) image_size 0x2800 (10240)
+image_cache_end_address 14080 image_cache_start_address 3840 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x3b80 (15232) image_size 0x1000 (4096)
+image_cache_end_address 21376 image_cache_start_address 17280 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x6c0 (1728) image_size 0x1800 (6144)
+image_cache_end_address 9984 image_cache_start_address 3840 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x46c0 (18112) image_size 0x800 (2048)
+image_cache_end_address 22272 image_cache_start_address 20224 image_cache_size 2048 oc_sram_size 262144
+coefficients_size 0x680 (1664) image_size 0x8000 (32768)
+image_cache_end_address 36480 image_cache_start_address 3712 image_cache_size 32768 oc_sram_size 262144
+coefficients_size 0x4340 (17216) image_size 0x5000 (20480)
+image_cache_end_address 39808 image_cache_start_address 19328 image_cache_size 20480 oc_sram_size 262144
+coefficients_size 0x680 (1664) image_size 0x4800 (18432)
+image_cache_end_address 22144 image_cache_start_address 3712 image_cache_size 18432 oc_sram_size 262144
+coefficients_size 0x4240 (16960) image_size 0x2800 (10240)
+image_cache_end_address 29312 image_cache_start_address 19072 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x680 (1664) image_size 0x2800 (10240)
+image_cache_end_address 13952 image_cache_start_address 3712 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x4380 (17280) image_size 0x1800 (6144)
+image_cache_end_address 25472 image_cache_start_address 19328 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x680 (1664) image_size 0x1800 (6144)
+image_cache_end_address 9856 image_cache_start_address 3712 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x4440 (17472) image_size 0x1000 (4096)
+image_cache_end_address 23680 image_cache_start_address 19584 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x680 (1664) image_size 0x1000 (4096)
+image_cache_end_address 7808 image_cache_start_address 3712 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x44c0 (17600) image_size 0x800 (2048)
+image_cache_end_address 21760 image_cache_start_address 19712 image_cache_size 2048 oc_sram_size 262144
+coefficients_size 0x540 (1344) image_size 0x8000 (32768)
+image_cache_end_address 36224 image_cache_start_address 3456 image_cache_size 32768 oc_sram_size 262144
+coefficients_size 0x4180 (16768) image_size 0x5000 (20480)
+image_cache_end_address 39296 image_cache_start_address 18816 image_cache_size 20480 oc_sram_size 262144
+coefficients_size 0x540 (1344) image_size 0x4800 (18432)
+image_cache_end_address 21888 image_cache_start_address 3456 image_cache_size 18432 oc_sram_size 262144
+coefficients_size 0x42c0 (17088) image_size 0x2800 (10240)
+image_cache_end_address 29440 image_cache_start_address 19200 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x540 (1344) image_size 0x2800 (10240)
+image_cache_end_address 13696 image_cache_start_address 3456 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x4380 (17280) image_size 0x1800 (6144)
+image_cache_end_address 25472 image_cache_start_address 19328 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x540 (1344) image_size 0x1800 (6144)
+image_cache_end_address 9600 image_cache_start_address 3456 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x4380 (17280) image_size 0x1000 (4096)
+image_cache_end_address 23424 image_cache_start_address 19328 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x540 (1344) image_size 0x1000 (4096)
+image_cache_end_address 7552 image_cache_start_address 3456 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x42c0 (17088) image_size 0x800 (2048)
+image_cache_end_address 21248 image_cache_start_address 19200 image_cache_size 2048 oc_sram_size 262144
+coefficients_size 0x600 (1536) image_size 0x8000 (32768)
+image_cache_end_address 36352 image_cache_start_address 3584 image_cache_size 32768 oc_sram_size 262144
+coefficients_size 0x4300 (17152) image_size 0x5000 (20480)
+image_cache_end_address 39680 image_cache_start_address 19200 image_cache_size 20480 oc_sram_size 262144
+coefficients_size 0x600 (1536) image_size 0x4800 (18432)
+image_cache_end_address 22016 image_cache_start_address 3584 image_cache_size 18432 oc_sram_size 262144
+coefficients_size 0x4340 (17216) image_size 0x2800 (10240)
+image_cache_end_address 29568 image_cache_start_address 19328 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x600 (1536) image_size 0x2800 (10240)
+image_cache_end_address 13824 image_cache_start_address 3584 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x4300 (17152) image_size 0x1800 (6144)
+image_cache_end_address 25344 image_cache_start_address 19200 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x600 (1536) image_size 0x1800 (6144)
+image_cache_end_address 9728 image_cache_start_address 3584 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x4280 (17024) image_size 0x1000 (4096)
+image_cache_end_address 23168 image_cache_start_address 19072 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x600 (1536) image_size 0x1000 (4096)
+image_cache_end_address 7680 image_cache_start_address 3584 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x4100 (16640) image_size 0x800 (2048)
+image_cache_end_address 20736 image_cache_start_address 18688 image_cache_size 2048 oc_sram_size 262144
+coefficients_size 0x6c0 (1728) image_size 0x8000 (32768)
+image_cache_end_address 36608 image_cache_start_address 3840 image_cache_size 32768 oc_sram_size 262144
+coefficients_size 0x4080 (16512) image_size 0x5000 (20480)
+image_cache_end_address 39040 image_cache_start_address 18560 image_cache_size 20480 oc_sram_size 262144
+coefficients_size 0x6c0 (1728) image_size 0x4800 (18432)
+image_cache_end_address 22272 image_cache_start_address 3840 image_cache_size 18432 oc_sram_size 262144
+coefficients_size 0x4000 (16384) image_size 0x2800 (10240)
+image_cache_end_address 28672 image_cache_start_address 18432 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x6c0 (1728) image_size 0x2800 (10240)
+image_cache_end_address 14080 image_cache_start_address 3840 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x4100 (16640) image_size 0x1800 (6144)
+image_cache_end_address 24832 image_cache_start_address 18688 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x6c0 (1728) image_size 0x1800 (6144)
+image_cache_end_address 9984 image_cache_start_address 3840 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x4100 (16640) image_size 0x1000 (4096)
+image_cache_end_address 22784 image_cache_start_address 18688 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x6c0 (1728) image_size 0x1000 (4096)
+image_cache_end_address 7936 image_cache_start_address 3840 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x40c0 (16576) image_size 0x800 (2048)
+image_cache_end_address 20736 image_cache_start_address 18688 image_cache_size 2048 oc_sram_size 262144
+coefficients_size 0x6c0 (1728) image_size 0x8000 (32768)
+image_cache_end_address 36608 image_cache_start_address 3840 image_cache_size 32768 oc_sram_size 262144
+coefficients_size 0x14e0 (5344) image_size 0x0 (0)
+coefficients_size 0x6c0 (1728) image_size 0x4800 (18432)
+image_cache_end_address 22272 image_cache_start_address 3840 image_cache_size 18432 oc_sram_size 262144
+coefficients_size 0x14e0 (5344) image_size 0x0 (0)
+coefficients_size 0x6c0 (1728) image_size 0x2800 (10240)
+image_cache_end_address 14080 image_cache_start_address 3840 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0x14e0 (5344) image_size 0x0 (0)
+coefficients_size 0x6c0 (1728) image_size 0x1800 (6144)
+image_cache_end_address 9984 image_cache_start_address 3840 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0x14e0 (5344) image_size 0x0 (0)
+coefficients_size 0x6c0 (1728) image_size 0x1000 (4096)
+image_cache_end_address 7936 image_cache_start_address 3840 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0x14e0 (5344) image_size 0x0 (0)
+coefficients_size 0x600 (1536) image_size 0x8000 (32768)
+image_cache_end_address 36352 image_cache_start_address 3584 image_cache_size 32768 oc_sram_size 262144
+coefficients_size 0xfb8 (4024) image_size 0x0 (0)
+coefficients_size 0x600 (1536) image_size 0x4800 (18432)
+image_cache_end_address 22016 image_cache_start_address 3584 image_cache_size 18432 oc_sram_size 262144
+coefficients_size 0xfb8 (4024) image_size 0x0 (0)
+coefficients_size 0x600 (1536) image_size 0x2800 (10240)
+image_cache_end_address 13824 image_cache_start_address 3584 image_cache_size 10240 oc_sram_size 262144
+coefficients_size 0xfb8 (4024) image_size 0x0 (0)
+coefficients_size 0x600 (1536) image_size 0x1800 (6144)
+image_cache_end_address 9728 image_cache_start_address 3584 image_cache_size 6144 oc_sram_size 262144
+coefficients_size 0xfb8 (4024) image_size 0x0 (0)
+coefficients_size 0x600 (1536) image_size 0x1000 (4096)
+image_cache_end_address 7680 image_cache_start_address 3584 image_cache_size 4096 oc_sram_size 262144
+coefficients_size 0xfb8 (4024) image_size 0x0 (0)
+logistic: input_width 1 tp_cores_used 1
+teflon: compiled graph, took 67 ms
+etnaviv: read 2 output tensors:
+  - 243
+  - 269
+Running the NN job took 11 ms.
+teflon: invoked graph, took 72 ms
+etnaviv: read 2 output tensors:
+  - 360
+  - 378
+Running the NN job took 8 ms.
+teflon: invoked graph, took 40 ms
+Found 1 image(s)
+[metadata] ssd-mn2-fpnlite_mc_phenobench_320_int8_ptq_per-tensor_regnms_no-native-resize.tflite: labels=['crop', 'weed'] norm(mean=[127.5], std=[127.5]) score_threshold=0.05000000074505806 iou=0.5 max_detections=100 nms=regular [labels:embedded, normalization:sidecar, postprocessing:sidecar]
+[runtime] loaded delegate: /usr/lib/libteflon.so
+
+=== OUTPUT DETAILS ===
+StatefulPartitionedCall:1 <class 'numpy.float32'> (0.0, 0) [  1 100]
+StatefulPartitionedCall:3 <class 'numpy.float32'> (0.0, 0) [  1 100   4]
+StatefulPartitionedCall:0 <class 'numpy.float32'> (0.0, 0) [1]
+StatefulPartitionedCall:2 <class 'numpy.float32'> (0.0, 0) [  1 100]
+[infer] input size: 320
+
+=== 05-15_00062_P0030859.png ===
+crop  score=0.969 box=[0, 52, 171, 218]
+crop  score=0.961 box=[604, 381, 726, 577]
+crop  score=0.938 box=[588, 635, 742, 829]
+crop  score=0.895 box=[14, 288, 168, 452]
+crop  score=0.871 box=[598, 1, 694, 108]
+crop  score=0.832 box=[611, 179, 688, 242]
+crop  score=0.828 box=[1, 519, 167, 679]
+weed  score=0.805 box=[789, 80, 885, 172]
+crop  score=0.781 box=[624, 846, 721, 991]
+weed  score=0.391 box=[89, 236, 126, 261]
+Rendered 10 detection(s) -> ssd-mn2-fpnlite_mc_phenobench_320_int8_ptq_per-tensor_regnms_no-native-resize-output/05-15_00062_P0030859.png
+
+Done. Outputs saved to: /tmp/agri-vision-edge/ssd-mn2-fpnlite_mc_phenobench_320_int8_ptq_per-tensor_regnms_no-native-resize-output
+
+#+end_example
+:end:
+
+
