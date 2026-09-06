@@ -1,54 +1,15 @@
 #!/usr/bin/env python3
 """
-Drive a power / resource sweep across three machines.
+Run power/resource sweeps across a dev host, meter host, and target board.
 
-Runs on the **dev host**, which reaches the other two by ssh and exports the
-repository over NFS::
+The dev host runs ``ave resources`` on the board over SSH/NFS and controls an
+FNB58 logger on the meter host. One power trace spans the sweep and is linked
+into each run directory.
 
-    dev host  ── ssh ─────────▶  lab server   (FNIRSI FNB58 on USB, inline on
-      │                           the board's supply line)
-      ├──────── ssh ─────────▶  target board  (runs `ave resources`)
-      └──────── NFS ─────────▶  target board  (repo + results, same paths)
+Clock alignment records SSH midpoint probes and board-side sync chirps.
+``power_report.py`` uses both to align and verify the trace.
 
-It starts the power logger once on the lab server, keeps it running across all
-selected inference loops on the board, then stops it and pulls one shared trace.
-That trace is linked into each newly executed run directory next to the board's
-own artifacts. The board writes its CSVs straight to the NFS mount, so nothing
-has to be copied back from it.
-
-Clock alignment
----------------
-The three hosts share no clock, and the power trace is timestamped in the *lab
-server's* ``CLOCK_MONOTONIC``, which has no defined origin at all. Two
-independent mechanisms are recorded so the join can be checked rather than
-trusted:
-
-1. **Offset probe.** Before and after each run, the lab server's epoch clock is
-   sampled over ssh several times; the sample with the smallest round trip wins
-   and the offset is its midpoint estimate, with ``rtt / 2`` as the error bound.
-   A paired ``(epoch, monotonic)`` reading taken on the lab server maps the
-   trace's ``t_ns`` onto that epoch clock. Probing on both sides of the run also
-   exposes drift over the run's duration.
-
-2. **Sync chirp.** ``ave resources`` saturates the board's cores for a moment
-   either side of the measured loop, which puts an unmistakable step into the
-   power trace at a timestamp the board recorded locally. ``power_report.py``
-   matches those edges and reports the residual against the probe estimate. If
-   the two disagree, the join is wrong and says so.
-
-Nothing here parses the power trace; this script only *collects*, in keeping
-with the rest of the pipeline (see ``scripts/benchmark_all.sh``). Run
-``scripts/power_report.py`` afterwards to join and summarise.
-
-Example
--------
-::
-
-    scripts/power_sweep.py \\
-        --device root@192.168.11.131 \\
-        --meter-host rlabD-srv \\
-        --device-repo /mnt/agri-vision-edge \\
-        --seconds 120 --cpu --dry-run
+This script only collects data; run ``scripts/power_report.py`` to summarize it.
 """
 
 from __future__ import annotations
@@ -75,7 +36,7 @@ CLOCK_SNIPPET = "import time; print(repr((time.time(), time.monotonic_ns())))"
 
 
 class Remote:
-    """A host reachable over ssh."""
+    """SSH host."""
 
     def __init__(self, target: str, ssh_options: list[str], python: str = "python3"):
         self.target = target
@@ -104,7 +65,7 @@ class Remote:
         )
 
     def script(self, body: str, *, timeout: float | None = 60.0):
-        """Run a multi-line shell script, avoiding a quoting nightmare."""
+        """Run a multi-line shell script over SSH."""
 
         return subprocess.run(
             [*self.ssh, "bash", "-s"],
@@ -116,13 +77,9 @@ class Remote:
 
 
 def probe_clock(remote: Remote, samples: int = 7) -> dict[str, Any]:
-    """
-    Estimate ``remote_epoch - local_epoch`` using the fastest round trip.
+    """Estimate ``remote_epoch - local_epoch`` from the lowest-RTT SSH sample.
 
-    Christian's algorithm: the remote reading is assumed to have happened at
-    the midpoint of the local send/receive pair, which is exact only if the
-    round trip is symmetric. The fastest sample is used because it is the one
-    least polluted by scheduling and queueing, and half of it bounds the error.
+    Uses the local round-trip midpoint; ``rtt / 2`` is the uncertainty bound.
     """
 
     best: dict[str, Any] | None = None
@@ -222,8 +179,8 @@ def probe_clock(remote: Remote, samples: int = 7) -> dict[str, Any]:
 #: settling point on both boards.
 #:
 #: fp32 rungs need ``--cpu``: the Teflon delegate claims float convolutions and
-#: returns NaN, so a delegated fp32 power figure describes a computation that
-#: did not happen.
+#: returns NaN, so a delegated fp32 power figure prices a run that executes but
+#: whose output is unusable.
 PRESETS: dict[str, list[str]] = {
     "arch-matrix": [
         "ssd-mn2_mc_phenobench_320_*",
@@ -244,21 +201,9 @@ PRESETS: dict[str, list[str]] = {
 #: An environment applied to one pass over the selected models, and the
 #: directory-name token that keeps its results apart from the others'.
 class Variant:
-    """
-    One named environment the sweep runs every model under.
+    """Named environment applied to each selected model.
 
-    The delegate is configurable at run time -- ``TEFLON_UNSUPPORTED_NODES`` and
-    ``TEFLON_UNSUPPORTED_OPS`` push individual nodes or whole operators back
-    onto the CPU -- and the question those switches exist to answer is *what
-    did that cost*. Answering it needs two runs of the **same file** that
-    differ in nothing but the environment, which is why a variant is a
-    first-class thing here rather than two invocations of this script: two
-    sweeps hours apart differ in die temperature and in ambient, and both move
-    power.
-
-    Interleaved per model (see the run loop) for the same reason: the pair
-    being compared should be adjacent in time, not separated by the rest of the
-    matrix.
+    Variants are interleaved per model so paired measurements are adjacent.
     """
 
     def __init__(self, name: str, env: dict[str, str]):
@@ -284,17 +229,7 @@ class Variant:
 
 
 def parse_variant(tokens: list[str], base_env: dict[str, str]) -> Variant:
-    """
-    ``--variant NAME KEY=VALUE ...`` -> a :class:`Variant`.
-
-    Each ``KEY=VALUE`` is its own argv item rather than a comma-separated list,
-    which is not cosmetic: the switch this feature exists for takes a comma
-    list of its own (``TEFLON_UNSUPPORTED_NODES=66,68,69,71-73,75``), and any
-    comma-splitting syntax would mangle it.
-
-    ``--env`` is merged first so it stays the sweep-wide baseline and a variant
-    can override one key of it without restating the rest.
-    """
+    """Parse ``--variant NAME KEY=VALUE ...`` and merge over ``base_env``."""
 
     if not tokens:
         raise argparse.ArgumentTypeError("--variant needs at least a name")
@@ -324,13 +259,7 @@ RUN_TIMEOUT_SLACK = 120.0
 
 
 def kill_remote_run(device: Remote, run_name: str) -> None:
-    """
-    Stop a board run the host has given up waiting for.
-
-    Killing ssh locally leaves the remote process running, holding the CPU the
-    *next* model is about to be measured on -- which would quietly corrupt
-    every subsequent run in the sweep rather than just the abandoned one.
-    """
+    """Kill a timed-out board run before the next measurement."""
 
     pattern = shlex.quote(run_name)
 
@@ -346,17 +275,7 @@ def kill_remote_run(device: Remote, run_name: str) -> None:
 def exclude_models(
     models: list[Path], patterns: list[str]
 ) -> tuple[list[Path], list[tuple[str, int]]]:
-    """
-    Drop models matching any of ``patterns``, reporting what each removed.
-
-    Subtractive selection, because the interesting exclusions are not
-    expressible as a glob over what remains: "everything except fp32" would
-    otherwise have to be spelled as a list of the four surviving schemes, which
-    silently stops being correct the next time a scheme is added.
-
-    The per-pattern counts are returned rather than discarded so a typo shows
-    up as ``-> 0 model(s)`` instead of quietly widening the sweep by hours.
-    """
+    """Drop matching models and return per-pattern removal counts."""
 
     counts: list[tuple[str, int]] = []
     kept = list(models)
@@ -370,15 +289,7 @@ def exclude_models(
 
 
 def collect_models(models_dir: Path, patterns: list[str] | None) -> list[Path]:
-    """
-    Resolve model selectors to .tflite paths.
-
-    Every model in ``artifacts/tflite`` sits beside a ``.metadata.json``
-    sidecar, so a natural selector like ``ssd-mn2_sc_*_int8_*`` matches twice
-    as many files as intended and half of them are not models. The suffix
-    filter is applied after globbing rather than expecting the caller to spell
-    it out.
-    """
+    """Resolve selectors to unique ``.tflite`` paths."""
 
     if patterns:
         selected: list[Path] = []
@@ -507,7 +418,7 @@ def main(argv=None) -> int:
             "corners come out of a full sweep: '--exclude *_fp32_*' drops the "
             "25 float exports, which the Teflon delegate cannot execute — it "
             "claims the float convolutions and returns NaN, so those runs cost "
-            "the most wall time and measure a computation that did not happen "
+            "the most wall time while producing unusable output "
             "(use --cpu to price fp32 properly, in its own sweep)"
         ),
     )
@@ -963,20 +874,7 @@ def main(argv=None) -> int:
         )
 
     def stop_meter_and_wait(pid: int | None) -> None:
-        """
-        Stop the logger, escalating rather than waiting forever.
-
-        SIGINT first and only once, so the logger can finalize its gzip stream;
-        the stop file records that it was sent so a retry does not interrupt the
-        finalization it is waiting for. But INT is not always deliverable: a
-        logger blocked in an uninterruptible USB read -- a misbehaving meter,
-        which is the case worth surviving -- stays in ``D`` state with the
-        signal pending, and the original unbounded wait then hung the sweep at
-        "awaiting cleanup" with local Ctrl-C caught and ignored.
-
-        So each stage is bounded, and TERM then KILL follow. Losing the gzip
-        footer of a trace costs its tail; hanging costs the sweep.
-        """
+        """Stop the meter logger with bounded INT, TERM, then KILL escalation."""
 
         pid_source = str(pid) if pid is not None else f"$(cat {remote_pid_file})"
         grace = max(args.meter_stop_grace, 1.0)
