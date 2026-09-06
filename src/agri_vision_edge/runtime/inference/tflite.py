@@ -295,8 +295,12 @@ class TFLiteRuntime(BaseRuntime):
 
         self.interpreter.invoke()
 
-        # The only phase that is actually the model. On a delegated run this is
-        # the NPU; everything either side of it is the CPU regardless.
+        # The whole graph, and the only phase that is actually the model.
+        # Not the accelerator alone, though: any operation the delegate
+        # refuses runs here too, on the CPU. On these SSD exports that is at
+        # least `TFLite_Detection_PostProcess` and the dequantize pair at the
+        # float boundary. What lies either side of this phase is the surrounding
+        # Python pipeline, which no delegate ever sees.
         self._phase("invoke", invoke_start)
 
         raw_scores = self.interpreter.get_tensor(self.output_details[0]["index"])
