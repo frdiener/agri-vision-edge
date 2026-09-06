@@ -7,32 +7,29 @@ app = marimo.App(width="medium")
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # Benchmark Analysis — Weed Detection on Embedded NPUs
+    # Benchmark analysis: weed detection on embedded NPUs
 
-    Tables and figures for Chapter 6, built from the artifacts of `ave benchmark`
-    (`latency.json`, `runtime.json`, `predictions.json`) and `ave evaluate`
-    (`metrics.json`, and `metrics_faithful.json` under `--faithful`). The analysis
-    itself is `agri_vision_edge.evaluation.benchmark_report`, imported as `br`.
+    Chapter 6 tables and figures, generated from `ave benchmark` and `ave evaluate`
+    artifacts. Analysis functions are imported from
+    `agri_vision_edge.evaluation.benchmark_report` as `br`.
 
-    ## The argument
+    ## Contents
 
-    | § | question | artifact |
+    | § | topic | artifact |
     |---|---|---|
-    | **0** | which runs are admissible | `sanity_checks` |
-    | **1** | float accuracy of the trained detector | `baseline` |
-    | **2** | cost of conversion and post-training quantization | `preparation_ladder`, `nms_substitution` |
-    | **3** | how much of it QAT reclaims | `qat_reclaim` |
-    | **4** | which exports the accelerator executes correctly | `deployability` |
-    | **5** | what the survivors cost, CPU against NPU | `device_latency`, `nms_latency_tradeoff` |
-    | **6** | whether class count or tiling changes any of it | `story_ablation` |
-
-    §1-§5 hold one configuration fixed; §6 varies it one axis at a time. §7 holds
-    measurements not yet joined to the argument.
+    | 0 | admissible runs | `sanity_checks` |
+    | 1 | float baseline | `baseline` |
+    | 2 | conversion and PTQ | `preparation_ladder_ptq`, `scheme_comparison` |
+    | 3 | QAT and NMS accuracy | `qat_reclaim`, `nms_substitution` |
+    | 4 | accelerator correctness | `deployability` |
+    | 5 | CPU and NPU cost | `device_latency`, `resource_summary` |
+    | 6 | class, tiling, NMS, and resolution ablations | `story_ablation`, `nms_latency_tradeoff` |
 
     ## Reference configuration
 
-    > **multi-class - trained full-frame - evaluated full-frame - 320x320**
-    > (`br.REFERENCE_CONFIG`)
+    **Multi-class, trained and evaluated full-frame, 320×320**
+    (`br.REFERENCE_CONFIG`). Sections 1–5 use this configuration; section 6 varies
+    one axis at a time.
 
     ## Run grammar
 
@@ -45,22 +42,19 @@ def _(mo):
 
     | axis | token | meaning |
     |---|---|---|
-    | **trained on** | `<dataset>` = `phenobench` / `phenobench-tiled` | finetuning data |
-    | **evaluated on** | `<tiling>` = `untiled` / `tiled` | input regime at benchmark time |
-    | **export scheme** | `<precision>_<quant>[_<granularity>]` | quantization that produced the file |
-    | **post-processing** | `<nms>` = `fastnms` / `regnms` | NMS compiled into the exported graph |
+    | **training data** | `<dataset>` = `phenobench` / `phenobench-tiled` | fine-tuning input |
+    | **evaluation input** | `<tiling>` = `untiled` / `tiled` | benchmark input |
+    | **export** | `<precision>_<quant>[_<granularity>]` | precision and quantization |
+    | **post-processing** | `<nms>` = `fastnms` / `regnms` | NMS in the exported graph |
 
-    `fastnms` and `regnms` are a matched pair off one checkpoint, graph and
-    calibration set, and are therefore identical in every field a table groups on:
-    unscoped, 224 of 590 configuration groups carry a silent duplicate. Every view
-    below resolves to one of the two.
+    `fastnms` and `regnms` use the same checkpoint, graph, and calibration set.
+    Each view selects one unless a comparison requires both.
 
     ## Metric families
 
-    - **pycocotools** (`AP`, `AP50`, `weed_AP`, ...) - every comparison made here.
-    - **official PhenoBench** (`faithful_*`) - the upstream torchmetrics evaluator,
-      cited only against the published baselines in §1. A separate metric stack,
-      not comparable to the above.
+    - **pycocotools** (`AP`, `AP50`, `weed_AP`, ...): all comparisons except §1.
+    - **PhenoBench** (`faithful_*`): used only for the published-baseline comparison
+      in §1; not comparable to pycocotools metrics.
 
     Figures export to `docs/thesis/figures/benchmarks/`, tables to
     `docs/thesis/tables/`.
@@ -84,7 +78,7 @@ def _():
 
 @app.cell(hide_code=True)
 def _(Path, br):
-    # --- Locations & options ---------------------------------------------
+    # Paths and options
     def _find_repo_root() -> Path:
         here = Path.cwd().resolve()
         for candidate in (here, *here.parents):
@@ -98,21 +92,17 @@ def _(Path, br):
     FIG_DIR = REPO_ROOT / "docs" / "thesis" / "figures" / "benchmarks"
     TAB_DIR = REPO_ROOT / "docs" / "thesis" / "tables"
 
-    # Where `power_sweep.py` / `power_report.py` land. Absent until the power
-    # measurements are run -- §5.3 degrades to a note rather than failing.
+    # Power results are optional; §5.3 shows a note when they are absent.
     RESOURCE_ROOT = REPO_ROOT / "resource_results"
 
-    # The evaluation set, for the qualitative gallery of §8.5 only. It lives
-    # outside the repo because it is the licensed dataset, so the figure degrades
-    # to a note when it is not mounted rather than failing the notebook.
-    # `test_annotations.json` is the *internal* test half of PhenoBench's val
-    # split -- the official test split ships no labels -- which is why the frames
-    # come from `val/images`.
+    # Optional licensed evaluation data for §8.5. `test_annotations.json` is the
+    # internal test half of the PhenoBench validation split; the official test
+    # split has no labels.
     _DATASETS = REPO_ROOT.parent.parent / "datasets"
     GT_ANNOTATIONS = _DATASETS / "phenobench_multiclass" / "test_annotations.json"
     IMAGE_ROOT = _DATASETS / "PhenoBench" / "val" / "images"
 
-    # Write figures/tables to the repo on run (set False to preview only).
+    # Set to False to preview without writing files.
     SAVE_ARTIFACTS = True
 
     br.apply_publication_style()
@@ -130,25 +120,14 @@ def _(Path, br):
 
 @app.cell(hide_code=True)
 def _(BENCHMARK_ROOT, br):
-    # One frame holds every run. Each table and figure below declares its own
-    # scope through `view(...)`; `runs` itself appears only where the scope is
-    # literally everything, which is the integrity gate of §0.
+    # Each analysis selects its scope through `view(...)`.
     runs, skipped = br.load_benchmark_results(BENCHMARK_ROOT)
 
-    # The configuration this analysis presents: per-class NMS. Both variants are
-    # deployable and both were flashed; `br.DEFAULT_NMS` stays what `ave convert`
-    # emits unasked (`fastnms`). The two differ in AP and in latency -- §5.3.
+    # Report per-class NMS. `br.DEFAULT_NMS` remains the `ave convert` default.
     NMS = br.REGULAR_NMS
 
-    # Kept out of every default view. `tf-savedmodel-nms0` is a second copy of the
-    # SavedModel rung, which would duplicate it in any aggregation grouped by
-    # stage; it carries the NMS score floor removed, and answers a question settled
-    # elsewhere. `frdm-imx93_vendor-stack` is the same board under the *vendor*
-    # stack (`libethosu_delegate.so`) rather than the mainline Mesa/Teflon path
-    # this analysis is about -- a different backend, not a different operating
-    # point, so it cannot share an axis with the Teflon trees without silently
-    # comparing two toolchains. It is not discussed here yet; `controls=True`
-    # admits it when it is.
+    # Exclude a duplicate SavedModel control and the i.MX93 vendor backend from
+    # comparative views. `controls=True` includes them in inventory tables.
     CONTROL_TREES = ("tf-savedmodel-nms0", "frdm-imx93_vendor-stack")
 
 
@@ -163,15 +142,12 @@ def _(BENCHMARK_ROOT, br):
     ):
         """Scoped slice of `runs`.
 
-        nms         `regnms` per-class (presented) | `fastnms` toolchain default | `both`
-        archs       `primary` the two compared SSDs | `aux` the YOLO reference | None
-        controls    admit CONTROL_TREES
-        ref         pin `br.REFERENCE_CONFIG`; pass a dict to override single axes
-        deployable  drop what §4 measured as executed incorrectly on its target
-        **where     equality filter on any column; a list/tuple/set means membership
-
-        `deployable` is opt-in rather than default so that every comparison states
-        in its own scope line what it excluded.
+        nms         `regnms`, `fastnms`, or `both`
+        archs       `primary`, `aux`, or None
+        controls    include CONTROL_TREES
+        ref         apply `br.REFERENCE_CONFIG`; a dict overrides selected axes
+        deployable  exclude incorrect target executions
+        **where     equality filters; sequences use membership
         """
         out = runs
         if not controls:
@@ -182,8 +158,7 @@ def _(BENCHMARK_ROOT, br):
             out = out[out["arch"].isin(br.PRIMARY_ARCHS)]
         elif archs == "aux":
             out = out[~out["arch"].isin(br.PRIMARY_ARCHS)]
-        # Before any `where`: the verdict is relative to the CPU reference tree,
-        # which a platform filter would have removed.
+        # Apply correctness before platform filters; verdicts require the CPU row.
         if deployable:
             out = br.drop_failed_deployments(out)
         for _col, _val in where.items():
@@ -201,19 +176,17 @@ def _(BENCHMARK_ROOT, br):
 
 @app.cell(hide_code=True)
 def _(FIG_DIR, SAVE_ARTIFACTS, TAB_DIR, br):
-    # Small wrappers so each analysis cell stays a one-liner.
     def show_fig(fig, stem, mo, **save_kwargs):
-        # `save_kwargs` reaches `br.save_figure`: the photographic gallery needs
-        # `formats=("png",)` and its own dpi, every plot wants the vector default.
+        # Galleries override the default vector format through `save_kwargs`.
         if fig is None:
-            return mo.md(f"_Not enough data yet for **{stem}** — skipped._")
+            return mo.md(f"_No data for `{stem}`._")
         if SAVE_ARTIFACTS:
             br.save_figure(fig, stem, FIG_DIR, **save_kwargs)
         return fig
 
     def show_table(df, name, mo, caption="", label="", **latex_kwargs):
         if df is None or df.empty:
-            return mo.md(f"_No rows for **{name}** yet — skipped._")
+            return mo.md(f"_No rows for `{name}`._")
         if SAVE_ARTIFACTS:
             br.save_latex_table(
                 df,
@@ -227,22 +200,13 @@ def _(FIG_DIR, SAVE_ARTIFACTS, TAB_DIR, br):
     return show_fig, show_table
 
 
-@app.cell
-def _(runs):
-    runs  # noqa: B018 - bare name is how a marimo cell renders a value
-    return
-
-
 @app.cell(hide_code=True)
 def _(NMS, br, mo, runs, skipped, view):
     _platforms = sorted(runs["platform"].unique())
     _archs = sorted(runs["arch_label"].unique())
     _sizes = sorted(runs["size"].dropna().unique())
 
-    # Only a tree that carries NMS tokens can be missing one. The SavedModel rung
-    # has none: it *is* the checkpoint's per-class suppressor, with no fast-NMS
-    # counterpart to lack, which is why `select_nms` passes untokened rows through
-    # either scope untouched.
+    # SavedModel rows have no NMS token and pass through either NMS scope.
     _tokened = runs[runs["nms"].notna()]
     _missing = [
         p
@@ -253,19 +217,18 @@ def _(NMS, br, mo, runs, skipped, view):
     mo.md(f"""
     ## Data
 
-    **{len(runs)}** runs over **{len(_platforms)}** platforms
+    **{len(runs)}** runs on **{len(_platforms)}** platforms
     ({", ".join(f"`{p}`" for p in _platforms)}); architectures
     {", ".join(_archs)}; input sizes {", ".join(f"`{s}`" for s in _sizes)}.
 
-    `view()` with no arguments resolves to **{len(view())}** of them — `{NMS}`
-    post-processing, the two compared architectures, control trees out.
-    A further **{len(skipped)}** run directories carried no `metrics.json` (§0.2).
+    Default scope: **{len(view())}** runs, `{NMS}` post-processing, primary
+    architectures, and no control trees. **{len(skipped)}** directories lack
+    `metrics.json` (§0.2).
 
     Reference configuration: **{br.REFERENCE_CONFIG}**.
 
-    {"**Carry only the other post-processing variant:** " + ", ".join(f"`{p}`" for p in _missing) +
-     " — sections scoped to those trees render empty until their `" + NMS + "` sweeps land."
-     if _missing else "Every tree that distinguishes the two variants carries the presented one."}
+    {"Missing `" + NMS + "` runs: " + ", ".join(f"`{p}`" for p in _missing) + "."
+     if _missing else "All NMS-aware trees include the selected variant."}
     """)
     return
 
@@ -275,10 +238,9 @@ def _(mo):
     mo.md("""
     ## 0 · Integrity gate
 
-    `pycocotools` matches a detection with `if iou < threshold: continue`. A `NaN`
-    IoU fails that test, so non-finite boxes are accepted at every threshold and
-    the run scores *higher* than a working one — measured `AP 85.8`, fingerprint
-    `AP == AP50`.
+    `pycocotools` can accept non-finite boxes at every IoU threshold because a
+    `NaN` comparison is false. Affected runs can score spuriously high (observed:
+    `AP 85.8`, with `AP == AP50`).
 
     | check | severity | condition |
     |---|---|---|
@@ -291,9 +253,8 @@ def _(mo):
     | `faithful-divergence` | warning | the two evaluators disagree beyond their implementations |
     | `latency-outliers` | info | disturbed timing run; median/p95 unaffected, mean is not |
 
-    Evaluated on `runs` unscoped. Empty means nothing was flagged, not that
-    everything is correct. `backend` records that the delegate library loaded, not
-    which subgraph it accepted.
+    Checks run on the full data set. An empty result means no issue was detected.
+    `backend` confirms that the delegate loaded, not which subgraph it accepted.
     """)
     return
 
@@ -335,9 +296,9 @@ def _(mo, skipped):
     mo.md(f"""
     ### 0.2 · Runs without metrics
 
-    **{len(skipped)}** run directories, all float graphs on an i.MX8M Plus delegate
-    tree. `ave evaluate` withholds `metrics.json` on non-finite boxes; §4 carries
-    them as `unscoreable`.
+    **{len(skipped)}** directories, all float graphs on an i.MX8M Plus delegate.
+    `ave evaluate` omits `metrics.json` for non-finite boxes; §4 marks these runs
+    `unscoreable`.
     """)
     return
 
@@ -374,21 +335,14 @@ def _(mo, pd, skipped):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # 1 · The float baseline
+    # 1 · Float baseline
 
-    Fine-tuned float accuracy, taken from the checkpoint's own graph before
-    TensorFlow Lite is involved (`benchmark_results/tf-savedmodel/`, training-time
-    decoding and per-class NMS), beside the detectors published with PhenoBench.
-    Official PhenoBench metrics (`faithful_*`), the only table here that does not
-    use pycocotools — the published rows were produced with that evaluator.
+    Fine-tuned SavedModel accuracy before TFLite conversion, compared with the
+    published PhenoBench detectors using official PhenoBench metrics (`faithful_*`).
+    The plain detector has 320/512/1024 exports; FPNLite has 320/512.
 
-    Rows are the input-resolution ladder at multi-class, full-frame training and
-    evaluation. It is ragged: `artifacts/tf` currently holds 320/512/1024 for the
-    plain detector and 320/512 for FPNLite.
-
-    Upstream rows are the withheld official test split at full resolution; *this
-    work* is the internal test split derived from the validation partition. The
-    `Source` column carries the distinction.
+    Published results use the withheld test split at full resolution. This work
+    uses an internal test split from the validation partition; see `Source`.
     """)
     return
 
@@ -399,12 +353,10 @@ def _(br, mo, show_table, view):
         br.baseline_table(view()),
         "baseline",
         mo,
-        caption="Fine-tuned float accuracy of the two detectors across input "
-        "resolution, against the baselines published with PhenoBench; multi-class, "
-        "full-frame evaluation, official PhenoBench metrics. Upstream figures are "
-        "on the withheld official test set, those obtained here on the internal "
-        "test split derived from the official validation partition; the comparison "
-        "is indicative rather than a leaderboard result.",
+        caption="Fine-tuned float accuracy across input resolutions using official "
+        "PhenoBench metrics. Published results use the withheld test set; this "
+        "work uses an internal split of the validation set, so the values are not "
+        "directly comparable.",
     )
     return
 
@@ -414,20 +366,15 @@ def _(mo):
     mo.md("""
     # 2 · Conversion and post-training quantization
 
-    What it costs to get from the checkpoint to a deployable INT8 file, measured on
-    the CPU reference with the accelerator held out — a statement about the
-    *export*. §4 and §5 bring the hardware in.
+    Export effects measured on the CPU reference. Accelerator results follow in
+    §4 and §5.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(br, mo, view):
-    # §2, §3 and §5 report one CPU curve as the unaccelerated reference for every
-    # board. Legitimate only while the per-board `<board>_cpu` trees agree with it,
-    # so it is checked rather than assumed. Scoped to the default export: the
-    # `_cpu` trees carry no per-class runs, and agreement is a property of the
-    # hardware, not of the post-processing.
+    # Verify the shared CPU reference against each board's CPU-only runs.
     _div = br.cpu_reference_divergence(view(archs=None, nms=br.DEFAULT_NMS))
 
     if _div.empty:
@@ -460,8 +407,8 @@ def _(NMS, br, mo):
     mo.md(f"""
     ### 2.1 · The preparation ladder
 
-    Every rung runs **{br.NMS_LABELS[NMS].lower()}**, so the float step prices the
-    format conversion alone and the INT8 steps price precision alone.
+    All rungs use **{br.NMS_LABELS[NMS].lower()}**, isolating format conversion at
+    the float step and precision at the INT8 steps.
 
     | rung | isolates |
     |---|---|
@@ -469,8 +416,7 @@ def _(NMS, br, mo):
     | ↓ Float TFLite | conversion, at matched post-processing |
     | ↓ INT8 PTQ, per-channel / per-tensor | precision, at each weight granularity |
 
-    INT8 rows are quoted against the float TFLite rung rather than against each
-    other: they are alternative exports of one model, not a chain.
+    INT8 changes are relative to float TFLite; the INT8 exports are alternatives.
     """)
     return
 
@@ -481,9 +427,8 @@ def _(NMS, br, mo, show_table, view):
         br.preparation_ladder_table(view(), include_qat=False, nms=NMS),
         "preparation_ladder_ptq",
         mo,
-        caption="Accuracy along the conversion and post-training quantization "
-        "ladder at the reference configuration, all rungs at per-class NMS. INT8 "
-        "rows are quoted against the float TFLite rung.",
+        caption="Accuracy after conversion and PTQ at the reference configuration. "
+        "All rungs use per-class NMS; INT8 changes are relative to float TFLite.",
     )
     return
 
@@ -493,8 +438,8 @@ def _(mo):
     mo.md("""
     ### 2.2 · Granularity across the matrix
 
-    The per-scheme view over every variant, beside the single reference cell.
-    Expected ordering is `fp32 >= per-channel >= per-tensor`.
+    Quantization schemes across all variants and at the reference configuration.
+    Expected order: `fp32 >= per-channel >= per-tensor`.
     """)
     return
 
@@ -510,9 +455,8 @@ def _(NMS, br, mo, show_table, view):
         ),
         "scheme_comparison_untiled",
         mo,
-        caption="Detection quality per quantization scheme on the CPU reference, "
-        "multi-class and trained full-frame, across input resolution; relative "
-        "change is against each variant's own FP32 baseline.",
+        caption="Detection quality by quantization scheme and input resolution on "
+        "the CPU reference. Changes are relative to each variant's FP32 baseline.",
     )
     return
 
@@ -532,17 +476,15 @@ def _(NMS, br, mo, show_fig, view):
 @app.cell(hide_code=True)
 def _(br, mo):
     mo.md(f"""
-    # 3 · What QAT reclaims
+    # 3 · QAT recovery
 
-    `Reclaimed` is QAT minus PTQ at equal granularity; `Reclaimed %` puts that
-    against the PTQ deficit, so ~100 % closes it and a negative value means QAT
-    lost ground.
+    `Reclaimed` is QAT minus PTQ at equal granularity. `Reclaimed %` divides that
+    difference by the PTQ deficit; 100% closes the deficit and negative values
+    indicate lower QAT accuracy.
 
-    `Reclaimed %` is empty where the PTQ deficit was under
-    **{br.QAT_RECLAIM_MIN_DEFICIT} AP** — the denominator is then noise and the
-    ratio explodes. The test uses the unrounded cost, so the FPNLite per-channel
-    row is suppressed at a displayed `-0.10` (it is -0.0997, and its +0.45 reclaim
-    over that would read 451 %). `Reclaimed` still carries the absolute change.
+    Percent recovery is omitted when the unrounded PTQ deficit is below
+    **{br.QAT_RECLAIM_MIN_DEFICIT} AP**. The absolute change remains available in
+    `Reclaimed`.
 
     Reference configuration, per-class NMS, CPU reference.
     """)
@@ -555,9 +497,8 @@ def _(NMS, br, mo, show_table, view):
         br.qat_reclaim_table(view(), nms=NMS),
         "qat_reclaim",
         mo,
-        caption="What quantization-aware training recovers of the post-training "
-        "quantization deficit, per architecture and weight granularity, at the "
-        "reference configuration.",
+        caption="QAT recovery of the PTQ deficit by architecture and weight "
+        "granularity at the reference configuration.",
     )
     return
 
@@ -567,9 +508,8 @@ def _(mo):
     mo.md("""
     ### 3.1 · The full preparation chain
 
-    §2.1's ladder continued through both quantization methods and both weight
-    granularities. INT8 rows are quoted against the float TFLite rung, not against
-    each other.
+    The §2.1 ladder extended to PTQ and QAT at both weight granularities. INT8
+    changes are relative to float TFLite.
     """)
     return
 
@@ -580,9 +520,8 @@ def _(NMS, br, mo, show_table, view):
         br.preparation_ladder_table(view(), nms=NMS),
         "preparation_ladder",
         mo,
-        caption="Accuracy along the full preparation chain at the reference "
-        "configuration, conversion through both quantization methods and both "
-        "weight granularities, all rungs at per-class NMS.",
+        caption="Accuracy after conversion, PTQ, and QAT at both weight "
+        "granularities. Reference configuration with per-class NMS.",
     )
     return
 
@@ -590,23 +529,15 @@ def _(NMS, br, mo, show_table, view):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 3.2 · The post-processing alternative, in accuracy
+    ### 3.2 · NMS accuracy
 
-    Both §2's conversion rung and §3's QAT rows were measured at per-class NMS.
-    The exported default is the other one: `ave convert` emits
-    `use_regular_nms=False` unless told otherwise, making a single class-agnostic
-    pass over each anchor's argmax class where the checkpoint suppresses per class.
-    SSD regresses one box per anchor and shares it across classes, so an anchor's
-    crop and weed hypotheses are the *same box* and only the higher-scoring one
-    survives — the cost falls on the suppressed class.
+    `ave convert` defaults to `use_regular_nms=False`: one class-agnostic pass over
+    each anchor's highest-scoring class. The checkpoint instead suppresses each
+    class separately. Because SSD shares one box per anchor across classes, fast
+    NMS removes the lower-scoring class hypothesis.
 
-    At the reference configuration, multi-class and full-frame. At one class the
-    two algorithms coincide and the difference is identically zero; §0's
-    `nms-control-broken` check enforces that, and §6 carries the single-class and
-    tiled rows.
-
-    Both variants are deployable and both were flashed. What the default buys in
-    latency is priced in §5.3; this is the half it costs.
+    Results use the reference configuration. The methods are identical for a
+    single class; `nms-control-broken` checks this. §6.3 reports latency.
     """)
     return
 
@@ -619,17 +550,15 @@ def _(br, mo, show_table, view):
         ),
         "nms_substitution_summary",
         mo,
-        caption="Accuracy cost of the exported post-processing substitution (fast "
-        "NMS minus per-class NMS) per architecture and input resolution, at the "
-        "reference configuration.",
+        caption="Accuracy difference between fast and per-class NMS by architecture "
+        "and input resolution at the reference configuration.",
     )
     return
 
 
 @app.cell(hide_code=True)
 def _(br, mo, show_fig, view):
-    # Pinned to the reference cell: the figure groups by scheme, so a frame
-    # spanning resolutions would average them into each bar without saying so.
+    # Pin resolution because the plot groups only by scheme.
     show_fig(br.plot_nms_substitution(view(nms="both", ref=True)), "nms_substitution", mo)
     return
 
@@ -637,10 +566,9 @@ def _(br, mo, show_fig, view):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # 4 · What the accelerators execute correctly
+    # 4 · Accelerator correctness
 
-    Verdicts are relative to the **same file on the CPU reference**, which
-    separates "this accelerator broke it" from "this export was always weak".
+    Each verdict compares the accelerator with the same file on the CPU reference.
 
     | verdict | meaning |
     |---|---|
@@ -650,23 +578,15 @@ def _(mo):
     | `unscoreable` | ran, but the output is not a detection; §0 withheld `metrics.json` |
     | `-` | not benchmarked |
 
-    `unscoreable` is recovered from §0.2's skip list: a refused run leaves no row in
-    the results frame, so without that recovery the cell would read as "never
-    benchmarked".
+    `unscoreable` runs are recovered from the §0.2 skip list because they have no
+    metrics row.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(CONTROL_TREES, NMS, br, runs, skipped, view):
-    # Boards only -- a `<board>_cpu` tree is the comparison, not a target, and the
-    # `_unpatched` trees are a different delegate build (§4.3). Scoped to the
-    # reference training configuration, as §2 and §3 are.
-    #
-    # `CONTROL_TREES` is subtracted rather than assumed absent: the prefix test
-    # below selects on the vendor-and-board naming of the directory, which a tree
-    # can satisfy while still not being a target of this analysis --
-    # `frdm-imx93_vendor-stack` is the same board under a different toolchain.
+    # Select target boards; exclude CPU, unpatched, and alternate-backend trees.
     deploy_boards = [
         p
         for p in sorted(runs["platform"].unique())
@@ -700,9 +620,8 @@ def _(deployability, mo, show_table):
         deployability,
         "deployability",
         mo,
-        caption="Which exports each target executes correctly (full-frame "
-        "input, deployed post-processing), judged against the same file on the "
-        "CPU reference.",
+        caption="Export correctness on each target relative to the same file on "
+        "the CPU reference. Full-frame input with deployed post-processing.",
     )
     return
 
@@ -710,18 +629,16 @@ def _(deployability, mo, show_table):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 4.2 · What the delegates do to the exports that survive
+    ### 4.2 · Delegate accuracy
 
-    INT8 only — the sole precision a delegate accelerates. Equal bar heights mean
-    the accelerator reproduced its CPU reference.
+    INT8 only. Equal bar heights indicate agreement with the CPU reference.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(NMS, br, mo, show_fig, view):
-    # Reference cell: the boards carry 320 only, so a wider scope adds rows with a
-    # CPU bar and no NPU bar to a CPU-vs-NPU figure.
+    # Use the reference resolution available on all boards.
     show_fig(
         br.plot_backend_effect(view(nms="both", ref=True), nms=NMS),
         "backend_effect",
@@ -733,50 +650,27 @@ def _(NMS, br, mo, show_fig, view):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 4.3 · The Mesa/Teflon operator-support delta
+    ### 4.3 · Mesa/Teflon operator support
 
-    `frdm-imx8mp_unpatched` is the same board with the delegate built before the
-    operator support added in thesis §5.5, so the pair prices that work in two
-    currencies: configurations that changed verdict, and what the ones that already
-    worked now cost.
+    `frdm-imx8mp_unpatched` uses the delegate build from before the operator-support
+    changes in thesis §5.5. The table reports verdict changes and latency by
+    architecture; pooling architectures would hide their different responses.
 
-    Rows are resolved **per architecture**. The plain head and FPNLite do not
-    respond to the rebuild alike — on per-tensor it moved `ssd-mn2` by −30.5 % and
-    FPNLite by −60.6 % — so a pooled median would belong to neither.
+    `ms before` and `ms after` include every configuration timed by both builds,
+    including collapsed runs. Their latency still measures dispatch and CPU–NPU
+    transfer, but their accuracy is invalid. `Before` and `After` provide the
+    corresponding correctness verdicts.
 
-    `ms before` / `ms after` cover every configuration **both builds timed**, not
-    only the ones both executed correctly. A collapsed run's wall clock is still a
-    real measurement of dispatch and CPU↔NPU tensor movement, which is exactly the
-    cost this rebuild shifts; it is the *accuracy* of a collapsed run that is
-    worthless, not its clock. Read the two medians against `Before` / `After`,
-    which say what correctness each side had — and note that FPNLite, which
-    fragments hardest under the older build, is also what the rebuild reclaims most
-    from.
-
-    Scoped to the i.MX8M Plus at **320×320**, default export. The i.MX93 runs a
-    different backend (Ethos-U rather than Vivante) whose rebuild is a separate
-    question, and the resolution ladder is §6.4's axis — the `_unpatched` tree was
-    only ever swept at 320 in any case.
+    Scope: i.MX8M Plus, 320×320, default export. The i.MX93 uses a different
+    backend, and the unpatched tree was measured only at 320×320.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(br, mo, show_table, skipped, view):
-    # Scope: the i.MX8M Plus pair only (the i.MX93 delegate is a different backend
-    # and its rebuild is not this question), 320 only (the resolution ladder is
-    # §6.4's axis, not this one), default export (`_unpatched` carries no per-class
-    # runs).
-    #
-    # `br.CPU_REFERENCE_PLATFORM` stays in the frame although it is never a column:
-    # every verdict is scored against it, and `deployability_matrix` falls back to
-    # `ok` for a configuration it cannot find a baseline for. Drop it and the whole
-    # table reads `ok` -> `ok`, `Fixed = 0` -- the rebuild appears to have done
-    # nothing.
-    #
-    # `paired` latency, not `ok-both`: a collapsed run's wall clock is still a real
-    # measurement of dispatch and CPU<->NPU tensor movement, which is the cost the
-    # rebuild is meant to shift.
+    # Keep the CPU reference for verdicts. `paired` latency includes collapsed
+    # runs because their execution time remains valid.
     show_table(
         br.delegate_build_table(
             view(
@@ -799,53 +693,38 @@ def _(br, mo, show_table, skipped, view):
         ),
         "delegate_build_delta",
         mo,
-        caption="Effect of the Mesa/Teflon operator-support work on the i.MX8M "
-        "Plus at 320x320, per architecture and export scheme: verdict transitions, "
-        "and median latency over the configurations both delegate builds timed.",
+        caption="Effect of the Mesa/Teflon operator-support changes on the i.MX8M "
+        "Plus at 320x320: correctness transitions and paired median latency by "
+        "architecture and export scheme.",
     )
     return
 
 
 @app.cell(hide_code=True)
 def _(BENCHMARK_ROOT, dg):
-    # Continuity is read from the delegate's own verbose diagnostics
-    # (`delegate_debug.log`), not from `metrics.json`, so it needs its own parse
-    # rather than a slice of `runs`.
+    # Parse delegation continuity from `delegate_debug.log`.
     delegation = dg.load_delegation(BENCHMARK_ROOT)
     return (delegation,)
 
 
 @app.cell(hide_code=True)
 def _(br, delegation, dg, mo, show_table):
-    # One row per (architecture, scheme). Continuity is a property of the graph
-    # the delegate was handed, so it cannot vary with class regime, NMS variant
-    # or evaluation tiling -- and does not: within every (architecture, scheme)
-    # group of this frame, `Ops`, `Delegated`, `K` and `Largest` each take
-    # exactly one distinct value. The repeats are the same measurement seen
-    # again, so one is kept rather than averaged.
-    #
-    # The auxiliary YOLO exports are dropped for the same reason they are
-    # everywhere else: they are a reference point, not part of the controlled
-    # SSD comparison.
+    # Continuity is constant by architecture and scheme; remove repeated parses
+    # across class, NMS, and tiling variants. Exclude auxiliary architectures.
     _primary = [br.ARCH_LABELS[a] for a in br.PRIMARY_ARCHS]
 
     _captions = {
         "frdm-imx8mp": (
-            "Delegation continuity on the i.MX8M Plus, full-frame input, "
-            "per-class post-processing. $R_{ops}$ is the delegated share of all "
-            "operations; $K$ the number of delegated regions; $R_{largest}$ the "
-            "share of delegated operations in the largest region. Runtime "
-            "partitioning makes $K$ a measured quantity on this backend."
+            "Delegation continuity on the i.MX8M Plus with full-frame input and "
+            "per-class NMS. $R_{ops}$ is the delegated operation share, $K$ the "
+            "number of delegated regions, and $R_{largest}$ the share in the "
+            "largest region."
         ),
         "frdm-imx93": (
-            "Delegation continuity on the i.MX93, full-frame input, per-class "
-            "post-processing. Columns are as in "
-            "\\cref{tab:continuity_imx8mp}. $K$ is measured here too, being read "
-            "off the same per-region partition dump: $K=1$ records that the "
-            "accepted set is contiguous, not a limitation of the backend, which "
-            "splits the graph into two regions for the auxiliary YOLOv7-tiny "
-            "exports. The float rows are delegated nowhere, so their continuity "
-            "columns are empty."
+            "Delegation continuity on the i.MX93 with full-frame input and "
+            "per-class NMS. Columns follow \\cref{tab:continuity_imx8mp}. $K=1$ "
+            "means the accepted operations form one region. Float rows are not "
+            "delegated, so their continuity fields are empty."
         ),
     }
 
@@ -854,9 +733,7 @@ def _(br, delegation, dg, mo, show_table):
         if not _table.empty:
             _table = _table[_table["Architecture"].isin(_primary)]
             _table = _table.drop_duplicates(["Architecture", "Scheme"])
-            # Positional index of the parsed log, i.e. how many files happened to
-            # sort ahead of this one. It changes whenever logs are re-collected
-            # and means nothing to a reader, so it is not carried into the table.
+            # Drop the unstable positional index from parsed logs.
             _table = _table.reset_index(drop=True)
         show_table(
             _table,
@@ -872,18 +749,14 @@ def _(br, delegation, dg, mo, show_table):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # 5 · What the survivors cost — CPU vs NPU
+    # 5 · CPU and NPU cost
 
-    Restricted to what §4 found each accelerator executes correctly: a delegate
-    returning `NaN` boxes still produces real timings, and usually fast ones.
+    Only exports judged correct in §4 are included. CPU results come from the same
+    board with its delegate disabled and XNNPACK enabled. Values are median latency
+    with p95, plus `dAP`.
 
-    The CPU column is the **same board with the delegate switched off**, not a host,
-    so the speedup is a property of the accelerator. That baseline is
-    XNNPACK-accelerated, which makes it conservative. `dAP` travels with every row.
-
-    Median, with p95 as spread. Multi-class, trained and evaluated full-frame,
-    320x320. Scoped to the default export: the `<board>_cpu` trees carry no
-    per-class runs yet.
+    Scope: default export at the reference configuration. Board CPU trees do not
+    yet include per-class NMS runs.
     """)
     return
 
@@ -896,9 +769,8 @@ def _(br, mo, show_table, view):
         ),
         "device_latency",
         mo,
-        caption="Median inference latency and throughput at the reference "
-        "configuration, each board's CPU against its own NPU delegate, for the "
-        "exports the delegate executes correctly.",
+        caption="Median latency and throughput for correct exports at the "
+        "reference configuration, comparing each board's CPU and NPU.",
     )
     return
 
@@ -918,19 +790,12 @@ def _(mo):
     mo.md("""
     ### 5.2 · Accuracy against latency
 
-    One panel per detector: accuracy is set by architecture and export scheme,
-    latency by platform and granularity, so pooling the two leaves most of the axis
-    empty between two AP bands. Colour is the platform, shape the whole export
-    scheme — a scheme is a method *and* a granularity, and both are needed to
-    identify a point.
+    Panels separate architectures because they occupy distinct AP ranges. Colour
+    identifies the platform; shape identifies quantization method and granularity.
+    The CPU reference is excluded from the deployment comparison.
 
-    Deployment targets only. The CPU reference is excluded: it exists to establish
-    that a device run computed the right answer, and its milliseconds compare two
-    machine classes rather than two deployments.
-
-    **The i.MX8M Plus NPU has no float point.** Its 32 fp32 runs produced non-finite
-    boxes under the delegate, so §0 withheld their metrics and §4 records them as
-    `unscoreable`. The gap is that result, not a missing measurement.
+    The i.MX8M Plus has no float point: its 32 FP32 delegate runs returned
+    non-finite boxes and are `unscoreable`, not missing.
     """)
     return
 
@@ -952,23 +817,13 @@ def _(mo):
     mo.md("""
     ### 5.3 · Power, energy and resource use
 
-    A separate measurement path from `ave benchmark`: that asks what a model
-    *predicts*, this asks what it *costs to run*, which needs a steady state long
-    enough for supply current, core frequency and die temperature to settle
-    (`ave resources MODEL IMAGES --seconds 120`, joined to the FNB58 trace by
-    `scripts/power_report.py`).
+    Resource measurements use a 120 s steady-state run (`ave resources`) joined to
+    the FNB58 power trace by `scripts/power_report.py`. Scope matches §5:
+    multi-class models trained full-frame.
 
-    Multi-class, trained full-frame, as in §5. Resource cost does not depend on
-    class count or training tiling, so the sweep collapses to one model per
-    (architecture x scheme) anyway; the scope keeps this section comparable with
-    the rest rather than adding information.
-
-    **`aligned` gates everything below it.** Three hosts, three clocks: the trace is
-    timestamped in the lab server's `CLOCK_MONOTONIC`, the board's artifacts in the
-    board's epoch clock. `ave resources` saturates the cores either side of the
-    measured loop so the resulting step can be matched against a locally recorded
-    time, and the residual of that match is the check. An unverified run still
-    reports entirely plausible watts.
+    Power values require verified clock alignment between the board and lab host.
+    `aligned` records the result; unverified values can appear plausible but are
+    excluded.
     """)
     return
 
@@ -976,26 +831,10 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(RESOURCE_ROOT, json, pd):
     def load_power_summaries(root) -> pd.DataFrame:
-        """Flatten every `power_summary.json` under `root` into one frame.
+        """Load power summaries and per-phase latency into one frame.
 
-        Two latency statistics are carried, not one. `power_summary.json` reports
-        both, and they answer different questions: a per-inference energy divides
-        an integrated meter trace by the inference count and is a mean by
-        construction, while a direct comparison between runs wants the median, the
-        tail being a property of the loop rather than of the graph. Keeping only
-        the mean, as this loader first did, silently applied the energy statistic
-        to the latency comparison.
-
-        The per-phase split is read from each run's own `run.json`, since
-        `power_summary.json` does not carry it. It is what makes an *accelerator*
-        comparison possible: the timed `predict` region deliberately spans the
-        whole deployed path, so it also contains a resize, an input quantization
-        and a post-processing pass that run on the CPU and do not depend on the
-        delegate. That fixed cost is added to the delegated and the CPU row alike
-        and so compresses every speedup toward one -- on the i.MX93 it is larger
-        than the model itself. `invoke` prices the graph alone; the full figure
-        remains what the application pays. Sweeps predating the phase
-        instrumentation leave these columns empty rather than absent.
+        Energy uses mean latency; run comparisons use median latency. Phase data
+        come from each run's `run.json`. Older sweeps leave phase fields empty.
         """
         rows = []
         if not root.is_dir():
@@ -1040,22 +879,18 @@ def _(RESOURCE_ROOT, json, pd):
                     {
                         # <device>/<stamp>/power_summary.json
                         "device": summary_path.parent.parent.name,
-                        # Kept so repeated sweeps of one board stay distinguishable.
-                        # Without it two sweeps under the same device directory
-                        # merge into duplicate rows -- silently, and straight into
-                        # any mean or plot drawn from the frame.
+                        # Distinguish repeated sweeps of the same board.
                         "stamp": summary_path.parent.name,
                         "run": result.get("run"),
                         "backend": result.get("backend"),
-                        # Leads on purpose: an unaligned run's power figures are
-                        # plausible and wrong.
+                        # Alignment determines whether power values are valid.
                         "aligned": alignment.get("verified"),
                         "state": alignment.get("state"),
                         "residual (s)": alignment.get("max_abs_residual_s"),
-                        # Whole `predict`: what the deployed application pays.
+                        # Full `predict` pipeline.
                         "lat mean (ms)": latency.get("mean_latency_ms"),
                         "lat med (ms)": latency.get("median_latency_ms"),
-                        # The graph alone, free of the CPU-side pipeline.
+                        # Graph execution only.
                         "invoke med (ms)": _invoke.get("median_latency_ms"),
                         "invoke mean (ms)": _invoke.get("mean_latency_ms"),
                         "net-resize med (ms)": _net.get("median_latency_ms"),
@@ -1082,13 +917,7 @@ def _(RESOURCE_ROOT, json, pd):
         if frame.empty:
             return frame
 
-        # A board can be swept more than once -- to extend coverage to further
-        # resolutions, or to re-measure after the instrumentation gained its
-        # per-phase latency split. Both land under the same device directory, so
-        # the same `run` arrives twice and every aggregate below would weight it
-        # twice. Timestamped sweep directories sort chronologically, so keeping
-        # the last occurrence keeps the newest measurement of each run while
-        # leaving runs the newer sweep never repeated untouched.
+        # Keep the latest measurement for runs repeated across timestamped sweeps.
         frame = frame.sort_values(["device", "run", "stamp"], kind="stable")
         frame = frame.drop_duplicates(["device", "run"], keep="last")
 
@@ -1101,9 +930,7 @@ def _(RESOURCE_ROOT, json, pd):
 
 @app.cell
 def _(br, power_df):
-    # The sweep records model stems, so the config axes come from the name. Scoped
-    # to §5's reference cell; latency and memory would survive a wider scope, but mixing
-    # them with power a reader cannot quote is worse than a smaller table.
+    # Parse configuration axes from model stems and match the §5 scope.
     power_scoped = br.annotate_resource_runs(power_df)
     if not power_scoped.empty:
         power_scoped = power_scoped[
@@ -1114,16 +941,8 @@ def _(br, power_df):
 
 @app.cell
 def _(NMS, br, power_scoped, runs, skipped, view):
-    # A power row is an *operating point* only if its export was executed
-    # correctly, and the sweep cannot tell. `output_integrity` catches output
-    # that is non-finite or out of range -- the fp32 graphs under Teflon -- but
-    # a collapse that still emits plausible boxes is visible only against the
-    # CPU reference, which is what `deployability_matrix` scores. Without this
-    # join the table presents a collapsed run's watts as an ordinary reading:
-    # real numbers that are not the cost of a working detector.
-    #
-    # Scored over every board carrying power rows, including the `_unpatched`
-    # and `_cpu` trees that §4's table leaves out of its columns.
+    # Join correctness verdicts because power sweeps cannot detect plausible but
+    # inaccurate output. Include control boards that have power measurements.
     _boards = sorted(
         p for p in runs["platform"].unique() if p.startswith(("frdm", "imx93"))
     )
@@ -1135,8 +954,7 @@ def _(NMS, br, power_scoped, runs, skipped, view):
         nms=NMS,
     )
 
-    # `deployability_matrix` drops the keys that are constant in its scope, so
-    # the join is on whichever of them survived.
+    # Join on configuration keys retained by both frames.
     _keys = [
         c
         for c in ("arch_label", "classes", "dataset", "size", "scheme")
@@ -1152,22 +970,15 @@ def _(NMS, br, power_scoped, runs, skipped, view):
         power_judged = power_scoped.merge(
             _verdicts, on=[*_keys, "device"], how="left"
         )
-        # A tree never benchmarked for accuracy has no verdict to join. Say so:
-        # a blank cell reads as `ok` to anyone skimming the column.
+        # Mark power runs without an accuracy benchmark explicitly.
         power_judged["verdict"] = power_judged["verdict"].fillna("unknown")
     return (power_judged,)
 
 
 @app.cell(hide_code=True)
 def _(mo, power_scoped):
-    # Three states, and only one of them condemns the numbers. `misaligned` means
-    # the chirp was found somewhere other than where the board recorded it, so the
-    # power is joined to the wrong part of the trace. `unverified` means no edge was
-    # detectable at all -- weaker evidence, not a contradiction, and the ssh probe
-    # behind it measures under 0.1 s of uncertainty against a 120 s window.
-    #
-    # Summaries written before the three-state split carry only `aligned`, so the
-    # state is derived when it is absent rather than counting every run as nothing.
+    # `misaligned` invalidates power values; `unverified` lacks the chirp check.
+    # Derive legacy states from `aligned` when necessary.
     if power_scoped.empty:
         _counts, _total = {}, 0
     else:
@@ -1193,10 +1004,7 @@ def _(mo, power_scoped):
             kind="neutral",
         )
     else:
-        # No matched chirp anywhere is the *worst* outcome, not the best: it means
-        # the check never ran, and an earlier version fell through to "success".
-        # Some misaligned runs among many good ones is a caveat, not an alarm --
-        # they are excluded below, so what is displayed stays sound.
+        # Escalate when no run is verified or misalignment is prevalent.
         if _ok == 0 or _bad > _ok:
             _kind = "danger"
         elif _bad or _soft:
@@ -1206,28 +1014,25 @@ def _(mo, power_scoped):
 
         _power_state = mo.callout(
             mo.md(
-                f"**{_ok} of {_total} runs in scope have a matched chirp.** "
+                f"**{_ok} of {_total} runs have verified alignment.** "
                 + (
-                    "None do — either the sweeps predate the alignment check or "
-                    "`scripts/power_report.py` has not been re-run over them. "
+                    "The sweeps may predate the check or require a new "
+                    "`scripts/power_report.py` run. "
                     if _ok == 0
                     else ""
                 )
                 + (
-                    f"**{_bad} misaligned** — chirp found away from where the board "
-                    "recorded it, so their power is joined to the wrong part of the "
-                    "trace and is excluded below. "
+                    f"**{_bad} misaligned** and excluded from power results. "
                     if _bad
                     else ""
                 )
                 + (
-                    f"{_soft} unverified: no edge was detectable, so the join rests "
-                    "on the ssh probe alone. "
+                    f"{_soft} unverified; alignment relies on the SSH probe. "
                     if _soft
                     else ""
                 )
-                + "Latency, CPU, memory and temperature come from the board and do "
-                "not depend on the join at all."
+                + "Board latency, CPU, memory, and temperature do not depend on "
+                "trace alignment."
             ),
             kind=_kind,
         )
@@ -1238,8 +1043,7 @@ def _(mo, power_scoped):
 
 @app.cell
 def _(NMS, br, mo, power_judged, show_fig):
-    # Pinned to the presented NMS like every other figure.
-    # `size` is pinned to the reference rung.
+    # Use the selected NMS and reference resolution.
 
     show_fig(
         br.plot_resource_summary(
@@ -1286,16 +1090,10 @@ def _(mo, power_judged, show_table):
         .reset_index(drop=True),
         "power_summary",
         mo,
-        caption="Steady-state power, energy per inference and resource use, per "
-        "run across the input-resolution ladder; the reference rung is "
-        "$320\\times320$ and the higher rungs belong to the input-resolution "
-        "ablation. "
-        "\\texttt{verdict} carries each export's "
-        "correctness on that board from \\cref{tab:deployability}: only "
-        "\\texttt{ok} rows are valid operating points. A \\texttt{collapsed} or "
-        "\\texttt{unscoreable} run executes the graph and its power and timings "
-        "are real measurements; what they cannot be read as is the cost of a "
-        "working detector.",
+        caption="Steady-state power, energy, and resource use across input "
+        "resolutions. The reference is $320\\times320$. Only \\texttt{ok} "
+        "verdicts are valid operating points; other rows retain measured power "
+        "and latency but do not represent a working detector.",
         split_by="device",
     )
     return
@@ -1304,30 +1102,19 @@ def _(mo, power_judged, show_table):
 @app.cell
 def _(mo):
     mo.md("""
-    ### 5.4 &middot; The model alone
+    ### 5.4 &middot; Graph-only latency
 
-    &sect;5.1 times the whole `predict` call &mdash; what the deployed application
-    pays. Around the model that call also does an input resize, an input
-    quantization, and a readback and rescaling of the outputs, none of which the
-    delegate ever sees. Those cost 10&ndash;15&nbsp;ms per inference and sit in the
-    delegated *and* the board-CPU row, so they enter a speedup on both sides and
-    pull it toward one.
+    Section 5.1 times the full `predict` call, including resize, input
+    quantization, output readback, and rescaling. These CPU-side steps add
+    10&ndash;15&nbsp;ms to both CPU and delegated runs.
 
-    `invoke` is the **graph**, not the accelerator. `TFLite_Detection_PostProcess`
-    and the two dequantize nodes are part of the exported model and run inside this
-    phase on the CPU, because no delegate here accepts them. Counting them is right
-    &mdash; they are what the deployed graph does &mdash; but the measurement does
-    not separate them from the delegated partition, so the column is the model's
-    cost rather than pure accelerator time.
+    `invoke` measures the exported graph, not pure accelerator time.
+    `TFLite_Detection_PostProcess` and two dequantize nodes remain on the CPU within
+    this phase. `CPU-side (ms)` is `preprocess + postprocess`; `resize` is already
+    included in `preprocess`.
 
-    The phases do not partition the call: `resize` is measured inside `preprocess`,
-    and `postprocess` is the remainder, so `CPU-side (ms)` is `preprocess` +
-    `postprocess`.
-
-    Read against &sect;5.1 every conclusion holds and the speedups roughly double.
-    The per-channel inversion is the exception: it stays at ~0.7, so a delegated
-    configuration slower than the same board's CPU is a property of the accelerator
-    rather than of the pipeline around it.
+    Removing pipeline overhead roughly doubles most speedups. Per-channel speedup
+    remains about 0.7, so the delegated graph is slower than the board CPU.
     """)
     return
 
@@ -1335,21 +1122,16 @@ def _(mo):
 @app.cell
 def _(NMS, br, mo, power_judged, show_table):
     show_table(
-        # Deployable only, as in the rest of §5: the i.MX8M Plus float rows are
-        # real timings of a graph returning non-finite boxes.
+        # Exclude timings from incorrect exports.
         br.accelerator_latency_table(
             power_judged, nms=NMS, size=br.REFERENCE_CONFIG["size"]
         ),
         "accelerator_latency",
         mo,
-        caption="Delegated against board-CPU latency at the reference "
-        "configuration, priced over the whole \\texttt{predict} call and over "
-        "graph execution alone. The \\texttt{invoke} columns are the model, not "
-        "the accelerator: the detection post-processing operator runs inside them "
-        "on the CPU. \\texttt{CPU-side (ms)} is the resize, input quantization and "
-        "output rescaling around the graph, which no delegate sees; it is "
-        "\\texttt{preprocess} + \\texttt{postprocess}, the phases not partitioning "
-        "the call.",
+        caption="Delegated and board-CPU latency at the reference configuration, "
+        "for the full \\texttt{predict} call and graph-only \\texttt{invoke}. "
+        "Invoke includes CPU detection post-processing; \\texttt{CPU-side (ms)} "
+        "is \\texttt{preprocess} plus \\texttt{postprocess}.",
     )
     return
 
@@ -1357,21 +1139,14 @@ def _(NMS, br, mo, power_judged, show_table):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # 6 · Three ablations
+    # 6 · Ablations
 
-    §1–§5 hold three things fixed. Each is varied here in turn: **class regime**
-    (§6.1), **apparent object scale via tiling** (§6.2), and the **exported
-    post-processing** (§6.3).
+    The overview varies one axis at a time, plus the matched tiled configuration.
+    `Float AP` is absolute; `Conversion`, `NMS swap`, and `PTQ` are changes from the
+    preceding rung; `QAT reclaim` is QAT minus PTQ with per-tensor weights.
 
-    The overview below deviates one axis at a time, plus the tiled configuration
-    where both tiling axes move together — they are not independent, and §6.2 is
-    about why. Column kinds differ: `Float AP` is a level; `Conversion`, `NMS swap`
-    and `PTQ` are costs against the preceding rung; `QAT reclaim` is QAT minus PTQ
-    at per-tensor weights.
-
-    > `NPU (ms)` is **per inference**, and a tiled inference covers a ninth of the
-    > frame. Read it down a column within one evaluation regime, never across the
-    > tiled and full-frame rows.
+    `NPU (ms)` is per inference. A tiled inference covers one ninth of a frame, so
+    do not compare its latency with full-frame inference.
     """)
     return
 
@@ -1382,8 +1157,8 @@ def _(br, mo, show_table, view):
         br.story_ablation_table(view(nms="both")),
         "story_ablation",
         mo,
-        caption="Effect of each single-axis deviation from the reference "
-        "configuration on every step of the deployment chain.",
+        caption="Deployment-stage effects of single-axis deviations from the "
+        "reference configuration.",
     )
     return
 
@@ -1393,14 +1168,11 @@ def _(mo):
     mo.md("""
     ### 6.1 · Single-class
 
-    Dropping `crop` and detecting only `weed`. The task keeps the harder class:
-    weeds are the small objects, so the COCO area breakdown (`APS` <= 32², `APM`,
-    `APL` > 96²) is where an architecture's answer to them shows.
+    Single-class models omit `crop` and detect only the smaller `weed` objects.
+    The area breakdown uses COCO thresholds (`APS` ≤ 32²; `APL` > 96²).
 
-    The first figure asks whether quantization behaves the same in both regimes.
-    Three series per scheme: the two classes a multi-class model reports, and the
-    weed AP of the *single-class* model trained on the same data. The last is not a
-    slice of the first — it is a different model, hence its own series.
+    The quantization figure compares crop and weed AP from the multi-class model
+    with weed AP from a separately trained single-class model.
     """)
     return
 
@@ -1442,33 +1214,26 @@ def _(NMS, arch_df, br, mo, show_fig):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 6.2 · Tiling — apparent object scale
+    ### 6.2 · Tiling and apparent object scale
 
-    A tile is a 512² crop of a 1024² frame (3x3, overlap 0.5), so it shows the same
-    scene at **2x linear magnification**. The two tiling axes are therefore not an
-    inference strategy; they are a proxy for how large objects appear to the model —
-    sensor focus at train time and at deployment time. Each of the four cells is a
-    different question about scale:
+    Each tile is a 512² crop of a 1024² frame (3×3, 50% overlap), equivalent to
+    2× linear magnification. Training and evaluation tiling therefore model object
+    scale rather than end-to-end tiled inference.
 
     | cell | question |
     |---|---|
-    | trained full / eval full | the reference |
-    | trained full / eval tiled | how the model reacts to **halving camera distance** in deployment — out of domain at inference |
-    | trained tiled / eval full | whether **training on strictly magnified features** transfers back to the wide view |
-    | trained tiled / eval tiled | the coherent **narrow-focus** configuration, in domain at both ends |
+    | trained full / eval full | reference |
+    | trained full / eval tiled | larger objects only at evaluation |
+    | trained tiled / eval full | transfer from larger training objects |
+    | trained tiled / eval tiled | matched narrow-field configuration |
 
-    The mismatched cells measure out-of-domain robustness in scale; only the matched
-    one is a deployable configuration, and its gain is a statement about **sensor
-    choice**: a narrower field of view, trained for, is worth substantially more
-    detection accuracy than the same detector aimed wide.
+    Mismatched cells test scale shift. The matched tiled cell represents a trained
+    narrow-field sensor configuration.
 
-    `d` is against the reference cell of the same architecture. The deltas do not
-    add — each axis alone loses several AP while moving both together gains — which
-    is why the square is reported rather than two one-axis rows.
+    `d` is relative to the same architecture's reference cell. The two axes
+    interact, so all four combinations are reported.
 
-    Latency is deliberately absent: a tiled inference covers a ninth of the area, so
-    per-inference times are not comparable across these cells and the question here
-    is scale, not throughput.
+    Latency is omitted because a tile covers one ninth of a frame.
     """)
     return
 
@@ -1479,9 +1244,9 @@ def _(br, mo, show_table, view):
         br.tiling_cross_table(view(nms="both")),
         "tiling_cross",
         mo,
-        caption="All four training x evaluation tiling combinations at the float "
-        "TFLite rung on the CPU reference, multi-class, with each cell's change "
-        "against its architecture's reference.",
+        caption="Training and evaluation tiling combinations for multi-class float "
+        "TFLite on the CPU reference. Changes are relative to each architecture's "
+        "full-frame reference.",
     )
     return
 
@@ -1489,35 +1254,28 @@ def _(br, mo, show_table, view):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### 6.3 · The exported post-processing
+    ### 6.3 · NMS latency
 
-    `ave convert` emits `use_regular_nms=False` unless told otherwise: one
-    class-agnostic suppression pass instead of one per class. §3.2 priced that in
-    accuracy; this is its latency side, and §6.1's dimension is what makes it
-    measurable. At one class the two algorithms **are** the same algorithm, so the
-    latency difference within a single-class pair is drift between two separately
-    benchmarked runs and nothing else — subtracting it leaves the algorithm.
+    Fast NMS uses one class-agnostic suppression pass; regular NMS uses one pass per
+    class. Their single-class latency difference estimates run-to-run drift. The
+    reported saving subtracts this control from the multi-class difference.
 
-    **INT8 only.** The quantity is a roughly fixed millisecond cost, so pooling a
-    340 ms fp32 regime with a 33 ms INT8 one adds variance without signal: the fp32
-    pairs carry ~40x the absolute timing noise, and four of twenty were setting
-    every interval's width. They also moved a point estimate by an order of
-    magnitude (`x86_cpu · MNv2`, -0.73 ms pooled against -0.06 ms here).
+    INT8 only. Including FP32 adds substantial timing variance to a millisecond-scale
+    effect.
 
     | column | meaning |
     |---|---|
-    | `mc pairs` / `sc pairs` | matched `fastnms`/`regnms` run pairs entering each arm |
-    | `dLatency mc` | mean (fast − per-class) over multi-class pairs; negative = fast is quicker |
-    | `sc drift` | the same over single-class pairs, where the true difference is zero — pure measurement drift |
-    | `NMS saving` | `dLatency mc` − `sc drift`: the difference in differences, the estimate |
+    | `mc pairs` / `sc pairs` | matched fast/regular NMS pairs |
+    | `dLatency mc` | mean fast minus regular latency; negative means fast is quicker |
+    | `sc drift` | corresponding single-class difference |
+    | `NMS saving` | `dLatency mc` minus `sc drift` |
     | `SE` | standard error of that difference, both arms combined |
-    | `sigma` | \|saving\| / SE — how far the estimate sits from zero |
-    | `95% CI` | interval on the saving; one containing zero has **not** resolved a saving from drift |
+    | `sigma` | \|saving\| / SE |
+    | `95% CI` | interval for the saving |
     | `resolved` | whether the interval excludes zero |
-    | `sc \|drift\| worst` | largest single-pair drift, as a sanity check on the arm |
+    | `sc \|drift\| worst` | largest single-pair drift |
 
-    A large point estimate whose interval spans zero is an *unmeasured* effect, not
-    a small one.
+    An interval spanning zero does not distinguish the effect from drift.
     """)
     return
 
@@ -1528,9 +1286,8 @@ def _(br, mo, show_table, view):
         br.nms_latency_tradeoff_table(view(nms="both")),
         "nms_latency_tradeoff",
         mo,
-        caption="Latency saved by the fast NMS substitution, estimated against the "
-        "single-class null control (difference in differences), per platform and "
-        "architecture.",
+        caption="Fast-NMS latency difference by platform and architecture, adjusted "
+        "for drift using matched single-class runs.",
     )
     return
 
@@ -1540,24 +1297,16 @@ def _(mo):
     mo.md("""
     ### 6.4 · Input resolution
 
-    320 / 512 / 1024 at the reference configuration. Accuracy is measured once on
-    the CPU reference; `FPS` and `(ms)` are per board, because a rung is
-    disqualified by what it costs **on the device it would ship on**. The `x86 (ms)`
-    column is the reference host and is a lower bound, not a proxy — it runs 320 in
-    ~14 ms against 30–50 ms on the accelerators.
+    Compare 320, 512, and 1024 inputs at the reference configuration. Accuracy is
+    measured on the CPU reference; latency and FPS are reported per board. Host
+    latency is a lower bound, not a device proxy.
 
-    Resolution is the axis under study, so class regime, training set and input
-    regime are pinned rather than collapsed: folding tiled runs in would confound
-    input *resolution* with apparent object *scale* (§6.2).
+    Other axes are fixed to avoid mixing resolution with the scale shift from
+    tiling (§6.2). The trade-off figure uses one export scheme and a logarithmic
+    latency axis.
 
-    The trade-off figure is pinned to one export scheme and log-scaled in latency.
-    Granularity alone moves latency eightfold on the Vivante NPU, so a line mixing
-    schemes would trace that instead of resolution; and the ladder spans 30 ms to
-    several seconds, which a linear axis collapses.
-
-    Still filling in: FPNLite at 1024 (a multi-session Kaggle run) and the i.MX8M
-    Plus above 512. A rung not yet benchmarked on a board leaves its cell empty
-    rather than falling back to the host.
+    FPNLite at 1024 and i.MX8M Plus runs above 512 are incomplete. Missing device
+    measurements remain empty.
     """)
     return
 
@@ -1572,9 +1321,8 @@ def _(NMS, br, mo, show_table, view):
         ),
         "resolution_ladder",
         mo,
-        caption="Detection quality against input resolution at the reference "
-        "configuration, every export scheme, with median latency on the CPU "
-        "reference and on each accelerator.",
+        caption="Detection quality and median latency by input resolution and "
+        "export scheme, measured on the CPU reference and each accelerator.",
     )
     return
 
@@ -1596,14 +1344,9 @@ def _(mo):
     mo.md("""
     # 7 · Auxiliary detectors
 
-    `yolov7-tiny` is in the frame; YOLOX has ONNX finetune artifacts
-    (`artifacts/onnx/yolox-nano_*`) but no TFLite exports or benchmark results.
-
-    A different family, kept out of the controlled comparison: different
-    post-processing (no `TFLite_Detection_PostProcess`, so §6.3 does not apply to
-    it) and a partial matrix — `yolov7-tiny` exists only as a tiled-trained 512
-    export. `br.PRIMARY_ARCHS` keeps it out of the default `view()`; `archs="aux"`
-    lets it back in.
+    YOLOv7-tiny is available only as a tiled-trained 512 export and uses different
+    post-processing. It is excluded from the controlled SSD comparison. YOLOX has
+    fine-tuned ONNX artifacts but no TFLite benchmarks.
     """)
     return
 
@@ -1614,8 +1357,8 @@ def _(br, mo, show_table, view):
         br.platform_metrics_table(view(archs="aux"), br.CPU_REFERENCE_PLATFORM),
         "auxiliary_detectors",
         mo,
-        caption="Auxiliary reference detectors (YOLO family) on the CPU "
-        "reference. Not part of the controlled SSD comparison.",
+        caption="Auxiliary YOLO detectors on the CPU reference, excluded from the "
+        "controlled SSD comparison.",
     )
     return
 
@@ -1623,24 +1366,18 @@ def _(br, mo, show_table, view):
 @app.cell(hide_code=True)
 def _(br, mo):
     mo.md(f"""
-    # 8 · Appendix — coverage and full matrices
+    # 8 · Appendix: coverage and full matrices
 
-    A *full run* benchmarks every trained variant in `artifacts/tf`, for every
-    export scheme, on both input regimes, on every target platform:
+    A full run covers every trained variant, export scheme, input regime, and
+    target platform:
 
     - schemes: {", ".join(f"`{br.scheme_label(br.scheme_name(*s))}`" for s in br.DEFAULT_SCHEMES)}
     - input regimes: {", ".join(f"`{t}`" for t in br.DEFAULT_EVAL_TILINGS)}
     - platforms: {", ".join(f"`{p}`" for p in br.DEFAULT_EXPECTED_PLATFORMS)}
 
-    Coverage counts the **default export** only. The per-class variant is equally
-    deployable and was swept on the boards, but not on the CPU-only and unpatched
-    control trees, so counting it would invent gaps that are deliberate — and
-    letting it *satisfy* a cell would let a per-class run stand in for the default.
-    The NMS axis gets its own completeness view instead.
-
-    `tf-savedmodel` is not in this matrix. It holds the checkpoint's raw fp32
-    graph — nothing there was quantized, so no export scheme is something it can be
-    missing. It appears in §8.2's per-platform tables.
+    Coverage uses the default NMS export; NMS-pair completeness is reported
+    separately. `tf-savedmodel` is excluded because it has no quantized export
+    schemes, but remains in the per-platform tables.
     """)
     return
 
@@ -1648,12 +1385,9 @@ def _(br, mo):
 @app.cell(hide_code=True)
 def _(br, mo, view):
     mo.ui.table(
-        # `view(archs=None, nms="both")` rather than `runs`: every architecture and
-        # both post-processing variants, minus `CONTROL_TREES`. Coverage counts
-        # per-platform pairs, so a tree from another toolchain would be counted as
-        # a platform this analysis reports on.
+        # Include all architectures and both NMS variants, excluding controls.
         br.nms_pair_coverage(view(archs=None, nms="both")),
-        label="Post-processing pair coverage (where both variants exist)",
+        label="Post-processing pair coverage",
         selection=None,
     )
     return
@@ -1681,7 +1415,7 @@ def _(br, coverage, mo, show_table):
         "benchmark_coverage",
         mo,
         caption="Benchmark coverage across the full run matrix "
-        "(x = done, - = missing).",
+        "(x: complete; -: missing).",
     )
     return
 
@@ -1697,8 +1431,7 @@ def _(mo):
     mo.md("""
     ### 8.2 · Per-platform result tables
 
-    One full COCO table per device (thesis Appendix D). Generated per platform,
-    so boards appear automatically as their sweeps land.
+    One full COCO table per platform for thesis Appendix D.
     """)
     return
 
@@ -1729,15 +1462,7 @@ def _(br, mo, platform_ui, view):
 
 @app.cell(hide_code=True)
 def _(br, mo, show_table, view):
-    # Export one table per platform regardless of the dropdown selection, so a
-    # full run of the notebook refreshes every device table in docs/thesis.
-    #
-    # `controls=True` here and nowhere else: this loop is a per-tree *record* of
-    # what was measured, not a comparison, so a control tree cannot distort it --
-    # each table stands alone under its own platform name. Scoping it to the
-    # analysis views would instead leave stale .tex files on disk for the trees
-    # it dropped. The dropdown above stays scoped, because that one does feed
-    # comparisons.
+    # Export every platform, including controls, independent of the dropdown.
     _export_platforms = sorted(view(archs=None, controls=True)["platform"].unique())
 
     for _platform in _export_platforms:
@@ -1760,25 +1485,21 @@ def _(mo):
     mo.md("""
     ### 8.3 · Cross-configuration degradation ladder
 
-    §2 and §3 report the preparation chain at the reference configuration.
-    This is the same decomposition across *every* configuration and continuing
-    onto the accelerator — the transpose of §2.1, and the frame §6's ablation
-    is drawn from.
+    Deployment-stage AP changes for every configuration, extending the §2–§3
+    preparation chain through accelerator execution.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(br, mo, runs, show_table):
-    # Unscoped by construction: this table's `nms-swap` column is built from both
-    # post-processing variants, so it needs the pair rather than one of them.
+    # Use both NMS variants to compute `nms-swap`.
     show_table(
         br.degradation_ladder_table(runs),
         "degradation_ladder_untiled",
         mo,
-        caption="Detection AP across the deployment rungs (full-frame input, PTQ "
-        "path) for every configuration, with the loss attributable to conversion, "
-        "the post-processing substitution, quantization and delegation separately.",
+        caption="Detection AP by deployment stage for every full-frame PTQ "
+        "configuration, separating conversion, NMS, quantization, and delegation.",
     )
     return
 
@@ -1800,8 +1521,8 @@ def _(br, mo, show_table, view):
         br.latency_table(view(archs=None)),
         "latency_by_scheme",
         mo,
-        caption="Median / p95 inference latency and throughput per platform, "
-        "backend and export scheme, uncollapsed.",
+        caption="Median and p95 inference latency and throughput by platform, "
+        "backend, and export scheme.",
     )
     return
 
@@ -1812,11 +1533,9 @@ def _(br, mo, show_table, view):
         br.master_table(view(archs=None, nms="both")),
         "benchmark_master",
         mo,
-        caption="Full benchmark matrix across platforms, architectures, class "
-        "regimes, input regimes, quantization schemes and exported "
-        "post-processing. Both NMS variants and every architecture; the "
-        "control trees of \\texttt{CONTROL\\_TREES} are excluded, so the table is "
-        "the matrix this analysis reports on rather than everything on disk.",
+        caption="Full benchmark matrix across platforms, architectures, class and "
+        "input regimes, quantization schemes, and NMS variants. Control trees are "
+        "excluded.",
     )
     return
 
@@ -1824,33 +1543,22 @@ def _(br, mo, show_table, view):
 @app.cell
 def _(mo):
     mo.md("""
-    ### 8.5 &middot; What the detectors actually produce
+    ### 8.5 &middot; Detection examples
 
-    Every other figure here is an aggregate, and an aggregate cannot show *how* a
-    detector is wrong. One row is one test frame: ground truth first, then each
-    detector's output on that same frame, so a row is read across.
+    Each row shows ground truth and detector outputs for one frame. Frames are
+    sorted by weed count and sampled at fixed intervals for a stable range of scene
+    densities.
 
-    Frames are picked deterministically, not at random &mdash; sorted by weed
-    count and sampled at even intervals, so the grid spans the near-empty frames
-    and the crowded ones, and does not change between runs of this notebook.
-
-    Boxes are drawn at a score threshold of 0.4. That is a **display choice**: the
-    exported graph keeps detections down to a floor of 0.05, and drawing all of
-    them would bury each frame. No metric in this report uses a fixed threshold
-    &mdash; AP integrates over all of them.
-
-    Three galleries follow, all on the same frames and all at the thesis text
-    width: what the two architectures produce, what a *collapsed* delegate run
-    produces, and what the unresolved 1024 failure produces.
+    Boxes use a display threshold of 0.4; AP still uses all detections down to the
+    exported score floor of 0.05. The three galleries use the same frames and
+    thesis text width.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(BENCHMARK_ROOT, NMS):
-    # The thesis is single-column at 418.3 pt (5.79 in) of text width, so a gallery
-    # rendered at that width prints 1:1 and keeps its type size. Rendered wider it is
-    # scaled down by LaTeX and the panel labels shrink with it.
+    # Match the 418.3 pt thesis text width to preserve label size.
     THESIS_TEXT_WIDTH_IN = 5.79
 
 
@@ -1882,9 +1590,7 @@ def _(
             GT_ANNOTATIONS,
             IMAGE_ROOT,
             {
-                # The deployed export at the reference configuration, scored on
-                # the CPU reference where every accuracy number in this report is
-                # measured.
+                # Reference export evaluated on the CPU reference.
                 _label: gallery_prediction(
                     br.CPU_REFERENCE_PLATFORM, _arch, "int8_qat_per-tensor"
                 )
@@ -1899,8 +1605,7 @@ def _(
         ),
         "detection_gallery",
         mo,
-        # Photographs, so raster: as PDF the same figure is three times the size
-        # and the 300 dpi default is far past what a 256 px panel carries.
+        # Raster output is sufficient for 256 px source panels.
         formats=("png",),
         dpi=200,
     )
@@ -1910,16 +1615,11 @@ def _(
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 8.6 &middot; What a collapsed run looks like
+    ### 8.6 &middot; Collapsed delegate output
 
-    &sect;4.3 prices the Mesa/Teflon operator-support work in AP and milliseconds.
-    The same pair drawn on frames shows what the verdict *collapsed* names: the
-    preceding build does not merely lose accuracy, it returns boxes with no
-    relation to what is in the image.
-
-    One export, three executions &mdash; same board, same file, same frames, only
-    the delegate build differs. The board's own CPU column places the fault in the
-    delegate rather than in the export.
+    The same export is shown on the board CPU and before and after the Mesa/Teflon
+    operator-support changes. The preceding delegate build returns unrelated boxes;
+    the board CPU result isolates the fault to delegation.
     """)
     return
 
@@ -1939,9 +1639,7 @@ def _(
             GT_ANNOTATIONS,
             IMAGE_ROOT,
             {
-                # `_unpatched` is the same board running the delegate build that
-                # preceded the operator-support work; the CPU column is that board
-                # with the delegate switched off.
+                # Same board with CPU, current delegate, and preceding delegate.
                 _label: gallery_prediction(
                     _platform, "ssd-mn2-fpnlite", "int8_ptq_per-tensor"
                 )
@@ -1966,17 +1664,13 @@ def _(
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 8.7 &middot; The 1024 FPNLite failure
+    ### 8.7 &middot; FPNLite failure at 1024×1024
 
-    FPNLite's INT8 exports are delegated as a single region at 1024&times;1024 and
-    raise no error, yet keep under a tenth of the accuracy the same file reaches
-    on the host reference. On the i.MX93, 99.3 % of the returned detections carry
-    a score of exactly 0.5, the class logits having gone to zero.
-
-    Drawn on frames the failure is not garbage boxes but near-total detection
-    loss: both boards return almost nothing above the display threshold where the
-    host reference returns the full set. Delegation is identical to the
-    512&times;512 case, which is correct on both boards.
+    The 1024&times;1024 INT8 export delegates as one region without errors but retains
+    less than one tenth of its host accuracy. On the i.MX93, 99.3% of detections
+    score exactly 0.5 because the class logits are zero. Both boards return almost
+    nothing above the display threshold, although the equivalent 512&times;512 export
+    is correct.
     """)
     return
 
@@ -1996,9 +1690,7 @@ def _(
             GT_ANNOTATIONS,
             IMAGE_ROOT,
             {
-                # The same file on three machines. The host reference carries
-                # accuracy throughout this report, so it is what "correct" means
-                # for this export.
+                # Compare the same file with its host reference on both NPUs.
                 _label: gallery_prediction(
                     _platform, "ssd-mn2-fpnlite", "int8_qat_per-tensor", size="1024"
                 )
@@ -2024,10 +1716,8 @@ def _(
 def _(FIG_DIR, SAVE_ARTIFACTS, TAB_DIR, mo):
     mo.md(f"""
     ---
-    **Artifact export:** {"enabled" if SAVE_ARTIFACTS else "disabled"}.
-    Figures → `{FIG_DIR}` · tables → `{TAB_DIR}`.
-    Set `SAVE_ARTIFACTS = False` in the options cell to preview without
-    writing to the repo.
+    Artifact export: **{"enabled" if SAVE_ARTIFACTS else "disabled"}**.
+    Figures: `{FIG_DIR}` · Tables: `{TAB_DIR}`.
     """)
     return
 
