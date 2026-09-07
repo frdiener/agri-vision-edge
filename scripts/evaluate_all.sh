@@ -5,15 +5,16 @@
 # name. Tiling is encoded by the tiled_ / untiled_ result-directory prefix.
 #
 # Usage:
-#   scripts/evaluate_all.sh [--faithful [--only-relevant]] [--overwrite] [target-dir]
+#   scripts/evaluate_all.sh [--faithful [--only-relevant]] [--ignore-partials]
+#                           [--overwrite] [target-dir]
 #
 # target-dir defaults to benchmark_results/<hostname>. Each immediate subdir is
 # expected to contain a predictions.json (as written by `ave benchmark`);
-# dirs without one (e.g. failed runs holding error.json) are skipped. metrics.json
-# is written beside each predictions.json. Existing metrics are skipped by
-# default; pass --overwrite to regenerate them. Lightweight and faithful outputs
-# are checked independently, so a missing metrics_faithful.json is still created
-# when metrics.json already exists.
+# dirs without one (e.g. failed runs holding error.json) are skipped.
+# metrics.json and score_sweep.json are written beside each predictions.json.
+# Existing outputs are skipped by default; pass --overwrite to regenerate them.
+# The outputs are checked independently, so a missing metrics_faithful.json or
+# score_sweep.json is still created when metrics.json already exists.
 #
 # Pass --faithful to ALSO run the official PhenoBench evaluator
 # (`ave evaluate --faithful`, writing metrics_faithful.json) alongside the
@@ -60,6 +61,7 @@ raw_tiled_dir="${PHENOBENCH_RAW_TILED:-${repo_root}/datasets/phenobench_raw_tile
 faithful=0
 only_relevant=0
 overwrite=0
+ignore_partials=0
 target_dir=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -72,8 +74,12 @@ while [[ $# -gt 0 ]]; do
         --overwrite)
             overwrite=1
             ;;
+        --ignore-partials)
+            ignore_partials=1
+            ;;
         -h|--help)
-            echo "usage: $0 [--faithful [--only-relevant]] [--overwrite] [target-dir]"
+            echo "usage: $0 [--faithful [--only-relevant]]" \
+                 "[--ignore-partials] [--overwrite] [target-dir]"
             exit 0
             ;;
         --*)
@@ -112,6 +118,11 @@ if [[ ! -d "${target_dir}" ]]; then
     exit 1
 fi
 
+eval_args=()
+if [[ ${ignore_partials} -eq 1 ]]; then
+    eval_args+=(--ignore-partials)
+fi
+
 echo "evaluating runs in: ${target_dir}"
 echo
 
@@ -127,6 +138,7 @@ for model_dir in "${target_dir}"/*/; do
     predictions="${model_dir}predictions.json"
     metrics="${model_dir}metrics.json"
     faithful_metrics="${model_dir}metrics_faithful.json"
+    score_sweep="${model_dir}score_sweep.json"
 
     if [[ ! -f "${predictions}" ]]; then
         echo "[skip] ${name}: no predictions.json"
@@ -158,14 +170,17 @@ for model_dir in "${target_dir}"/*/; do
         continue
     fi
 
-    if [[ -f "${metrics}" && ${overwrite} -eq 0 ]]; then
-        echo "[eval-skip] ${name}: metrics.json already exists"
+    # Checked alongside metrics.json so an already-evaluated tree picks up the
+    # sweep, and an interrupted backfill resumes.
+    if [[ -f "${metrics}" && -f "${score_sweep}" && ${overwrite} -eq 0 ]]; then
+        echo "[eval-skip] ${name}: metrics.json and score_sweep.json already exist"
         skipped=$((skipped + 1))
     else
         echo "[eval] ${name}  (annotations=$(basename "${annotations}"))"
         "${script_dir}/ave" evaluate \
             "${annotations}" \
-            "${predictions}"
+            "${predictions}" \
+            "${eval_args[@]}"
         evaluated=$((evaluated + 1))
     fi
 
