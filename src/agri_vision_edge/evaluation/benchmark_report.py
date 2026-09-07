@@ -20,6 +20,12 @@ from matplotlib.ticker import FuncFormatter
 
 # Use the same axis styling as training-curve figures.
 from .curves import _prepare_axis
+from .score_sweep import (
+    MICRO_CLASS,
+    SCORE_SWEEP_FILENAME,
+    ScoreSweep,
+    load_score_sweep,
+)
 
 # =========================================================
 # Run-name parsing
@@ -4418,6 +4424,347 @@ def plot_detection_gallery(
     )
     fig.tight_layout(rect=(0, 0.025, 1, 1))
     return fig
+
+
+# =========================================================
+# Confidence-threshold sweeps
+# =========================================================
+
+#: Colours for the three swept metrics.
+SWEEP_METRIC_COLORS = {
+    "precision": "#4C72B0",
+    "recall": "#DD8452",
+    "f1": "#55A868",
+}
+
+SWEEP_METRIC_LABELS = {
+    "precision": "Precision",
+    "recall": "Recall",
+    "f1": "F1",
+}
+
+
+def load_score_sweeps(
+    root: str | Path = "benchmark_results",
+    exclude_dirs: Iterable[str] = NON_PLATFORM_DIRS,
+) -> dict[tuple[str, str], ScoreSweep]:
+    """Load every ``score_sweep.json`` under the results tree.
+
+    Keyed by ``(platform, run)`` to match :func:`load_benchmark_results`. Runs
+    without one are absent.
+    """
+    root = Path(root)
+
+    if not root.is_dir():
+        return {}
+
+    exclude = set(exclude_dirs)
+    sweeps: dict[tuple[str, str], ScoreSweep] = {}
+
+    platforms = sorted(
+        p for p in root.iterdir() if p.is_dir() and p.name not in exclude
+    )
+
+    for platform_dir in platforms:
+        for run_dir in sorted(p for p in platform_dir.iterdir() if p.is_dir()):
+            sweep = load_score_sweep(run_dir / SCORE_SWEEP_FILENAME)
+
+            if sweep is not None:
+                sweeps[platform_dir.name, run_dir.name] = sweep
+
+    return sweeps
+
+
+def score_sweep_frame(
+    sweeps: dict[tuple[str, str], ScoreSweep],
+    *,
+    class_name: str | None = None,
+    iou_thresholds: Iterable[float] | None = None,
+) -> pd.DataFrame:
+    """Flatten sweeps to one row per (run, class, IoU, threshold).
+
+    Carries only ``platform`` / ``run`` as identity, not the parsed run
+    metadata: that frame has its own ``precision`` column meaning FP32/INT8.
+    Join on ``["platform", "run"]`` after renaming if both are needed.
+    """
+    rows: list[pd.DataFrame] = []
+
+    for (platform, run), sweep in sweeps.items():
+        names = list(sweep.per_class) + [MICRO_CLASS]
+
+        if class_name is not None:
+            names = [class_name] if class_name in names else []
+
+        ious = sweep.iou_thresholds if iou_thresholds is None else iou_thresholds
+
+        for name in names:
+            for iou in ious:
+                curve = sweep.curve(iou, name)
+
+                frame = pd.DataFrame(
+                    {
+                        "score": curve["score"],
+                        "precision": curve["precision"],
+                        "recall": curve["recall"],
+                        "f1": curve["f1"],
+                        "tp": curve["tp"],
+                        "fp": curve["fp"],
+                    }
+                )
+
+                frame["platform"] = platform
+                frame["run"] = run
+                frame["class"] = name
+                frame["iou"] = iou
+
+                rows.append(frame)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.concat(rows, ignore_index=True)
+
+
+def _panel_ious(iou_thresholds, default) -> tuple[float, ...]:
+    """Resolve the IoU argument to one entry per panel.
+
+    ``None`` uses the sweep's own thresholds; a scalar gives a single panel.
+    """
+    if iou_thresholds is None:
+        return tuple(float(v) for v in default)
+
+    if isinstance(iou_thresholds, (int, float)):
+        return (float(iou_thresholds),)
+
+    return tuple(float(v) for v in iou_thresholds)
+
+
+def plot_pr_f1_vs_confidence(
+    sweep: ScoreSweep | None,
+    iou_thresholds: float | Iterable[float] | None = None,
+    *,
+    class_name: str = MICRO_CLASS,
+    title: str | None = None,
+    annotate_best: bool = True,
+    figsize: tuple[float, float] | None = None,
+):
+    """Plot precision, recall and F1 against the confidence threshold.
+
+    One panel per IoU threshold, defaulting to the sweep's own (0.50 and 0.75);
+    pass a scalar for a single panel. The dashed line marks the F1-optimal
+    operating point. Precision is blank where undefined, not zero.
+    """
+    if sweep is None:
+        return None
+
+    ious = _panel_ious(iou_thresholds, sweep.iou_thresholds)
+
+    if not ious:
+        return None
+
+    if figsize is None:
+        figsize = (5.0 * len(ious), 3.9)
+
+    fig, axes = plt.subplots(1, len(ious), figsize=figsize, sharey=True)
+    axes = np.atleast_1d(axes)
+
+    for ax, iou in zip(axes, ious, strict=False):
+        curve = sweep.curve(iou, class_name)
+
+        for metric in ("precision", "recall", "f1"):
+            ax.plot(
+                curve["score"],
+                curve[metric],
+                color=SWEEP_METRIC_COLORS[metric],
+                label=SWEEP_METRIC_LABELS[metric],
+                linewidth=2,
+            )
+
+        if annotate_best:
+            best = sweep.best_f1(iou, class_name)
+
+            if np.isfinite(best["score"]):
+                ax.axvline(
+                    best["score"],
+                    color="#444444",
+                    linestyle="--",
+                    linewidth=0.9,
+                    zorder=1,
+                )
+                ax.annotate(
+                    f"F1 {best['f1']:.3f} @ {best['score']:.2f}\n"
+                    f"P {best['precision']:.2f}  R {best['recall']:.2f}",
+                    xy=(best["score"], best["f1"]),
+                    xytext=(6, -28),
+                    textcoords="offset points",
+                    fontsize=7,
+                )
+
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.02)
+        ax.set_xlabel("Confidence threshold")
+        ax.set_title(f"IoU {iou:.2f}")
+
+        _prepare_axis(ax)
+
+    axes[0].set_ylabel("Precision / Recall / F1")
+    axes[0].legend(loc="upper right")
+
+    heading = title or "Precision, recall and F1 vs. confidence"
+
+    if class_name != MICRO_CLASS:
+        heading += f" - {class_name}"
+
+    fig.suptitle(heading)
+    fig.tight_layout()
+
+    return fig
+
+
+def _sweep_label(runs: pd.DataFrame | None, platform: str, run: str) -> str:
+    """Label a sweep from parsed run metadata when available."""
+
+    if runs is not None and not runs.empty and "run" in runs.columns:
+        match = runs[(runs["platform"] == platform) & (runs["run"] == run)]
+
+        if not match.empty:
+            row = add_scheme(match).iloc[0]
+
+            return (
+                f"{platform_label(platform)} | "
+                f"{_short(pd.Series([row['arch_label']])).iloc[0]} | "
+                f"{scheme_label(row['scheme'])}"
+            )
+
+    return f"{platform} | {run}"
+
+
+def plot_f1_vs_confidence(
+    sweeps: dict[tuple[str, str], ScoreSweep],
+    runs: pd.DataFrame | None = None,
+    iou_thresholds: float | Iterable[float] | None = (0.5, 0.75),
+    *,
+    class_name: str = MICRO_CLASS,
+    labels: dict[tuple[str, str], str] | None = None,
+    figsize: tuple[float, float] | None = None,
+):
+    """Compare the F1/confidence curve of several runs, one panel per IoU.
+
+    Pass ``runs`` (from :func:`load_benchmark_results`, pre-filtered to the runs
+    of interest) to label curves by architecture and export scheme; only sweeps
+    whose key appears in ``runs`` are then drawn.
+    """
+    if not sweeps:
+        return None
+
+    selected = dict(sweeps)
+
+    if runs is not None and not runs.empty:
+        keep = set(zip(runs["platform"], runs["run"], strict=False))
+        selected = {k: v for k, v in selected.items() if k in keep}
+
+    if not selected:
+        return None
+
+    ious = _panel_ious(iou_thresholds, (0.5, 0.75))
+
+    if not ious:
+        return None
+
+    if figsize is None:
+        figsize = (5.0 * len(ious), 3.9)
+
+    fig, axes = plt.subplots(1, len(ious), figsize=figsize, sharey=True)
+    axes = np.atleast_1d(axes)
+
+    drawn = False
+
+    for ax, iou in zip(axes, ious, strict=False):
+        for index, key in enumerate(sorted(selected)):
+            sweep = selected[key]
+
+            if not any(abs(v - iou) < 1e-9 for v in sweep.iou_thresholds):
+                continue
+
+            curve = sweep.curve(iou, class_name)
+
+            label = (labels or {}).get(key) or _sweep_label(runs, *key)
+
+            ax.plot(
+                curve["score"],
+                curve["f1"],
+                color=PALETTE[index % len(PALETTE)],
+                label=label,
+                linewidth=1.8,
+            )
+
+            drawn = True
+
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.02)
+        ax.set_xlabel("Confidence threshold")
+        ax.set_title(f"IoU {iou:.2f}")
+
+        _prepare_axis(ax)
+
+    if not drawn:
+        plt.close(fig)
+        return None
+
+    axes[0].set_ylabel("F1")
+
+    fig.suptitle("F1 vs. confidence threshold")
+    fig.tight_layout()
+    _legend_outside(fig, axes[-1])
+
+    return fig
+
+
+def operating_point_table(
+    sweeps: dict[tuple[str, str], ScoreSweep],
+    runs: pd.DataFrame | None = None,
+    *,
+    class_name: str = MICRO_CLASS,
+    iou_thresholds: Iterable[float] = (0.5, 0.75),
+) -> pd.DataFrame:
+    """Tabulate the F1-optimal threshold and its precision/recall per run.
+
+    ``runs`` labels and restricts the rows, as in
+    :func:`plot_f1_vs_confidence`; without it every sweep is listed.
+    """
+    selected = dict(sweeps)
+
+    if runs is not None and not runs.empty:
+        keep = set(zip(runs["platform"], runs["run"], strict=False))
+        selected = {k: v for k, v in selected.items() if k in keep}
+
+    rows = []
+
+    for key in sorted(selected):
+        sweep = selected[key]
+        platform, run = key
+
+        row = {
+            "Platform": platform,
+            "Run": run,
+            "Label": _sweep_label(runs, platform, run),
+        }
+
+        for iou in iou_thresholds:
+            if not any(abs(v - iou) < 1e-9 for v in sweep.iou_thresholds):
+                continue
+
+            best = sweep.best_f1(iou, class_name)
+            tag = f"@{iou:.2f}"
+
+            row[f"conf{tag}"] = round(best["score"], 3)
+            row[f"F1{tag}"] = round(best["f1"], 4)
+            row[f"P{tag}"] = round(best["precision"], 4)
+            row[f"R{tag}"] = round(best["recall"], 4)
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def save_figure(

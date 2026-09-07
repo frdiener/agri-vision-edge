@@ -1323,7 +1323,84 @@ def _(NMS, arch_df, br, mo, show_fig):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 6.2 · Tiling and apparent object scale
+    ### 6.2 · Operating point: precision, recall and F1 vs. confidence
+
+    AP integrates over the whole ranking and cannot say where to put the score
+    threshold. These curves sweep that axis, one panel per IoU threshold. The
+    dashed line marks the F1-optimal operating point.
+
+    Read from the `score_sweep.json` that `ave evaluate` writes beside each
+    `metrics.json`; `scripts/evaluate_all.sh` backfills runs that lack one.
+    Curves start at the export score floor (~0.05).
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(BENCHMARK_ROOT, br):
+    sweeps = br.load_score_sweeps(BENCHMARK_ROOT)
+    return (sweeps,)
+
+
+@app.cell(hide_code=True)
+def _(br, mo, show_fig, sweeps, view):
+    # One representative run: the CPU reference at the reference configuration.
+    _sel = view(platform=br.CPU_REFERENCE_PLATFORM, ref=True)
+    _keys = (
+        []
+        if _sel.empty
+        else [k for k in sweeps if k in set(zip(_sel["platform"], _sel["run"]))]
+    )
+
+    show_fig(
+        br.plot_pr_f1_vs_confidence(sweeps[_keys[0]]) if _keys else None,
+        "pr_f1_vs_confidence",
+        mo,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(br, mo, show_fig, sweeps, view):
+    # F1 only, comparing export schemes on the CPU reference.
+    show_fig(
+        br.plot_f1_vs_confidence(
+            sweeps,
+            view(
+                platform=br.CPU_REFERENCE_PLATFORM,
+                ref={"precision": None, "quant": None, "granularity": None},
+            ),
+        ),
+        "f1_vs_confidence_schemes",
+        mo,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(br, mo, show_table, sweeps, view):
+    show_table(
+        br.operating_point_table(
+            sweeps,
+            view(
+                platform=br.CPU_REFERENCE_PLATFORM,
+                ref={"precision": None, "quant": None, "granularity": None},
+            ),
+        ),
+        "operating_points",
+        mo,
+        caption=(
+            "F1-optimal confidence threshold and the precision/recall it yields, "
+            "at IoU 0.50 and 0.75."
+        ),
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    ### 6.3 · Tiling and apparent object scale
 
     Each tile is a 512² crop of a 1024² frame (3×3, 50% overlap), equivalent to
     2× linear magnification. Training and evaluation tiling therefore model object
@@ -1363,7 +1440,7 @@ def _(br, mo, show_table, view):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### 6.3 · NMS latency
+    ### 6.4 · NMS latency
 
     Fast NMS uses one class-agnostic suppression pass; regular NMS uses one pass per
     class. Their single-class latency difference estimates run-to-run drift. The
@@ -1404,7 +1481,7 @@ def _(br, mo, show_table, view):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    ### 6.4 · Input resolution
+    ### 6.5 · Input resolution
 
     Compare 320, 512, and 1024 inputs at the reference configuration. Accuracy is
     measured on the CPU reference; latency and FPS are reported per board. Host
