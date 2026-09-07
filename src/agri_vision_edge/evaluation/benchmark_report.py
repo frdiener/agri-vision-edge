@@ -4713,7 +4713,12 @@ def plot_f1_vs_confidence(
 
     axes[0].set_ylabel("F1")
 
-    fig.suptitle("F1 vs. confidence threshold")
+    heading = "F1 vs. confidence threshold"
+
+    if class_name != MICRO_CLASS:
+        heading += f" - {class_name}"
+
+    fig.suptitle(heading)
     fig.tight_layout()
     _legend_outside(fig, axes[-1])
 

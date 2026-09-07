@@ -1329,6 +1329,9 @@ def _(mo):
     threshold. These curves sweep that axis, one panel per IoU threshold. The
     dashed line marks the F1-optimal operating point.
 
+    Curves are per class. Pooling the classes would be dominated by crop, which
+    has both more instances and much better detection than weed.
+
     Read from the `score_sweep.json` that `ave evaluate` writes beside each
     `metrics.json`; `scripts/evaluate_all.sh` backfills runs that lack one.
     Curves start at the export score floor (~0.05).
@@ -1352,10 +1355,19 @@ def _(br, mo, show_fig, sweeps, view):
         else [k for k in sweeps if k in set(zip(_sel["platform"], _sel["run"]))]
     )
 
-    show_fig(
-        br.plot_pr_f1_vs_confidence(sweeps[_keys[0]]) if _keys else None,
-        "pr_f1_vs_confidence",
-        mo,
+    _sweep = sweeps[_keys[0]] if _keys else None
+
+    mo.vstack(
+        [
+            show_fig(
+                br.plot_pr_f1_vs_confidence(_sweep, class_name=_cls),
+                f"pr_f1_vs_confidence_{_cls}",
+                mo,
+            )
+            for _cls in _sweep.per_class
+        ]
+        if _sweep is not None
+        else [show_fig(None, "pr_f1_vs_confidence", mo)]
     )
     return
 
@@ -1370,6 +1382,7 @@ def _(br, mo, show_fig, sweeps, view):
                 platform=br.CPU_REFERENCE_PLATFORM,
                 ref={"precision": None, "quant": None, "granularity": None},
             ),
+            class_name="weed",
         ),
         "f1_vs_confidence_schemes",
         mo,
@@ -1386,12 +1399,13 @@ def _(br, mo, show_table, sweeps, view):
                 platform=br.CPU_REFERENCE_PLATFORM,
                 ref={"precision": None, "quant": None, "granularity": None},
             ),
+            class_name="weed",
         ),
         "operating_points",
         mo,
         caption=(
-            "F1-optimal confidence threshold and the precision/recall it yields, "
-            "at IoU 0.50 and 0.75."
+            "Weed-class F1-optimal confidence threshold and the precision/recall "
+            "it yields, at IoU 0.50 and 0.75."
         ),
     )
     return
