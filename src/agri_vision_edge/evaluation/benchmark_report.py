@@ -4465,13 +4465,17 @@ def save_latex_table(
     *,
     caption: str = "",
     label: str | None = None,
-    split_by: str | None = None,
+    split_by: str | tuple[str, ...] | None = None,
+    drop_split_by: bool = False,
+    clear_between_panels: bool = True,
     **to_latex_kwargs,
 ) -> None:
     """Write a DataFrame as an ASCII-safe booktabs LaTeX table.
 
     Non-default indexes are preserved as columns. ``split_by`` emits one continued
-    table panel per group.
+    table panel per group. With ``drop_split_by``, the invariant group identifiers
+    move into each panel caption instead of being repeated in every row. Disable
+    ``clear_between_panels`` when several short panels should share a page.
     """
     if df.empty:
         return
@@ -4493,10 +4497,14 @@ def save_latex_table(
     if split_by is not None:
         if not caption:
             raise ValueError("split_by requires a caption")
-        if split_by not in df.columns:
-            raise ValueError(f"split column not found: {split_by}")
-        groups = list(df.groupby(split_by, sort=False, dropna=False))
+        split_columns = [split_by] if isinstance(split_by, str) else list(split_by)
+        missing = [column for column in split_columns if column not in df.columns]
+        if missing:
+            raise ValueError(f"split column not found: {', '.join(missing)}")
+        group_key = split_columns[0] if len(split_columns) == 1 else split_columns
+        groups = list(df.groupby(group_key, sort=False, dropna=False))
     else:
+        split_columns = []
         groups = [(None, df)]
 
     kwargs = {
@@ -4506,34 +4514,50 @@ def save_latex_table(
         "float_format": "%.4g",
     }
     kwargs.update(to_latex_kwargs)
-    table_bodies = [
-        (group, _ascii(group_df.to_latex(**kwargs))) for group, group_df in groups
-    ]
+    table_bodies = []
+    for group, group_df in groups:
+        if drop_split_by:
+            group_df = group_df.drop(columns=split_columns)
+        table_bodies.append((group, _ascii(group_df.to_latex(**kwargs))))
 
     if caption:
         label = label or path.stem
         # Scale only tables wider than the text block.
         panels = []
+        placement = "H" if split_by is not None else "htbp"
         for panel_index, (group, table_body) in enumerate(table_bodies):
-            if panel_index == 0:
-                heading = f"\\caption{{{_ascii(caption)}}}\n\\label{{tab:{label}}}\n"
+            if group is None:
+                group_label = ""
             else:
-                group_label = _ascii(str(group)).replace("_", "\\_")
+                values = group if isinstance(group, tuple) else (group,)
+                group_label = "; ".join(
+                    f"{column}: {_ascii(str(value)).replace('_', ' ')}"
+                    for column, value in zip(split_columns, values, strict=True)
+                )
+            if panel_index == 0:
+                panel_suffix = (
+                    f" Panel: {group_label}." if drop_split_by and group is not None else ""
+                )
+                heading = (
+                    f"\\caption{{{_ascii(caption)}{panel_suffix}}}\n"
+                    f"\\label{{tab:{label}}}\n"
+                )
+            else:
                 heading = (
                     "{\\centering\\small\\textbf{\\tablename~\\thetable:} "
-                    f"(continued) \\texttt{{{group_label}}}.\\par}}\n"
+                    f"(continued) {group_label}.\\par}}\n"
                     "\\vspace{\\belowcaptionskip}\n"
                 )
             panels.append(
-                # Allow normal, top, bottom and float-page placement.
-                "\\begin{table}[htbp]\n\\centering\n"
+                f"\\begin{{table}}[{placement}]\n\\centering\n"
                 f"{heading}"
                 "\\begin{adjustbox}{max width=\\linewidth}\n"
                 f"{table_body}"
                 "\\end{adjustbox}\n"
                 "\\end{table}\n"
             )
-        body = "\\clearpage\n".join(panels)
+        separator = "\\clearpage\n" if clear_between_panels else "\n"
+        body = separator.join(panels)
     else:
         body = table_bodies[0][1]
     path.write_text(body)

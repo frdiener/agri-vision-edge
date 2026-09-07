@@ -17,9 +17,8 @@ the detection is accepted as a match -- at **every** IoU threshold, because the
 comparison never depends on the threshold. Every detection therefore matches
 some ground truth, and AP@0.50 = AP@0.55 = ... = AP@0.95.
 
-That gives the fingerprint worth remembering: **``AP == AP50`` (to full float
-precision) means the boxes are not real.** A genuine detector's AP is always
-well below its AP50.
+That gives the fingerprint: **``AP == AP50`` (to full float precision) means the
+boxes are not real.** A genuine detector's AP is always well below its AP50.
 
 Scores outside ``[0, 1]`` are the second symptom. They cannot corrupt AP by
 themselves (only the ranking matters), but a "score" of 6.0 means the tensor

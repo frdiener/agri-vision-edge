@@ -735,6 +735,21 @@ def _(br, delegation, dg, mo, show_table):
             _table = _table.drop_duplicates(["Architecture", "Scheme"])
             # Drop the unstable positional index from parsed logs.
             _table = _table.reset_index(drop=True)
+            _table["Scheme"] = _table["Scheme"].replace(
+                {
+                    "fp32_ptq": "FP32 PTQ",
+                    "int8_ptq_per-channel": "INT8 PTQ/C",
+                    "int8_ptq_per-tensor": "INT8 PTQ/T",
+                    "int8_qat_per-channel": "INT8 QAT/C",
+                    "int8_qat_per-tensor": "INT8 QAT/T",
+                }
+            )
+            _table["Architecture"] = _table["Architecture"].replace(
+                {
+                    "SSD MobileNetV2": "MNv2",
+                    "SSD MobileNetV2 FPNLite": "FPNLite",
+                }
+            )
         show_table(
             _table,
             f"continuity_{_plat.replace('frdm-', '').replace('-', '')}",
@@ -763,14 +778,33 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(br, mo, show_table, view):
+    _table = br.device_latency_table(
+        view(nms=br.DEFAULT_NMS, ref=True, deployable=True), nms=br.DEFAULT_NMS
+    ).drop(columns=["Input"])
+    _table["Board"] = _table["Board"].replace(
+        {"frdm-imx8mp": "i.MX8MP", "frdm-imx93": "i.MX93"}
+    )
+    _table["Architecture"] = _table["Architecture"].replace(
+        {
+            "SSD MobileNetV2": "MNv2",
+            "SSD MobileNetV2 FPNLite": "FPNLite",
+        }
+    )
+    _table["Scheme"] = _table["Scheme"].replace(
+        {
+            "fp32_ptq": "FP32 PTQ",
+            "int8_ptq_per-channel": "INT8 PTQ/C",
+            "int8_ptq_per-tensor": "INT8 PTQ/T",
+            "int8_qat_per-channel": "INT8 QAT/C",
+            "int8_qat_per-tensor": "INT8 QAT/T",
+        }
+    )
     show_table(
-        br.device_latency_table(
-            view(nms=br.DEFAULT_NMS, ref=True, deployable=True), nms=br.DEFAULT_NMS
-        ),
+        _table,
         "device_latency",
         mo,
         caption="Median latency and throughput for correct exports at the "
-        "reference configuration, comparing each board's CPU and NPU.",
+        "reference input of $320\\times320$, comparing each board's CPU and NPU.",
     )
     return
 
@@ -1060,41 +1094,90 @@ def _(NMS, br, mo, power_judged, show_fig):
 
 
 @app.cell
-def _(mo, power_judged, show_table):
-    show_table(
-        power_judged[
-            (power_judged["aligned"] == True)  # noqa: E712
-            & (power_judged["nms"] == "regnms")
-            & (power_judged["device"].isin(["frdm-imx8mp", "frdm-imx8mp_unpatched", "frdm-imx93"]))
-        ]
-        .drop(
-            columns=[
-                c
-                for c in (
-                    "run",
-                    "stamp",
-                    "backend",
-                    "state",
-                    "classes",
-                    "dataset",
-                    "nms",
-                    "aligned",
-                    "arch_label",
-                    "precision",
-                    "quant",
-                    "granularity",
-                )
-                if c in power_judged
-            ]
+def _(br, mo, pd, power_judged, show_table):
+    _power_table = power_judged[
+        (power_judged["aligned"] == True)  # noqa: E712
+        & (power_judged["nms"] == "regnms")
+        & (
+            power_judged["device"].isin(
+                ["frdm-imx8mp", "frdm-imx8mp_unpatched", "frdm-imx93"]
+            )
         )
-        .reset_index(drop=True),
+    ].copy()
+    _power_table["device"] = _power_table["device"].replace(
+        {
+            "frdm-imx8mp": "i.MX8M Plus",
+            "frdm-imx8mp_unpatched": (
+                "i.MX8M Plus, delegate build preceding the operator-support work"
+            ),
+            "frdm-imx93": "i.MX93",
+        }
+    )
+    _power_table["arch"] = _power_table["arch"].replace(br.ARCH_LABELS).replace(
+        {
+            "SSD MobileNetV2": "MNv2",
+            "SSD MobileNetV2 FPNLite": "FPNLite",
+        }
+    )
+    _power_table["scheme"] = _power_table["scheme"].replace(
+        {
+            "fp32_ptq": "FP32 PTQ",
+            "int8_ptq_per-channel": "INT8 PTQ/C",
+            "int8_ptq_per-tensor": "INT8 PTQ/T",
+            "int8_qat_per-channel": "INT8 QAT/C",
+            "int8_qat_per-tensor": "INT8 QAT/T",
+        }
+    )
+    # Run names carry the input size as a string, so order it numerically.
+    _power_table = _power_table.assign(
+        _px=pd.to_numeric(_power_table["size"], errors="coerce")
+    ).sort_values(["device", "arch", "_px", "scheme"], kind="stable")
+    _power_table = _power_table[
+        [
+            "device",
+            "arch",
+            "size",
+            "scheme",
+            "verdict",
+            "lat med (ms)",
+            "FPS",
+            "P (W)",
+            "net P (W)",
+            "net mJ/inf",
+            "CPU %",
+            "RSS (MiB)",
+            "temp max (C)",
+        ]
+    ].rename(
+        columns={
+            "device": "Board/build",
+            "arch": "Arch.",
+            "size": "Input",
+            "scheme": "Scheme",
+            "verdict": "Verdict",
+            "lat med (ms)": "Lat. (ms)",
+            "net P (W)": "Net P (W)",
+            "net mJ/inf": "Net (mJ)",
+            "temp max (C)": "Tmax (C)",
+        }
+    )
+    show_table(
+        _power_table.reset_index(drop=True),
         "power_summary",
         mo,
-        caption="Steady-state power, energy, and resource use across input "
-        "resolutions. The reference is $320\\times320$. Only \\texttt{ok} "
-        "verdicts are valid operating points; other rows retain measured power "
-        "and latency but do not represent a working detector.",
-        split_by="device",
+        caption="Selected steady-state performance, power, energy, and resource "
+        "metrics across input resolutions. Board/build is invariant within each "
+        "panel and stated in its caption; the second panel is the i.MX8M Plus "
+        "under the delegate build that preceded the operator-support work of "
+        "Section 5.5, so its verdicts describe that build and not the deployed "
+        "one. The reference is "
+        "$320\\times320$; C and T denote per-channel and per-tensor weights, and "
+        "net energy is per inference. Only "
+        "\\texttt{ok} verdicts are valid operating points; other rows retain real "
+        "measurements but do not represent a working detector. Full phase-level "
+        "measurements remain in the archived \\texttt{power\\_summary.json} files.",
+        split_by="Board/build",
+        drop_split_by=True,
     )
     return
 
@@ -1121,17 +1204,43 @@ def _(mo):
 
 @app.cell
 def _(NMS, br, mo, power_judged, show_table):
+    _table = br.accelerator_latency_table(
+        power_judged, nms=NMS, size=br.REFERENCE_CONFIG["size"]
+    )
+    _table["Board"] = _table["Board"].replace(
+        {"frdm-imx8mp": "i.MX8MP", "frdm-imx93": "i.MX93"}
+    )
+    _table["Architecture"] = _table["Architecture"].replace(
+        {
+            "SSD MobileNetV2": "MNv2",
+            "SSD MobileNetV2 FPNLite": "FPNLite",
+        }
+    )
+    _table["Scheme"] = _table["Scheme"].replace(
+        {
+            "int8_ptq_per-channel": "INT8 PTQ/C",
+            "int8_ptq_per-tensor": "INT8 PTQ/T",
+            "int8_qat_per-channel": "INT8 QAT/C",
+            "int8_qat_per-tensor": "INT8 QAT/T",
+        }
+    )
+    _table = _table.rename(
+        columns={
+            "CPU invoke (ms)": "CPU inv. (ms)",
+            "NPU invoke (ms)": "NPU inv. (ms)",
+            "Speedup (invoke)": "Inv. speedup",
+            "CPU predict (ms)": "CPU pred. (ms)",
+            "NPU predict (ms)": "NPU pred. (ms)",
+            "Speedup (predict)": "Pred. speedup",
+        }
+    )
     show_table(
         # Exclude timings from incorrect exports.
-        br.accelerator_latency_table(
-            power_judged, nms=NMS, size=br.REFERENCE_CONFIG["size"]
-        ),
+        _table,
         "accelerator_latency",
         mo,
-        caption="Delegated and board-CPU latency at the reference configuration, "
-        "for the full \\texttt{predict} call and graph-only \\texttt{invoke}. "
-        "Invoke includes CPU detection post-processing; \\texttt{CPU-side (ms)} "
-        "is \\texttt{preprocess} plus \\texttt{postprocess}.",
+        caption="Full-call and graph-only latency on each board at the reference "
+        "configuration. CPU-side time is preprocess plus postprocess.",
     )
     return
 

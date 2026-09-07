@@ -35,7 +35,7 @@ def _():
 @app.cell(hide_code=True)
 def _(PhenoBench):
     phenobench_train_dataset = PhenoBench(
-        root="datasets/phenobench_raw",
+        root="datasets/phenobench_raw_full",
         split="train",
         target_types=[
             "semantics",

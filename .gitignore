@@ -8,7 +8,9 @@ datasets/
 
 # never track large intermediate results
 predictions.json
+*.gz
 
+__marimo__/
 *.tern-port
 node_modules/
 npm-debug.log*
@@ -137,3 +139,22 @@ Thumbs.db
 # Project specific configs
 *.bak
 *.tmp
+
+# Measurement results
+# Global rules exclude predictions, compressed traces, and diagnostic logs.
+# Keep compact benchmark JSON and the delegate logs used by the notebook.
+!/benchmark_results/**/delegate_debug.log
+
+# Keep model manifests, not exported models or training artifacts.
+/artifacts/**
+!/artifacts/**/
+!/artifacts/**/manifest.json
+
+# Keep power summaries and phase metadata, not raw sweep data.
+/resource_results/**
+!/resource_results/**/
+!/resource_results/**/power_summary.json
+!/resource_results/**/run.json
+
+# The CSV is the final native-benchmark table; JSONL is append-only history.
+/native-benchmark/**/results.jsonl
