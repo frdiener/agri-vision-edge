@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from pycocotools.coco import COCO
@@ -14,6 +15,12 @@ from .partials import (
     DEFAULT_PARTIAL_THRESHOLD,
     filter_predictions_against_partials,
     split_annotations_by_partial,
+)
+from .score_sweep import (
+    SCORE_SWEEP_FILENAME,
+    compute_score_sweep,
+    operating_points,
+    save_score_sweep,
 )
 
 METRIC_NAMES = [
@@ -106,28 +113,54 @@ def _coco_from_dict(dataset: dict) -> COCO:
     return coco
 
 
-def evaluate_predictions(
+@dataclass(frozen=True)
+class PreparedEvaluation:
+    """
+    A predictions/ground-truth pair that is ready to be scored.
+
+    Every consumer must go through :func:`prepare_evaluation` rather than
+    assembling its own ``COCO`` objects, so that derived analyses (the
+    confidence sweep in :mod:`agri_vision_edge.evaluation.score_sweep`) are
+    computed on *exactly* the same detections and ground truth as the headline
+    metrics. Filtering the two independently is how an F1 curve ends up
+    disagreeing with the AP50 printed next to it.
+    """
+
+    #: Ground truth with partial ("do-not-care") annotations removed.
+    coco_gt: COCO
+
+    #: Detections loaded into pycocotools' result structure.
+    coco_dt: COCO
+
+    #: The detection dicts backing ``coco_dt``, after partial filtering.
+    predictions: list[dict]
+
+    #: Whether detections landing on partial plants were dropped.
+    ignore_partials: bool = False
+
+    partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD
+
+
+def prepare_evaluation(
     annotations_path: str | Path,
     predictions_path: str | Path,
     ignore_partials: bool = False,
     partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
     allow_corrupt: bool = False,
-) -> dict:
+) -> PreparedEvaluation | None:
     """
-    Evaluate a COCO predictions file.
-
-    Returns the 12 aggregate (class-averaged) metrics in ``METRIC_NAMES`` plus a
-    ``per_class`` entry mapping each category name to its own 12 metrics.
+    Load, validate and filter a predictions/annotations pair for scoring.
 
     Partial ("do-not-care") ground-truth annotations (flagged ``partial`` /
     ``ignore`` / low ``visibility`` -- see
     :mod:`agri_vision_edge.evaluation.partials`) are always excluded from the
-    scored ground-truth, matching the pre-partials behaviour. When
-    ``ignore_partials`` is set, the PhenoBench rule is additionally applied to
-    the predictions: any detection whose area is more than ``partial_threshold``
-    contained inside a partial ground-truth box is dropped, so a hit on a
-    partial plant is not counted as a false positive. Scoring stays
-    pycocotools-based, so numbers remain comparable across the pipeline.
+    scored ground-truth. When ``ignore_partials`` is set, the PhenoBench rule is
+    additionally applied to the predictions: any detection whose area is more
+    than ``partial_threshold`` contained inside a partial ground-truth box is
+    dropped, so a hit on a partial plant is not counted as a false positive.
+
+    Returns ``None`` when the predictions file is empty -- there is nothing to
+    score, and the ground truth is not even read.
     """
 
     with open(predictions_path) as f:
@@ -138,12 +171,7 @@ def evaluate_predictions(
     #
 
     if not predictions:
-        print(f"[warning] no predictions: {predictions_path}")
-
-        metrics = dict.fromkeys(METRIC_NAMES, 0.0)
-        metrics["per_class"] = {}
-
-        return metrics
+        return None
 
     # Non-finite boxes make pycocotools match every detection at every IoU
     # threshold, which yields a high AP (with AP == AP50) instead of an error.
@@ -185,9 +213,38 @@ def evaluate_predictions(
 
     coco_dt = coco_gt.loadRes(predictions)
 
+    return PreparedEvaluation(
+        coco_gt=coco_gt,
+        coco_dt=coco_dt,
+        predictions=predictions,
+        ignore_partials=ignore_partials,
+        partial_threshold=partial_threshold,
+    )
+
+
+def empty_metrics() -> dict:
+    """Metrics for a run that produced no detections at all."""
+
+    # Annotated: the aggregate entries are floats but ``per_class`` is a dict.
+    metrics: dict = dict.fromkeys(METRIC_NAMES, 0.0)
+    metrics["per_class"] = {}
+
+    return metrics
+
+
+def evaluate_prepared(prepared: PreparedEvaluation) -> dict:
+    """
+    Score an already-prepared pair with the standard COCO parameters.
+
+    Split out of :func:`evaluate_predictions` so callers that also want the
+    confidence sweep prepare once and score the identical detections.
+    """
+
+    coco_gt = prepared.coco_gt
+
     evaluator = COCOeval(
         coco_gt,
-        coco_dt,
+        prepared.coco_dt,
         "bbox",
     )
 
@@ -195,7 +252,7 @@ def evaluate_predictions(
     evaluator.accumulate()
     evaluator.summarize()
 
-    metrics = {
+    metrics: dict = {
         name: float(value)
         for name, value in zip(
             METRIC_NAMES,
@@ -209,17 +266,103 @@ def evaluate_predictions(
     return metrics
 
 
+def evaluate_predictions(
+    annotations_path: str | Path,
+    predictions_path: str | Path,
+    ignore_partials: bool = False,
+    partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
+    allow_corrupt: bool = False,
+) -> dict:
+    """
+    Evaluate a COCO predictions file.
+
+    Returns the 12 aggregate (class-averaged) metrics in ``METRIC_NAMES`` plus a
+    ``per_class`` entry mapping each category name to its own 12 metrics.
+
+    Partial handling is described on :func:`prepare_evaluation`. Scoring stays
+    pycocotools-based, so numbers remain comparable across the pipeline.
+    """
+
+    prepared = prepare_evaluation(
+        annotations_path,
+        predictions_path,
+        ignore_partials=ignore_partials,
+        partial_threshold=partial_threshold,
+        allow_corrupt=allow_corrupt,
+    )
+
+    #
+    # No detections
+    #
+
+    if prepared is None:
+        print(f"[warning] no predictions: {predictions_path}")
+
+        return empty_metrics()
+
+    return evaluate_prepared(prepared)
+
+
+def evaluate_and_sweep(
+    annotations_path: str | Path,
+    predictions_path: str | Path,
+    ignore_partials: bool = False,
+    partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
+    allow_corrupt: bool = False,
+    score_sweep: bool = True,
+):
+    """
+    Evaluate a predictions file and, optionally, sweep the confidence threshold.
+
+    Returns ``(metrics, sweep)``; ``sweep`` is ``None`` when disabled or when
+    there are no detections. Both come from one :func:`prepare_evaluation` call,
+    so the curve and the AP beside it describe the same detections.
+    """
+
+    prepared = prepare_evaluation(
+        annotations_path,
+        predictions_path,
+        ignore_partials=ignore_partials,
+        partial_threshold=partial_threshold,
+        allow_corrupt=allow_corrupt,
+    )
+
+    if prepared is None:
+        print(f"[warning] no predictions: {predictions_path}")
+
+        return empty_metrics(), None
+
+    metrics = evaluate_prepared(prepared)
+
+    if not score_sweep:
+        return metrics, None
+
+    # `metrics` is returned untouched: the sweep is its own artifact, so
+    # re-evaluating an existing tree adds a file rather than rewriting one.
+    return metrics, compute_score_sweep(prepared)
+
+
 def save_metrics(
     metrics: dict,
     output_path: str | Path,
-):
+) -> bool:
+    """
+    Write metrics, returning whether the file changed.
 
-    with open(output_path, "w") as f:
-        json.dump(
-            metrics,
-            f,
-            indent=2,
-        )
+    An unchanged file is left alone, so backfilling score_sweep.json across an
+    evaluated tree does not touch recorded results at all -- not even mtimes.
+    """
+
+    payload = json.dumps(metrics, indent=2)
+
+    output_path = Path(output_path)
+
+    if output_path.exists() and output_path.read_text() == payload:
+        return False
+
+    output_path.write_text(payload)
+
+    return True
 
 
 def evaluate_model_dir(
@@ -228,6 +371,7 @@ def evaluate_model_dir(
     ignore_partials: bool = False,
     partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
     allow_corrupt: bool = False,
+    score_sweep: bool = True,
 ):
     """
     Evaluate one benchmark directory.
@@ -238,6 +382,8 @@ def evaluate_model_dir(
     error_path = model_dir / "error.json"
 
     metrics_path = model_dir / "metrics.json"
+
+    sweep_path = model_dir / SCORE_SWEEP_FILENAME
 
     #
     # Failed benchmark
@@ -260,12 +406,13 @@ def evaluate_model_dir(
     print(f"\n=== Evaluating: {model_dir.name} ===")
 
     try:
-        metrics = evaluate_predictions(
+        metrics, sweep = evaluate_and_sweep(
             annotations_path,
             predictions_path,
             ignore_partials=ignore_partials,
             partial_threshold=partial_threshold,
             allow_corrupt=allow_corrupt,
+            score_sweep=score_sweep,
         )
     except CorruptPredictionsError as exc:
         # Skip loudly rather than abort the sweep -- but do NOT write metrics,
@@ -274,6 +421,10 @@ def evaluate_model_dir(
         print(f"[skip] {model_dir.name}: {exc}")
 
         metrics_path.unlink(missing_ok=True)
+
+        # Same reasoning for the curve: a stale sweep from an earlier, healthy
+        # run would otherwise still be picked up by the report.
+        sweep_path.unlink(missing_ok=True)
 
         save_metrics(
             {"status": "corrupt_predictions", "message": str(exc)},
@@ -287,6 +438,11 @@ def evaluate_model_dir(
         metrics_path,
     )
 
+    if sweep is None:
+        sweep_path.unlink(missing_ok=True)
+    else:
+        save_score_sweep(sweep, sweep_path)
+
     print()
 
     print(f"AP:   {metrics['AP']:.4f}")
@@ -297,7 +453,39 @@ def evaluate_model_dir(
 
     print_per_class(metrics)
 
+    print_operating_points(sweep)
+
     return True
+
+
+def print_operating_points(sweep):
+    """
+    Print the best-F1 confidence threshold for each IoU threshold.
+
+    Takes the sweep, not ``metrics``: operating points are derived from it on
+    demand and deliberately never written into metrics.json, which holds only
+    threshold-free aggregates.
+    """
+
+    if sweep is None:
+        return
+
+    points = operating_points(sweep)
+
+    if not points:
+        return
+
+    print()
+    print(f"{'best F1':<16} {'conf':>8} {'F1':>8} {'P':>8} {'R':>8}")
+
+    for key, point in points.items():
+        # "f1_best@0.50" -> "IoU 0.50"
+        label = f"IoU {key.split('@')[-1]}"
+
+        print(
+            f"{label:<16} {point['score']:>8.3f} {point['f1']:>8.4f} "
+            f"{point['precision']:>8.4f} {point['recall']:>8.4f}"
+        )
 
 
 def print_per_class(metrics: dict):
