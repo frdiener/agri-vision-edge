@@ -82,8 +82,11 @@ def benchmark_model(
 
     # The factory selects SSD (post-NMS) vs YOLOv7-tiny (raw grids) by output
     # shape; score_threshold is pinned to 0.0 (overriding any embedded metadata
-    # default) so COCO eval sees every detection — the YOLO runtime floors
-    # candidates internally to keep NMS tractable.
+    # default) so COCO eval sees every detection the runtime is given — the
+    # YOLO runtime floors candidates internally to keep NMS tractable.
+    #
+    # This does not lift the baked-in floor on SSD exports
+
     runtime = build_runtime(
         model_path=model_path,
         delegate_path=delegate,
@@ -117,9 +120,7 @@ def env_var(value: str) -> tuple[str, str]:
     try:
         key, val = value.split("=", 1)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"expected KEY=VALUE, got {value!r}"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {value!r}") from exc
 
     if not key:
         raise argparse.ArgumentTypeError("environment-variable name cannot be empty")
@@ -158,10 +159,7 @@ def main(argv=None):
     parser.add_argument(
         "--output-prefix",
         default="",
-        help=(
-            "Prefix added to each model result directory name "
-            "inside --output-dir"
-        ),
+        help=("Prefix added to each model result directory name inside --output-dir"),
     )
 
     parser.add_argument(
