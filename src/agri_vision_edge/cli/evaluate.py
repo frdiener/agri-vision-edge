@@ -16,8 +16,9 @@ import json
 from pathlib import Path
 
 from agri_vision_edge.evaluation.coco import (
+    evaluate_and_sweep,
     evaluate_model_dir,
-    evaluate_predictions,
+    print_operating_points,
     print_per_class,
     save_metrics,
 )
@@ -147,6 +148,15 @@ def main(argv=None):
     )
 
     parser.add_argument(
+        "--no-score-sweep",
+        action="store_true",
+        help=(
+            "Skip the confidence sweep (score_sweep.json). It re-runs matching "
+            "at IoU 0.50/0.75 only, adding roughly 10%% to evaluation time."
+        ),
+    )
+
+    parser.add_argument(
         "--faithful",
         action="store_true",
         help=(
@@ -190,12 +200,13 @@ def main(argv=None):
 
     if input_path.is_file():
         try:
-            metrics = evaluate_predictions(
+            metrics, sweep = evaluate_and_sweep(
                 annotations_path,
                 input_path,
                 ignore_partials=args.ignore_partials,
                 partial_threshold=args.partial_threshold,
                 allow_corrupt=args.allow_corrupt_predictions,
+                score_sweep=not args.no_score_sweep,
             )
         except CorruptPredictionsError as exc:
             raise SystemExit(f"[error] {exc}") from exc
@@ -204,10 +215,20 @@ def main(argv=None):
         # aggregate + per-class metrics land in written data, not just stdout.
         metrics_path = input_path.with_name("metrics.json")
 
-        save_metrics(
-            metrics,
-            metrics_path,
-        )
+        changed = save_metrics(metrics, metrics_path)
+
+        written = [metrics_path] if changed else []
+        unchanged = [] if changed else [metrics_path]
+
+        if sweep is not None:
+            from agri_vision_edge.evaluation.score_sweep import (
+                SCORE_SWEEP_FILENAME,
+                save_score_sweep,
+            )
+
+            sweep_path = input_path.with_name(SCORE_SWEEP_FILENAME)
+            save_score_sweep(sweep, sweep_path)
+            written.append(sweep_path)
 
         print()
 
@@ -220,7 +241,15 @@ def main(argv=None):
 
         print_per_class(metrics)
 
-        print(f"\nwrote {metrics_path}")
+        print_operating_points(sweep)
+
+        print()
+
+        for path in written:
+            print(f"wrote {path}")
+
+        for path in unchanged:
+            print(f"unchanged {path}")
 
         return
 
@@ -266,6 +295,7 @@ def main(argv=None):
             ignore_partials=args.ignore_partials,
             partial_threshold=args.partial_threshold,
             allow_corrupt=args.allow_corrupt_predictions,
+            score_sweep=not args.no_score_sweep,
         )
 
         if ok:
