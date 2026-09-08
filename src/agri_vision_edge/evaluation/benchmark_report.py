@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -836,8 +836,8 @@ CPU_REFERENCE_PLATFORM = "x86_cpu"
 #: Metrics compared when checking that every CPU tree agrees with the reference.
 CPU_REFERENCE_METRICS = ("AP", "AP50", "AP75", "weed_AP", "crop_AP")
 
-#: Tolerance for CPU-reference metric differences.
-CPU_REFERENCE_TOLERANCE = 1e-5
+#: Tolerance for CPU-reference metric differences, per precision.
+CPU_REFERENCE_TOLERANCE = {"fp32": 1e-5, "int8": 2e-3}
 
 
 def cpu_reference_divergence(
@@ -897,30 +897,82 @@ def cpu_reference_divergence(
             if diff.empty:
                 continue
 
-            rows.append(
-                {
-                    "platform": platform,
-                    "reference": reference,
-                    "metric": metric,
-                    "configs": int(len(diff)),
-                    "max_abs_diff": float(diff.max()),
-                    "mean_abs_diff": float(diff.mean()),
-                    "bit_identical": int((diff < 1e-9).sum()),
-                }
+            # Report per precision: INT8 and FP32 disagree with the reference
+            # for different reasons and carry different tolerances.
+            grouped = (
+                diff.groupby(level="precision")
+                if "precision" in (diff.index.names or [])
+                else [("-", diff)]
             )
 
+            for precision, sub in grouped:
+                rows.append(
+                    {
+                        "platform": platform,
+                        "reference": reference,
+                        "precision": precision,
+                        "metric": metric,
+                        "configs": int(len(sub)),
+                        "max_abs_diff": float(sub.max()),
+                        "mean_abs_diff": float(sub.mean()),
+                        "bit_identical": int((sub < 1e-9).sum()),
+                    }
+                )
+
     return pd.DataFrame(rows)
+
+
+def _tolerance_bounds(
+    divergence: pd.DataFrame,
+    tolerance: float | Mapping[str, float],
+) -> pd.Series:
+    """Per-row tolerance for a divergence frame.
+
+    A scalar applies to every row. A mapping is keyed by precision; precisions
+    it does not name fall back to its strictest bound, so an unrecognised
+    export can never be waved through.
+    """
+    if not isinstance(tolerance, Mapping):
+        return pd.Series(float(tolerance), index=divergence.index)
+
+    strictest = min(tolerance.values())
+
+    if "precision" not in divergence.columns:
+        return pd.Series(strictest, index=divergence.index)
+
+    return divergence["precision"].map(tolerance).astype(float).fillna(strictest)
 
 
 def cpu_reference_holds(
     divergence: pd.DataFrame,
     *,
-    tolerance: float = CPU_REFERENCE_TOLERANCE,
+    tolerance: float | Mapping[str, float] = CPU_REFERENCE_TOLERANCE,
 ) -> bool:
-    """Return whether all CPU-reference differences are below ``tolerance``."""
+    """Return whether every CPU-reference difference is within tolerance."""
     if divergence.empty:
         return False
-    return bool((divergence["max_abs_diff"] < tolerance).all())
+    return bool(
+        (divergence["max_abs_diff"] < _tolerance_bounds(divergence, tolerance)).all()
+    )
+
+
+def cpu_reference_summary(
+    divergence: pd.DataFrame,
+    *,
+    tolerance: float | Mapping[str, float] = CPU_REFERENCE_TOLERANCE,
+) -> str:
+    """Render the worst divergence against its bound, one clause per precision."""
+    if divergence.empty:
+        return ""
+
+    bounds = _tolerance_bounds(divergence, tolerance)
+    frame = divergence.assign(_bound=bounds)
+    group = "precision" if "precision" in frame.columns else "metric"
+
+    return ", ".join(
+        f"{name} {rows['max_abs_diff'].max():.1e} of {rows['_bound'].iloc[0]:.0e}"
+        for name, rows in frame.groupby(group)
+    )
 
 
 #: Colours for the five deployable exports, float first then INT8 coarse->fine.

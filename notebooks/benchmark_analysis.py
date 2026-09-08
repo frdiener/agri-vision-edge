@@ -391,14 +391,16 @@ def _(NMS, br, mo, view):
             mo.md(
                 f"**CPU reference {'holds' if _ok else 'FAILS — do not collapse the CPU trees'}.** "
                 f"Worst disagreement with `{br.CPU_REFERENCE_PLATFORM}` across "
-                f"{int(_div['configs'].max())} shared configs is "
-                f"`{_div['max_abs_diff'].max():.2e}`, tolerance "
-                f"`{br.CPU_REFERENCE_TOLERANCE:.0e}`."
+                f"{int(_div['configs'].max())} shared configs, per precision: "
+                f"`{br.cpu_reference_summary(_div)}`. INT8 carries the looser bound "
+                f"because quantised scores tie at the per-image top-k cutoff and the "
+                f"x86 and ARM kernels break those ties differently."
             ),
             kind="success" if _ok else "danger",
         )
 
     mo.vstack([_verdict, mo.ui.table(_div, selection=None)])
+
     return
 
 
