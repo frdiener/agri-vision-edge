@@ -1,33 +1,7 @@
-"""
-Kaggle runtime metadata collection utilities.
+"""Capture Kaggle experiment provenance from non-secret environment variables.
 
-This module provides lightweight provenance capture for experiments
-executed inside Kaggle notebook environments.
-
-The implementation intentionally avoids:
-- Kaggle API dependencies
-- authentication requirements
-- internet access
-- undocumented internal APIs
-
-All metadata collection is environment-variable based and designed
-to fail gracefully outside Kaggle.
-
-Examples
---------
->>> from agri_vision_edge.experiment.kaggle import (
-...     capture_kaggle_metadata,
-... )
->>>
->>> metadata = capture_kaggle_metadata()
->>>
->>> if metadata is not None:
-...     print(metadata["accelerator"])
-
-Notes
------
-Sensitive runtime secrets are intentionally excluded from exported
-metadata to avoid accidental credential leakage.
+Collection requires no Kaggle API, authentication, or network access and
+returns no metadata outside Kaggle.
 """
 
 from __future__ import annotations
@@ -58,14 +32,7 @@ EXCLUDED_ENV_KEYS: set[str] = {
 
 
 def is_kaggle_environment() -> bool:
-    """
-    Determine whether execution is occurring inside Kaggle.
-
-    Returns
-    -------
-    bool
-        True if Kaggle runtime indicators are detected.
-    """
+    """Return whether Kaggle runtime indicators are present."""
 
     return (
         "KAGGLE_KERNEL_RUN_TYPE" in os.environ
@@ -74,22 +41,7 @@ def is_kaggle_environment() -> bool:
 
 
 def capture_kaggle_metadata() -> dict[str, Any] | None:
-    """
-    Capture Kaggle runtime metadata.
-
-    The returned structure is fully JSON-serializable and intended
-    for inclusion in experiment manifests.
-
-    Returns
-    -------
-    dict[str, Any] or None
-        Kaggle runtime metadata if running inside Kaggle,
-        otherwise None.
-
-    Notes
-    -----
-    Sensitive environment variables are intentionally excluded.
-    """
+    """Return JSON-safe, non-secret Kaggle metadata, or ``None`` outside Kaggle."""
 
     if not is_kaggle_environment():
         return None
@@ -112,23 +64,7 @@ def capture_kaggle_metadata() -> dict[str, Any] | None:
 
 
 def detect_kaggle_accelerator() -> str:
-    """
-    Infer the active Kaggle accelerator type.
-
-    Returns
-    -------
-    str
-        One of:
-        - "TPU"
-        - "GPU"
-        - "CPU"
-
-    Notes
-    -----
-    GPU detection uses TensorFlow if available.
-    If TensorFlow is unavailable or GPU detection fails,
-    the function safely falls back to CPU.
-    """
+    """Return ``TPU``, ``GPU``, or ``CPU``; detection failures fall back to CPU."""
 
     if os.environ.get("TPU_NAME"):
         return "TPU"

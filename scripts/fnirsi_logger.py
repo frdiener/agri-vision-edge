@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Compact, robust-ish CSV logger for an FNIRSI FNB58.
+"""Log FNIRSI FNB58 samples to CSV, optionally gzip-compressed.
 
-Output columns:
-    t_ns,voltage_V,current_A,power_W
-
-`t_ns` is a host monotonic timestamp in nanoseconds. The FNB58 sends groups of
-four values without per-value timestamps; values within a report are assigned
-nominal 10 ms spacing (100 Hz), with the newest value aligned to USB receipt.
-
-Use a .gz output filename to write gzip-compressed CSV directly.
+``t_ns`` is the host monotonic time in nanoseconds. Each four-sample USB report
+is assigned nominal 10 ms spacing, with its newest sample aligned to receipt.
 """
 
 from __future__ import annotations
@@ -127,8 +121,8 @@ def open_meter():
         raise RuntimeError(f"could not detach FNB58 HID driver: {exc}") from exc
 
     try:
-        # This device is composite and usb-storage holds interface 0, so
-        # set_configuration() -- which acts on the whole device -- wedges it:
+        # This composite device has interface 0 claimed by usb-storage.
+        # Whole-device set_configuration() calls wedge it:
         # "usbfs: interface 0 claimed by usb-storage while 'python3' sets
         # config #1", after which it streams nothing and the next reset drops
         # it off the bus. The kernel has already configured it.

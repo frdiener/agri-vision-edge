@@ -17,10 +17,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Prefer the standalone tflite-runtime (the on-device path, installed via the
-# `device` extra). When it is absent — e.g. the preparation/conversion env,
-# which installs the `prep` extra instead — fall back to full TensorFlow's
-# tf.lite so conversion never depends on the standalone interpreter.
+# Prefer the standalone tflite-runtime installed by the `device` extra. The
+# preparation environment uses TensorFlow's tf.lite fallback.
 try:
     from tflite_runtime.interpreter import Interpreter, load_delegate
 except ImportError:
@@ -46,10 +44,8 @@ def load_delegates_with_status(delegate_path) -> tuple[list, str | None]:
     ``Interpreter(experimental_delegates=...)`` and ``active_path`` is the
     delegate that is really in use, or ``None`` for plain CPU execution.
 
-    The fallback to CPU is deliberate -- a missing or unloadable delegate must
-    not abort a sweep -- but it is silent in the results unless the *effective*
-    delegate is recorded: a run that asked for the NPU and quietly got the CPU
-    otherwise looks exactly like a successful NPU run in the artifacts.
+    A missing or unloadable delegate falls back to CPU without aborting a sweep.
+    Recording the effective delegate distinguishes that fallback from an NPU run.
     """
 
     if delegate_path is None:
@@ -194,10 +190,8 @@ class TFLiteRuntime(BaseRuntime):
         image,
     ):
 
-        # Timed separately from the rest of preprocessing because it is the one
-        # step whose cost is set by the *source* resolution rather than by the
-        # model: an untiled 1024px frame and a 512px tile reach this line with
-        # the same interpreter behind it. See BaseRuntime.enable_phase_timing.
+        # Resize cost depends on source resolution, so measure it separately from
+        # the remaining preprocessing. See BaseRuntime.enable_phase_timing.
         resize_start = self._mark()
 
         image = cv2.resize(
@@ -311,8 +305,8 @@ class TFLiteRuntime(BaseRuntime):
 
         raw_classes = self.interpreter.get_tensor(self.output_details[3]["index"])
 
-        # Auto-detect quantized outputs from the score tensor's dtype rather than
-        # relying on external metadata. The SSD models export float outputs
+        # Detect quantized outputs from the score tensor dtype. The SSD models
+        # export float outputs
         # (inference_output_type = tf.float32), but a genuinely INT8-output graph
         # is handled correctly without configuration.
         dequantize_outputs = self.output_details[0]["dtype"] in (np.int8, np.uint8)

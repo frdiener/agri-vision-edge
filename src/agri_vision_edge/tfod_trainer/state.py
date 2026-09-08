@@ -1,6 +1,4 @@
-"""
-Mutable trainer state.
-"""
+"""Persist mutable training-loop state across sessions."""
 
 from __future__ import annotations
 
@@ -13,26 +11,9 @@ import numpy as np
 
 @dataclass
 class TrainerState:
-    """
-    Tracks training progress.
+    """Persist training-loop progress not stored in TensorFlow checkpoints."""
 
-    Persisted to ``train_dir/trainer_state.json`` on every evaluation so a run
-    that is killed mid-training (the Kaggle 12 h limit, typically) can be
-    resumed in a later session *with its bookkeeping intact*. The TF checkpoint
-    in ``train_dir`` already restores weights, optimizer slots and the global
-    step; what it does not carry is everything on this object -- the best metric
-    seen so far, the delta-gated stall references, the plateau/cooldown counters
-    and the metrics history. Without them a resumed run would re-seed
-    ``best_metric`` from ``-inf`` (so the first post-resume eval would be
-    checkpointed as "best" even if it is worse than what the earlier session
-    reached), restart the plateau schedule's patience from zero, and -- because
-    ``metrics_history`` is written by overwriting -- truncate the curves to just
-    the second session.
-
-    See :meth:`save` / :meth:`load`.
-    """
-
-    # True strict maximum of the monitored metric -- drives checkpointing only.
+    # Strict metric maximum used only for checkpointing.
     best_metric: float = -np.inf
 
     # Early-stopping stall counter and its own delta-gated reference. Decoupled
@@ -67,7 +48,7 @@ class TrainerState:
         default_factory=list
     )
 
-    # -- persistence ----------------------------------------------------
+    # Persistence
 
     #: `-inf` has no portable JSON spelling (`json` emits `-Infinity`, which is
     #: not valid JSON and trips strict readers), so it round-trips as null.
@@ -99,20 +80,10 @@ class TrainerState:
 
     @classmethod
     def load(cls, path, train_dir=None, history_path=None) -> TrainerState:
-        """
-        Restore a state written by :meth:`save`.
+        """Restore saved trainer state, optionally rebasing its best checkpoint.
 
-        ``train_dir`` rebases :attr:`best_checkpoint_path`: the stored path is
-        absolute and points into the *previous* session's train dir, which on
-        Kaggle is a different directory (or gone entirely). Only the file name
-        is meaningful, and only if the checkpoint was actually carried over --
-        otherwise the reference is dropped, which degrades the warm restart to
-        "reduce the LR without restoring" rather than crashing on a dead path.
-
-        ``history_path`` guards against losing an evaluation: the history file
-        is written before the counters are updated, so a crash in between
-        leaves it one record ahead of the state file. The longer of the two
-        wins, so the curves stay complete.
+        Missing rebased checkpoints are cleared. When ``history_path`` contains
+        more records than the state, its history takes precedence.
         """
         state = cls.from_mapping(json.loads(Path(path).read_text()))
 

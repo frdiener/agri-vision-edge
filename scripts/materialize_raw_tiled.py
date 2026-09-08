@@ -1,20 +1,8 @@
 #!/usr/bin/env python3
-"""
-Materialize ``datasets/phenobench_raw_tiled`` from ``phenobench_raw_full``.
+"""Materialize a raw PhenoBench dataset using the export tiling geometry.
 
-The tiled raw tree is the *file-level* counterpart of the tiling the export
-notebooks apply in memory. ``ave benchmark`` reads its ``val/images`` tiles and
-``ave evaluate --faithful`` stages its ``val`` masks as ground truth, both keyed
-by file name -- so its geometry has to track notebooks ``03``/``04``
-(3x3, ``overlap=0.5``, i.e. uniform 512px tiles). See
-:mod:`agri_vision_edge.data.raw_tiling` for why a stale grid fails silently.
-
-Usage
------
-    python scripts/materialize_raw_tiled.py [--rows 3] [--cols 3]
-                                            [--overlap 0.5] [--workers N]
-                                            [--source DIR] [--dest DIR]
-                                            [--splits train val test]
+File names and geometry must match the annotation export because benchmark and
+faithful-evaluation inputs are joined by file name.
 """
 
 from __future__ import annotations

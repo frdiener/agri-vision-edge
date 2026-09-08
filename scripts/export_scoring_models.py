@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
-"""
-Re-export every training stage's SavedModel without the NMS score floor.
+"""Re-export training stages without the baked-in NMS score floor.
 
-The stage exports bake ``batch_non_max_suppression.score_threshold`` (0.05) into
-the graph, which truncates the precision/recall curve COCO AP integrates over.
-That makes the stock export useless as the *reference* rung of the degradation
-ladder -- it would score below the TFLite export it is meant to bound. See
-:func:`agri_vision_edge.tfod_trainer.export.export_scoring_saved_model`.
-
-Writes ``<variant>/<stage>/saved_model_nms0/`` for each stage, leaving the
-stock ``saved_model/`` (which the TFLite conversion traces from) untouched.
-
-Usage
------
-    python scripts/export_scoring_models.py [--artifacts artifacts/tf]
-                                            [--stages ptq qat_per-tensor ...]
-                                            [--variant NAME ...] [--override]
+Writes ``<variant>/<stage>/saved_model_nms0/`` while preserving the stock
+``saved_model/`` used for TFLite conversion. Removing the 0.05 floor exposes
+the full precision-recall curve required for a reference measurement.
 """
 
 from __future__ import annotations
@@ -28,9 +16,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-# `agri_vision_edge.tfod_trainer` imports `object_detection` at module scope, and
-# object_detection only resolves once the vendored copy is on sys.path -- so the
-# path injection has to happen before the import, not inside it.
+# `agri_vision_edge.tfod_trainer` imports `object_detection` at module scope.
+# Add the vendored path before importing the trainer.
 from agri_vision_edge.third_party import setup_tensorflow_models  # noqa: E402
 
 setup_tensorflow_models()

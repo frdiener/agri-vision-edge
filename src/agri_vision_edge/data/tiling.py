@@ -1,23 +1,4 @@
-"""
-PhenoBench tiling utilities.
-
-Tiling is applied before bbox generation.
-
-Bounding boxes are regenerated from
-cropped semantics + plant_instances.
-
-Boxes are never dropped: every plant
-instance in a tile yields a box. Instead,
-tile-border fragments and otherwise
-partially-visible plants are *tagged*
-``is_partial`` (do-not-care) following the
-upstream PhenoBench ``visibility <= 0.5``
-rule applied to each box's effective
-visibility -- the fraction of the whole
-plant visible within the tile, combining
-original-frame occlusion with the tile cut
-(see ``generate_plant_bboxes``).
-"""
+"""Tile PhenoBench masks and regenerate boxes with partial-visibility metadata."""
 
 from __future__ import annotations
 
@@ -30,9 +11,7 @@ from PIL import Image
 # Visibility masks store a 0..255 visible-fraction; normalize to [0, 1].
 _VISIBILITY_SCALE = 255.0
 
-# --------------------------------------------------
 # Geometry
-# --------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -143,11 +122,7 @@ def compute_instance_areas(
     return areas
 
 
-# --------------------------------------------------
-# Filtering
-# --------------------------------------------------
-# BBox regeneration
-# --------------------------------------------------
+# Bounding-box regeneration
 
 
 def _combine_visibility(
@@ -184,39 +159,11 @@ def generate_plant_bboxes(
     partial_threshold: float | None = None,
     plant_visibility: np.ndarray | None = None,
 ):
-    """
-    Regenerate plant bboxes from cropped masks.
+    """Regenerate one box per plant instance in cropped masks.
 
-    Every plant instance present in the (cropped) masks yields a box; there is
-    no size- or visibility-based *dropping*. Instead, partially-visible plants
-    -- including tile-border fragments -- are *tagged* ``is_partial``
-    (do-not-care) so downstream evaluation can ignore them without removing them.
-
-    If ``instance_areas`` is provided, the per-instance ``visible_fraction``
-    (fraction of the original uncropped instance surviving the tile cut) is
-    computed and stored on the box; it also feeds the ``is_partial`` decision.
-
-    Partiality applies the **upstream PhenoBench criterion** (``<=
-    partial_threshold``) to the box's *effective visibility* -- the fraction of
-    the **whole plant** that is visible within this tile. Two independent
-    reductions combine (by product) into that fraction so tile-slice borders are
-    handled exactly like the upstream visibility rule:
-
-    * ``upstream_visibility`` -- the fraction of the plant that was visible in
-      the **original frame** (occlusion / frame border), read per instance from
-      the cropped ``plant_visibility`` mask as ``max(plant_visibility[mask]) /
-      255``. Available when ``plant_visibility`` is given.
-    * ``visible_fraction`` -- the fraction of the frame-visible plant that
-      survives the **tile cut** (``visible_pixels / original_pixels``).
-      Available when ``instance_areas`` is given.
-
-    The effective visibility is ``upstream_visibility * visible_fraction`` when
-    both are known, or whichever single source is available otherwise; a box is
-    flagged ``is_partial`` when it is ``<= partial_threshold``. This means a
-    plant that was fully visible in the frame but is sliced away by a tile
-    border (leaving ``<= partial_threshold`` of its pixels) is flagged partial,
-    consistently with an originally-partial plant. The effective visibility is
-    also stored on the box as ``visibility``.
+    Effective visibility multiplies original-frame visibility by the surviving
+    pixel fraction when both are known; values at or below ``partial_threshold``
+    set ``is_partial``. Visibility inputs and outputs are normalized to ``[0, 1]``.
     """
 
     boxes = []
@@ -337,9 +284,7 @@ def generate_plant_bboxes(
     return boxes
 
 
-# --------------------------------------------------
 # Dataset indexing
-# --------------------------------------------------
 
 
 def decode_tile_index(
@@ -360,9 +305,7 @@ def decode_tile_index(
     )
 
 
-# --------------------------------------------------
 # Sample tiling
-# --------------------------------------------------
 
 
 def tile_sample(
@@ -439,9 +382,7 @@ def tile_sample(
     return result
 
 
-# --------------------------------------------------
 # Dataset wrapper
-# --------------------------------------------------
 
 
 class TiledPhenoBench:

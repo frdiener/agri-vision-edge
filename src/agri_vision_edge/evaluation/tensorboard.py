@@ -52,7 +52,7 @@ def load_event_scalars(
 
                 tag = value.tag
 
-                # --- scalar summary ---
+                # scalar summary
                 if value.HasField("simple_value"):
 
                     rows.append({
@@ -62,7 +62,7 @@ def load_event_scalars(
                         "value": value.simple_value,
                     })
 
-                # --- tensor summary ---
+                # tensor summary
                 elif value.HasField("tensor"):
 
                     tensor = tf.make_ndarray(value.tensor)

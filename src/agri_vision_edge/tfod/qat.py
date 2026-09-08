@@ -1,174 +1,7 @@
-"""
-Quantization-aware training for folded TFOD SSD / SSD-FPNLite MobileNetV2.
+"""Quantization-aware training for folded TFOD SSD models.
 
-The deployment targets require an int8 TFLite graph. Before QAT, every
-functional subgraph is folded with `folding.fold_model`: BatchNorm parameters
-are absorbed into their preceding convolution and a following ReLU6 is moved
-into that convolution's intrinsic `activation`. Consequently, the folded
-Conv2D / DepthwiseConv2D output is the post-ReLU6 tensor that TFLite may fuse
-into the corresponding convolution operator.
-
-`quantize_backbone` applies the common convolutional QAT scheme. Conv2D and
-DepthwiseConv2D layers are annotated throughout; residual `Add` outputs are
-also annotated for the per-channel target. Detection heads are rebuilt as
-functional graphs before applying the same machinery, because TFOD's original
-head components are subclassed models whose layers cannot safely be replaced
-in place for SavedModel/TFLite export.
-
-`per_channel` selects the intended *deployment weight granularity*, not the
-granularity of the QAT fake-quant variables: `BaseQuantConfig` always uses
-per-tensor, symmetric weight fake-quant. Per-channel TFLite weights are left to
-the converter, which emits them for a weight-only-annotated conv when
-`_experimental_disable_per_channel=False`.
-
-Crucially, the pin placement is therefore an EXPORT-TIME choice. Note the
-consequence: ``per_channel`` no longer changes the TRAINING graph at all -- a
-per-channel run and a per-tensor run currently train the identical graph, and
-differ only in how their checkpoint is exported. (What would legitimately differ
-is per-AXIS weight fake-quant, matching the grid per-channel actually deploys;
-see ``DepthwisePerAxisQuantizer``.)
-
-```
-* TRAINING (``for_export=False``, both granularities): a convolution
-  carrying an intrinsic ``tf.nn.relu6`` receives ``ReLU6ConvQuantConfig``,
-  pinning its output to the fixed interval ``[0, 6]``. QAT therefore
-  simulates the int8 activation the model actually deploys with, which is
-  what makes the exported graph track the trained one (measured: per-layer
-  correlation 0.999 through the backbone).
-
-* EXPORT for ``per_channel=True``: the same graph is rebuilt WEIGHT-ONLY
-  throughout -- every conv output quantizer dropped, including the relu6
-  pins, the signed-conv ranges and the Add pins. One QAT checkpoint
-  restores into either graph (the pins are stateless; the dropped range
-  variables are simply left unused). The intrinsic ReLU6 still clamps the
-  real activation to ``[0, 6]``, so the converter calibrates a range
-  bounded by 6.
-
-  Weight-only *throughout* is the point. A calibrated export re-derives
-  EVERY activation range, so any QAT-trained range left in the graph is
-  overridden anyway -- and the weights were tuned against it, so a partial
-  set is worse than none. Handing all of them to calibration makes the
-  export self-consistent, and it is also what frees the converter to emit
-  per-channel weights.
-
-  Dropping the pin at export is required, not merely preferred, and was
-  validated on the combined FPN graph (experiments/fpn_qat_probe,
-  out/PIN_VS_FREE_FINDINGS.md): an explicit [0, 6] output pin CRASHES the
-  FPN export (native abort in flatbuffer_export) under BOTH the legacy and
-  the new converter/quantizer, and -- even where it converts -- makes each
-  relu6-fed conv a self-contained per-tensor op, which drops per-channel
-  weight emission to zero. Per-channel weights + per-tensor int8
-  activations are otherwise the intended, working representation.
-```
-
-Getting there took two corrections, both of which come down to keeping the
-export self-consistent. Pinning during training used to be tied to the
-per-tensor target, leaving the per-channel graph with no activation simulation
-at all: it trained against float activations. And the export kept a SUBSET of
-the QAT-trained ranges (signed convs, Add outputs) that calibration then
-overrode, so the weights deployed against ranges they were never tuned for.
-Measured on ssd-mn2-fpnlite_mc_phenobench-tiled_320, one pin-trained checkpoint:
-
-    free-trained, partial ranges kept (old)   AP 0.3529
-    pin-trained, partial ranges kept          AP 0.3970
-    pin-trained, weight-only export           AP 0.4526   <- per-channel
-    per-tensor export of the same checkpoint  AP 0.4499
-    int8 PTQ per-channel                      AP 0.4406
-    FP32                                      AP 0.4464
-
-An alternative would be to never calibrate, so the trained ranges deploy as-is.
-That needs the graph fully QDQ-specified: per-AXIS weight fake-quant (so the
-per-channel grid comes from the graph rather than the converter), pinned relu6 /
-Add outputs, and a pinned input range. It is implemented behind
-``fully_quantized`` and is UNUSABLE on this converter (TF 2.11) -- but note that
-it is the OUTPUT pins that it rejects, not per-axis weights. Probed on the
-combined FPN graph with float weights and observers over 196 representative
-images:
-
-    with the fully-QDQ output pins
-      per-axis weights, Conv2D + DepthwiseConv2D  -> exported graph is EMPTY
-      per-axis weights, Conv2D only               -> SIGABRT in flatbuffer_export
-      per-tensor weights                          -> SIGABRT in flatbuffer_export
-
-    with the weight-only export (the working one)
-      per-tensor weights (current)                -> converts, 214 per-channel
-      per-axis weights, Conv2D only               -> converts, 214 per-channel
-      per-axis weights, Conv2D + DepthwiseConv2D  -> exported graph is EMPTY
-
-The SIGABRT rows reproduce the crash recorded in
-experiments/fpn_qat_probe/out/PIN_VS_FREE_FINDINGS.md: explicit output
-quantization and per-channel weights cannot be combined here, which is why the
-weight-only export is not a workaround for a missing feature but the
-representation this converter actually supports.
-
-Per-axis WEIGHT fake-quant converts fine in that export (see
-``PerChannelWeightQuantizer``), and TRAINING with it -- so that QAT simulates the
-per-channel weight grid the target actually deploys, instead of the coarser
-per-tensor one -- was tried and MEASURED TO BE WORTH NOTHING:
-
-    per-tensor checkpoint, exported per-channel            AP 0.4526
-    per-channel checkpoint trained with per-axis weight FQ AP 0.4523
-
-Both runs peaked at the same step (13464), so that is close to a paired
-comparison rather than two independent draws. Note the QAT-graph metric moved
-the other way (0.48271 vs 0.48128 mAP): per-channel fake-quant is a marginally
-easier training problem, but the advantage does not survive to the exported int8
-model.
-
-Read together with the earlier -0.022 from exporting a per-tensor-trained
-checkpoint through per-axis fake-quant, the picture is that at 8 bits the
-per-channel grid is fine enough that per-tensor-trained weights already export
-near-optimally: that -0.022 was pure train/deploy mismatch, not headroom, and
-training it away merely returns to the same place. The whole per-channel gain
-comes from the export granularity, not from training against it.
-
-So ``per_axis_weights`` stays opt-in (``fully_quantized``). Enabling it would
-also make ``per_channel`` change the training graph, which costs a QAT run per
-granularity -- for nothing. It is kept because a coarser grid (4-bit, say) is
-where it would start to matter.
-
-Linear box-predictor convolutions are also kept output-free. Their outputs feed
-reshape/concat paths across feature-map levels, where independently fixed
-output scales would require requantization to make concat inputs compatible.
-Leaving these outputs free lets conversion choose compatible scales for the
-prediction path while retaining QAT-trained weights.
-
-For the same reason, graph boundaries matter. Tensors passed between separately
-quantized functional submodels may acquire incompatible quantization domains or
-extra Quantize/Dequantize/Requantize operations at export. Where a feature-map
-tensor is consumed by multiple components, the preferred representation is one
-combined functional graph folded and passed through `quantize_apply` once. This
-keeps the relevant producer, consumers, and concat paths in a single QAT graph.
-
-`quantize_detection_model` is the single self-contained entry point (callers do
-not pre-fold / pre-quantize the backbone). It dispatches on architecture:
-
-  * FPNLite folds + quantizes the backbone as its own graph, then rebuilds the
-    whole post-backbone head (FPN generator + coarse blocks + weight-shared box
-    predictor) as one combined functional graph. Its backbone taps are signed /
-    Add outputs, not free-relu6 tensors, so the backbone/head boundary is clean.
-
-  * plain SSD INLINES the backbone with the head into a single full-model
-    functional graph (image -> backbone -> feature-map generator -> box/class
-    predictor), folded and quantized in one pass. This is required because the
-    SSD tap `layer_15/expansion_output` is `block_13_expand`'s ReLU6 output,
-    which is DUAL-USE (it feeds the backbone's own `block_13_depthwise` and is
-    exported as a feature map). In the per-channel scheme relu6 outputs are
-    free-calibrated; a separately quantized backbone and head would calibrate
-    that shared tensor independently, pick mismatched (scale, zero_point), and
-    force the converter to dequantize + recompute the conv in float + requantize
-    per consumer -- stray ops the NPU delegate cannot consume. One full-model
-    graph makes the tap interior, so it is calibrated once, both consumers share
-    the scale, no stray requant appears, and per-channel weights are retained.
-
-Per-channel fake-quant nodes are currently avoided. Baking
-`fake_quant_with_min_max_vars_per_channel` into the graph alongside converter
-calibration has previously produced near-zero collected activation ranges and
-severe AP loss -- note that this is an interaction with calibration, so it would
-have to be re-evaluated as part of the fully-QDQ (never-calibrate) scheme
-sketched above, where the two no longer meet. `per_channel` therefore changes
-export-time pin placement and permits converter-side per-channel weight
-emission; it does not request per-channel fake-quant during training.
+Detection heads use functional graphs to preserve TFLite graph visibility.
+Per-channel export removes output pins for converter calibration.
 """
 
 import collections
@@ -185,32 +18,17 @@ from agri_vision_edge.tfod.folding import fold_model, is_relu6
 
 _CONV = (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D)
 
-#: Range of the image tensor entering the graph. ``SSDModule.inference_fn``
-#: consumes an already-normalized image, and the representative dataset and the
-#: runtime both produce [-1, 1], so this is a property of the pipeline rather
-#: than an estimate.
+#: Normalized graph input range used by inference and representative data.
 INPUT_RANGE = (-1.0, 1.0)
 
 
-# ---------------------------------------------------------------------------
-# Validation hook (default OFF -- does not affect production export).
-#
-# Training pins relu6-fed conv outputs to [0, 6] for both granularities; only
-# the per-channel EXPORT rewrite frees them (so TFLite may emit per-channel
-# weights). This flag lets a probe keep the explicit ReLU6ConvQuantConfig
-# ([0, 6] pin) even in that rewrite, to empirically re-test whether an explicit
-# activation pin is compatible with converter-emitted per-channel weights.
-# Toggle only via the ``force_relu6_pin_in_per_channel`` context manager below;
-# leave False for real exports.
-# ---------------------------------------------------------------------------
+# Test hook for retaining the ReLU6 pin during per-channel export.
 _FORCE_RELU6_PIN_IN_PER_CHANNEL = False
 
 
 @contextlib.contextmanager
 def force_relu6_pin_in_per_channel(enabled: bool = True):
-    """Temporarily keep the fixed [0, 6] relu6 pin in the per-channel export
-    rewrite (validation/probe use only). Restores the previous value on exit.
-    See ``_FORCE_RELU6_PIN_IN_PER_CHANNEL``."""
+    """Temporarily retain the [0, 6] ReLU6 pin in per-channel exports."""
     global _FORCE_RELU6_PIN_IN_PER_CHANNEL
     previous = _FORCE_RELU6_PIN_IN_PER_CHANNEL
     _FORCE_RELU6_PIN_IN_PER_CHANNEL = enabled
@@ -220,30 +38,18 @@ def force_relu6_pin_in_per_channel(enabled: bool = True):
         _FORCE_RELU6_PIN_IN_PER_CHANNEL = previous
 
 
-# =========================================================
 # Quantization configs
-# =========================================================
 
 
 @register_keras_serializable()
 class BaseQuantConfig(tfmot.quantization.keras.QuantizeConfig):
-    """
-    Shared configuration for convolutional layers: symmetric weight fake-quant.
+    """Configure symmetric convolution weight fake quantization.
 
-    ``per_axis_weights=False`` (default) keeps the weight grid per-tensor and
-    leaves per-channel emission to the CONVERTER (weight-only convs +
-    ``_experimental_disable_per_channel=False``). That path needs calibration,
-    and calibration discards the QAT-trained activation ranges.
-
-    ``per_axis_weights=True`` puts the per-channel grid in the graph instead, so
-    the export needs no calibration at all and the trained ranges survive. See
-    the module docstring.
+    Per-axis weights are embedded in fully QDQ graphs; per-tensor weights leave
+    per-channel emission to converter calibration.
     """
 
     def __init__(self, per_axis_weights: bool = False):
-        # Per-axis weight fake-quant puts the per-channel weight grid in the
-        # GRAPH instead of leaving it to converter calibration, which is what
-        # a fully-QDQ (never-calibrated) export needs.
         self.per_axis_weights = per_axis_weights
 
     def _weight_quantizer(self, layer):
@@ -286,40 +92,7 @@ class BaseQuantConfig(tfmot.quantization.keras.QuantizeConfig):
 
 @register_keras_serializable()
 class FreeOutputConvQuantConfig(BaseQuantConfig):
-    """
-    Quantize convolution weights only; leave the OUTPUT scale FREE (calibrated
-    by the converter). No output/activation fake-quant node is inserted.
-
-    Two uses, both relying on the converter -- not a fixed pin -- to set the
-    output scale:
-
-      (a) relu6-fed convs in the per-channel EXPORT rewrite (never while
-          training): a free output range lets TFLite emit PER-CHANNEL weights,
-          while the intrinsic ``tf.nn.relu6`` still pins the fused output MIN at
-          0 (zp -128) and the converter calibrates the MAX (<= 6). A fixed [0,6]
-          output pin cannot be used here -- validated empirically on the
-          combined FPN graph (see
-          experiments/fpn_qat_probe/out/PIN_VS_FREE_FINDINGS.md):
-            * TFMOT cannot quantize tf.nn.relu6 as an activation; the pin can
-              only live on the conv OUTPUT.
-            * That explicit output pin + per-channel weights CRASHES the FPN
-              export (native SIGABRT in flatbuffer_export) under BOTH the legacy
-              AND the new quantizer (``_experimental_new_quantizer`` False/True).
-            * Even where it converts (backbone alone, no FPN fanout), the pin
-              defeats per-channel weight emission entirely (104 -> 0 per-channel
-              weight tensors): an explicit output quantizer makes the conv a
-              self-contained per-tensor op, so the converter emits PER-TENSOR
-              weights. Explicit output pin and per-channel weights are mutually
-              exclusive on the same conv -- a QAT/converter interaction limit,
-              not a limit of per-channel weight quantization.
-          Hence per-channel keeps free outputs; the exact (6/255, -128) pin is
-          reserved for the per-TENSOR scheme (ReLU6ConvQuantConfig), which wants
-          per-tensor weights anyway.
-
-      (b) box-predictor convs (linear, feeding a concat): a free scale lets the
-          converter align all concat inputs to one scale -- no stray requant
-          QUANTIZE the NPU delegate would trip on.
-    """
+    """Quantize convolution weights and leave output ranges for calibration."""
 
     def get_activations_and_quantizers(self, layer):
         return []
@@ -333,14 +106,7 @@ class FreeOutputConvQuantConfig(BaseQuantConfig):
 
 @register_keras_serializable()
 class SignedConvQuantConfig(BaseQuantConfig):
-    """
-    Per-tensor weights + an AllValues (signed) output quantizer.
-
-    For convolutions whose output is *signed* (the inverted-residual projection /
-    bottleneck convs, which have no following ReLU and produce negative values).
-    AllValues tracks the true observed min/max and calibrates in ~1 step, so the
-    signed dynamic range feeding the head is preserved -- no ±6 clamp.
-    """
+    """Quantize weights and track signed linear-convolution output ranges."""
 
     def _output_quantizer(self):
         return tfmot.quantization.keras.quantizers.AllValuesQuantizer(
@@ -362,12 +128,9 @@ class SignedConvQuantConfig(BaseQuantConfig):
 
 @register_keras_serializable()
 class FixedRangeQuantizer(tfmot.quantization.keras.quantizers.Quantizer):
-    """
-    A fixed, stateless fake-quant over a known interval.
+    """Apply stateless fake quantization over a fixed interval.
 
-    Statelessness is load-bearing: a graph carrying these pins holds exactly the
-    same variables as one without them, so a checkpoint restores into either and
-    the pins can be added or dropped when rebuilding the graph.
+    Stateless pins may be added or removed without changing checkpoint variables.
     """
 
     def __init__(self, min_value: float, max_value: float, num_bits: int = 8):
@@ -408,36 +171,11 @@ class FixedRelu6Quantizer(FixedRangeQuantizer):
 
 @register_keras_serializable()
 class PerChannelWeightQuantizer(tfmot.quantization.keras.quantizers.Quantizer):
-    """
-    Symmetric per-output-channel weight fake-quant, in the layout TFLite uses.
+    """Apply stateless symmetric per-output-channel weight fake quantization.
 
-    Deployment quantizes weights per channel, so training should simulate that
-    grid rather than the coarser per-tensor one. Under a shared scale a channel
-    whose range is small gets very few levels, and the network learns not to
-    rely on it -- even though deployment would have given it full resolution.
-    MobileNetV2's depthwise kernels, whose per-channel ranges vary the most, are
-    where that costs the most.
-
-    The channel axis differs per layer, and getting it wrong is SILENT:
-
-        Conv2D           [kh, kw, in, out]   -> one scale per ``out``
-        DepthwiseConv2D  [kh, kw, in, mult]  -> one per ``in * mult``
-
-    Stock per-axis quantizers reduce over the leading axes and keep the last, so
-    on a depthwise kernel (``mult`` is 1 here) they yield a SINGLE scale --
-    per-tensor wearing a per-channel label. Hence the explicit ``depthwise``
-    switch: it selects the reduction axes, and nothing else differs.
-
-    Implemented as a straight-through estimator rather than with
-    ``fake_quant_with_min_max_vars_per_channel``, because that op only quantizes
-    the last axis, and reshaping the kernel to suit it makes the exported graph
-    come out EMPTY. Nothing is lost by avoiding it: the weight-only export never
-    reads this fake-quant -- the converter derives the per-channel scales from
-    the float weights itself -- so it only has to be numerically right during
-    TRAINING, and folds to a constant at export.
-
-    Stateless, like the activation pins: a weight tensor's range is a function
-    of the weights, so there is nothing to carry between steps.
+    Conv2D uses ``[kh, kw, in, out]`` and reduces axes 0-2. DepthwiseConv2D uses
+    ``[kh, kw, in, mult]`` and reduces axes 0-1 to retain ``in * mult`` scales.
+    A straight-through implementation avoids the last-axis-only TensorFlow op.
     """
 
     def __init__(self, num_bits: int = 8, depthwise: bool = False):
@@ -471,16 +209,10 @@ class PerChannelWeightQuantizer(tfmot.quantization.keras.quantizers.Quantizer):
 
 @register_keras_serializable()
 class ReLU6ConvQuantConfig(BaseQuantConfig):
-    """
-    Per-tensor weights + a fixed [0, 6] output quantizer, for a conv that carries
-    an intrinsic ``tf.nn.relu6`` (the pre-folded relu6-fed convs).
+    """Quantize weights and pin a folded intrinsic ReLU6 output to [0, 6].
 
-    The [0, 6] pin lives on the CONV's OWN output. Because the ReLU6 was folded
-    into the conv, that output IS the post-ReLU6 tensor -- the one that survives
-    TFLite's conv+ReLU6 fusion. And because the conv is a self-contained
-    quantized op (per-tensor weights + its own fixed output range), the fused op
-    keeps PER-TENSOR weights. This is the per-TENSOR target's mechanism for a
-    strictly per-tensor int8 graph with an exact [0, 6] ReLU6 range.
+    The output pin applies after folded ReLU6 and keeps the fused TFLite
+    convolution's weights per-tensor.
     """
 
     def get_activations_and_quantizers(self, layer):
@@ -490,28 +222,15 @@ class ReLU6ConvQuantConfig(BaseQuantConfig):
         pass
 
     def get_output_quantizers(self, layer):
-        # The fixed [0,6] pin must be an OUTPUT quantizer: TFMOT's activation
-        # quantizer path rejects tf.nn.relu6 (QuantizeAwareActivation whitelists
-        # only a few Keras activations), so the ReLU6 range can only be pinned on
-        # the (post-fold) conv output tensor -- which, thanks to pre-folding, is
-        # the tensor that survives conv+ReLU6 fusion.
+        # TFMOT rejects tf.nn.relu6 in its activation-quantizer path.
         return [FixedRelu6Quantizer()]
 
 
 @register_keras_serializable()
 class AddOutputConfig(tfmot.quantization.keras.QuantizeConfig):
-    """
-    Quantize the output of a residual ``Add`` (no weights), signed AllValues.
+    """Quantize residual Add outputs with a signed range.
 
-    NO LONGER APPLIED. It patched a coverage gap that only existed while the
-    per-channel TRAINING graph left relu6 outputs free, making the ``Add`` the
-    one un-fake-quantized tensor in an inverted-residual block. Training now
-    pins relu6 for both granularities, so the gap is closed at its source, and
-    the export graph is calibrated end to end anyway (verified: 0 of 123 conv
-    outputs fall back to float/dynamic without it).
-
-    Retained so graphs and checkpoints written by the previous scheme still
-    deserialize.
+    Retained only to deserialize graphs and checkpoints from the previous scheme.
     """
 
     def get_weights_and_quantizers(self, layer):
@@ -554,11 +273,7 @@ _QUANT_SCOPE = {
 
 
 def _has_intrinsic_relu6(layer: tf.keras.layers.Layer) -> bool:
-    """
-    True for a Conv2D / DepthwiseConv2D carrying an intrinsic ``tf.nn.relu6``
-    activation -- i.e. a relu6-fed conv after ``folding.fold_model`` pre-folds
-    the ReLU6 into it.
-    """
+    """Return whether a convolution has a folded intrinsic ``tf.nn.relu6``."""
     if not isinstance(layer, _CONV):
         return False
 
@@ -574,9 +289,7 @@ def _has_intrinsic_relu6(layer: tf.keras.layers.Layer) -> bool:
         return False
 
 
-# =========================================================
-# The "full" int8 scheme -- shared by backbone and every detection head.
-# =========================================================
+# Full int8 scheme shared by the backbone and detection heads.
 
 
 def _quantize_full(
@@ -588,43 +301,16 @@ def _quantize_full(
     fully_quantized: bool = False,
     input_range: tuple[float, float] | None = None,
 ):
+    """Apply one quantization pass to a folded functional model.
+
+    Intrinsic ReLU6 outputs use [0, 6], named predictor outputs remain free for
+    concat scaling, and other convolution outputs use signed ranges. Calibrated
+    per-channel export leaves every output free; intrinsic ReLU6 takes precedence.
     """
-    One ``quantize_apply`` over a folded functional model, applying the full
-    int8 scheme. Each conv is classified by what its folded output is:
-
-      * intrinsic relu6 (absorbed by ``fold_model``)
-          -> ``ReLU6ConvQuantConfig`` -- weights + fixed [0, 6] OUTPUT pin, so
-             training simulates the int8 activation the model deploys with.
-      * name in ``weight_only_names`` (box-predictor convs feeding a concat)
-          -> ``FreeOutputConvQuantConfig`` -- free output for shared concat scale.
-      * otherwise (signed / linear) -> ``SignedConvQuantConfig``.
-
-    The per-channel EXPORT rewrite overrides all of that with
-    ``FreeOutputConvQuantConfig`` everywhere; see below.
-
-    ``weight_only_names`` lets the FPN combined graph force box-predictor convs
-    weight-only; intrinsic-relu6 detection takes precedence for tower convs that
-    happen to feed a relu6.
-    """
-    # Simulating the per-channel weight grid during training was measured to be
-    # worth nothing (see the module docstring), and it costs a QAT run per
-    # granularity, so it is opt-in and off for the calibrated export.
     per_axis_weights = fully_quantized
     weight_only_cfg = FreeOutputConvQuantConfig(per_axis_weights=per_axis_weights)
 
-    # A CALIBRATED per-channel export is weight-only THROUGHOUT: no relu6 pins,
-    # no signed-conv output quantizers, no Add pins. Whichever activation ranges
-    # such a graph does carry, calibration overrides them all anyway -- so
-    # keeping a subset of QAT-trained ranges is the worst of both, leaving the
-    # weights tuned against ranges that never deploy. Handing every range to
-    # calibration instead makes the export self-consistent, and it is also what
-    # frees the converter to emit per-channel weights.
-    #
-    # Measured on ssd-mn2-fpnlite_mc_phenobench-tiled_320, one pin-trained
-    # checkpoint exported three ways:
-    #     trained ranges kept, relu6 pinned  -> per-tensor weights,   AP 0.4499
-    #     relu6 freed, signed/Add kept       -> per-channel weights,  AP 0.3970
-    #     weight-only throughout             -> per-channel weights,  AP 0.4526
+    # Converter calibration requires all output ranges to remain free.
     export_weight_only = (
         per_channel
         and for_export
@@ -637,17 +323,12 @@ def _quantize_full(
         if export_weight_only
         else SignedConvQuantConfig(per_axis_weights=per_axis_weights)
     )
-    # The relu6 pin is what makes QAT simulate the activation quantization, so
-    # it is always present while training -- for BOTH deployment granularities.
     relu6_conv_cfg = (
         weight_only_cfg
         if export_weight_only
         else ReLU6ConvQuantConfig(per_axis_weights=per_axis_weights)
     )
-    # Residual Add outputs are the one tensor in an inverted-residual block with
-    # no conv of its own. The calibrated export lets the converter cover them; a
-    # fully-QDQ graph has to pin them, since the FPN backbone taps are Add
-    # outputs and leaving them open would force calibration back on.
+    # Fully QDQ graphs must pin residual Add outputs, including FPN taps.
     add_cfg = AddOutputConfig() if fully_quantized else None
 
     def clone_function(layer):
@@ -680,15 +361,7 @@ def _quantize_full(
 
 
 def _pin_model_input(model, input_range: tuple[float, float]):
-    """
-    Fake-quantize the model's INPUT to a known fixed range.
-
-    The image reaching the graph is normalized to [-1, 1] by construction, but
-    nothing in the graph says so, and the very first convolution cannot be
-    quantized without a range for its input. With calibration that range comes
-    from the representative data; a fully-QDQ export has no calibration, so the
-    range has to be stated. It is stateless, like the relu6 pins.
-    """
+    """Add a stateless fixed-range fake quantizer at the model input."""
     from tensorflow_model_optimization.python.core.quantization.keras import (
         quantize_layer,
     )
@@ -703,9 +376,7 @@ def _pin_model_input(model, input_range: tuple[float, float]):
         name="quant_model_input",
     )(inputs)
 
-    # Replayed onto the new input rather than called as a nested model: calling
-    # it (`model(pinned)`) leaves an opaque sub-Model whose layers the
-    # SavedModel trace does not follow, and the exported graph comes out empty.
+    # Replay exposes nested layers to SavedModel tracing; direct calls export empty.
     outputs = _replay_functional(model, pinned)
 
     return tf.keras.Model(
@@ -722,14 +393,9 @@ def quantize_backbone(
     for_export: bool = False,
     fully_quantized: bool = False,
 ):
-    """
-    Apply the full int8 scheme to a FOLDED MobileNetV2 backbone (or any folded
-    functional feature graph). See the module docstring for the training vs
-    export pin placement. Input must already be folded
-    (``folding.fold_model`` / ``fold_mobilenetv2_backbone``).
+    """Quantize a folded functional backbone.
 
-    The backbone's input is the (normalized) image, so under the fully-QDQ
-    scheme it is also where the model's input range is pinned.
+    Fully QDQ mode pins the normalized image input to ``INPUT_RANGE``.
     """
     return _quantize_full(
         backbone,
@@ -749,18 +415,7 @@ def ensure_model_is_built_for_qat(detection_model, pipeline_config):
     detection_model.predict(image, shapes)
 
 
-# =========================================================
-# Whole-model QAT: weight-preserving functional rebuild of the detection head.
-#
-# object_detection's feature_map_generator / FPN generator and box-predictor
-# heads are *subclassed* Keras models. Swapping folded / quantize-wrapped layers
-# into them in place breaks TFLite conversion (the swapped layers are not tracked
-# sublayers, so the SavedModel trace prunes the graph to empty). Rebuilding them
-# as FUNCTIONAL models -- reusing the converged layers, so weights are preserved
-# exactly -- and wrapping them in tracked adapter Layers lets the same
-# fold_model + quantize path used for the backbone quantize them, so a QAT model
-# covers the whole graph up to the (float) TFLite_Detection_PostProcess.
-# =========================================================
+# Functional head rebuilds preserve layer tracking during TFLite conversion.
 
 
 def _clone_conv_unique(layer, name):
@@ -786,57 +441,14 @@ def quantize_detection_model(
     for_export=False,
     fully_quantized=None,
 ):
-    """
-    Quantize the detection head in place via weight-preserving functional
-    rebuilds, so QAT covers the whole graph up to the postprocess. Call AFTER the
-    backbone has been folded + quantized.
+    """Fold and quantize a fresh detection model in place.
 
-    Self-contained: it folds + quantizes the backbone itself, so callers pass a
-    freshly built (unfolded, unquantized) detection model -- they must NOT
-    pre-fold / pre-quantize ``classification_backbone``.
-
-    ``per_channel`` selects the deployment weight granularity, and with it the
-    scheme (override with ``fully_quantized`` to convert a checkpoint trained
-    under the other one):
-
-      * ``per_channel=False`` -- per-tensor weights, calibrated export. Every
-        relu6-fed conv output is pinned to [0, 6] so QAT simulates the int8
-        activations, and the converter fills in the rest from the
-        representative dataset.
-
-      * ``per_channel=True`` -- the CONVERTER emits the per-channel weights,
-        which it only does for a conv whose output range it is free to choose.
-        Hence ``for_export=True`` rebuilds the graph weight-only. Those pins are
-        stateless, so the rebuild does not disturb the restore.
-
-    ``fully_quantized=True`` opts into the alternative scheme in which the graph
-    specifies its own quantization completely (per-AXIS weight grid, pinned
-    relu6 / Add / input ranges) so that no calibration is needed and the trained
-    ranges survive. It is IMPLEMENTED BUT NOT USABLE on this converter; see the
-    module docstring for what it does instead of converting.
-
-    Dispatches on the head architecture:
-
-      * FPNLite (KerasFpnTopDownFeatureMaps + WeightSharedConvolutionalBox
-        Predictor): the backbone is folded + quantized as its OWN graph, then the
-        whole post-backbone head (FPN generator + coarse blocks + weight-shared
-        box predictor) is rebuilt as ONE combined functional graph and quantized
-        in ONE pass -- see ``_quantize_fpn_detection_head``. The FPN taps are not
-        free-relu6 dual-use tensors, so the backbone/head boundary stays clean.
-
-      * plain SSD MobileNetV2 (KerasMultiResolutionFeatureMaps +
-        ConvolutionalBoxPredictor): the backbone is INLINED with the head into a
-        single full-model functional graph, folded + quantized in ONE pass -- see
-        ``_quantize_ssd_detection_head``. This is required because the SSD tap
-        ``layer_15/expansion_output`` is a free-relu6 tensor used both inside the
-        backbone and by the head; a separate backbone graph would calibrate it
-        inconsistently and leave stray requant nodes.
+    FPNLite uses separate backbone and combined-head graphs. Plain SSD uses one
+    graph because ``layer_15/expansion_output`` has backbone and head consumers.
+    Per-channel export frees output ranges; fully QDQ embeds all ranges.
     """
     if fully_quantized is None:
-        # Off by default: the fully-QDQ scheme is not usable on this converter
-        # (see the module docstring -- it either aborts in flatbuffer_export or
-        # exports an empty graph). Kept opt-in so it can be retried on a newer
-        # TFLite converter without having to rebuild it.
+        # Current TFLite conversion aborts or exports an empty fully QDQ graph.
         fully_quantized = False
 
     fe = detection_model.feature_extractor
@@ -865,49 +477,14 @@ def quantize_detection_model(
     )
 
 
-# =========================================================
-# Plain SSD MobileNetV2 QAT -- ONE full-model combined functional graph.
-#
-# Unlike the FPNLite head (which starts from backbone feature inputs, keeping the
-# backbone a separate quantized graph), the plain SSD path folds+quantizes the
-# WHOLE model -- backbone + feature-map generator + box/class predictor -- as a
-# single functional graph in ONE quantize_apply pass:
-#
-#     padded image
-#       -> MobileNetV2 backbone (inlined)  -> layer_15/expansion & layer_19 taps
-#       -> feature-map generator
-#       -> box/class predictor convs -> reshape
-#
-# Why the backbone must be INSIDE this graph (not quantized separately): the SSD
-# backbone tap ``layer_15/expansion_output`` is ``block_13_expand``'s ReLU6
-# output, which is DUAL-USE -- it feeds the backbone's own ``block_13_depthwise``
-# AND is exported as a feature map. In the per-channel scheme relu6 outputs are
-# free-calibrated; a separately-quantized backbone and head calibrate that shared
-# tensor INDEPENDENTLY, pick mismatched (scale, zero_point), and the converter
-# then dequantizes + recomputes ``block_13_expand`` in float + requantizes per
-# consumer -> stray QUANTIZE/DEQUANTIZE. Folding+quantizing the backbone together
-# with the head makes the tap interior to ONE quantize_apply, so it is calibrated
-# ONCE, both consumers share the same scale, and no stray requant appears -- while
-# TFLite still emits per-channel weights (the relu6-fed convs stay weight-only).
-#
-# Installation: the meta-arch calls extract_features -- which calls
-# classification_backbone then feature_map_generator -- and then the box
-# predictor, as separate steps; but the combined model must run ONCE. The
-# BACKBONE adapter runs it (it is the first call, and receives the padded image =
-# the combined graph's input) and caches (feature_maps, box, cls); the generator
-# and box-predictor adapters return their cached slice.
-# =========================================================
+# Plain SSD uses one graph so dual-use backbone taps share a quantization domain.
+# The backbone adapter runs the graph once; later adapters return cached outputs.
 
 
 def _replay_functional(model, input_tensor):
-    """
-    Re-apply a functional Keras model's layers onto ``input_tensor``, reusing the
-    original layer objects (weights preserved), and return the model's output
-    tensor(s). This flattens a nested model into the surrounding functional graph
-    -- needed so ``fold_model`` (which folds conv/BN/ReLU6 across ``model.layers``)
-    can see the backbone's layers instead of an opaque nested Model. Mirrors
-    ``fold_model``'s single-input, single-inbound-node replay; the backbone is a
-    single-input graph, exactly what ``fold_mobilenetv2_backbone`` already folds.
+    """Replay a single-input functional model while reusing its layers.
+
+    Flattening exposes nested backbone layers to ``fold_model``.
     """
     out: dict[str, tf.Tensor] = {}
     for layer in model.layers:
@@ -921,14 +498,11 @@ def _replay_functional(model, input_tensor):
 
 
 def _ssd_bp_body(box_predictor, feature_tensors, conv_sink):
-    """Replay a ConvolutionalBoxPredictor over the feature tensors; return
-    (box_out, cls_out). Box/class heads are one 1x1 conv each (no BN) followed by
-    a reshape; the convs share names across heads, so each is cloned to a unique
-    name. Every conv touched (optional shared tower + box/class heads) is
-    recorded in ``conv_sink`` and forced weight-only, so the reshape/CONCAT
-    prediction path can share one scale (any relu6-fed tower conv keeps its
-    intrinsic-relu6 handling via ``_has_intrinsic_relu6`` precedence in
-    ``_quantize_full``)."""
+    """Replay a convolutional predictor and return box and class tensors.
+
+    Head convolutions receive unique names and enter ``conv_sink`` so concat
+    inputs can share a converter-selected scale.
+    """
     from object_detection.core.box_predictor import (
         BOX_ENCODINGS,
         CLASS_PREDICTIONS_WITH_BACKGROUND,
@@ -973,22 +547,10 @@ def _ssd_bp_body(box_predictor, feature_tensors, conv_sink):
 
 
 def _build_combined_ssd_functional(detection_model, image_size):
-    """
-    Build ONE functional model for the WHOLE plain SSD model: padded image ->
-    MobileNetV2 backbone (inlined) -> feature-map generator -> box/class predictor
-    -> [feature_maps..., box_out..., cls_out...]. Converged layers are reused
-    (weights preserved, BN/ReLU6 still present so ``fold_model`` folds the whole
-    graph at once); ReLU6 Lambdas in the generator are swapped for explicit
-    ``keras.layers.ReLU`` so folding pre-folds them into the conv (a conv +
-    Lambda(relu6) does NOT fuse in TFLite -- it leaves a dequant->relu6->quant
-    sandwich the NPU delegate cannot consume).
+    """Build the plain SSD backbone and head as one functional model.
 
-    The backbone is INLINED (not a separate quantized graph) so its dual-use tap
-    ``layer_15/expansion_output`` is interior to one quantize_apply -- see the
-    section banner.
-
-    Returns (model, feature_map_keys, num_feature_maps, num_taps,
-    box_predictor_conv_names).
+    ReLU6 Lambdas become Keras ReLU layers for convolution fusion. The return
+    value includes output metadata and predictor convolution names.
     """
     from object_detection.utils import ops as od_ops
 
@@ -1001,18 +563,15 @@ def _build_combined_ssd_functional(detection_model, image_size):
         tf.zeros([1, image_size, image_size, 3], dtype=tf.float32)
     )
     padded = od_ops.pad_to_multiple(pp, fe._pad_to_multiple)
-    # Concrete run to recover the fmg output key order.
     feats = backbone(padded)
     out_keys = list(fmg({k: feats[i] for i, k in enumerate(tap_keys)}).keys())
 
-    # Inline the raw backbone into the combined graph (single image input).
     image_input = tf.keras.Input(
         shape=tuple(padded.shape.as_list()[1:]), name="padded_image"
     )
     taps = _replay_functional(backbone, image_input)
     tap_map = {k: taps[i] for i, k in enumerate(tap_keys)}
 
-    # Feature-map generator body (KerasMultiResolutionFeatureMaps).
     fmaps = []
     for index, from_layer in enumerate(fmg.feature_map_layout["from_layer"]):
         if from_layer:
@@ -1036,9 +595,7 @@ def _build_combined_ssd_functional(detection_model, image_size):
 
 
 class _CombinedSsdHead:
-    """Runs the combined full SSD model (image -> everything) once and caches
-    (feature_maps, box, cls) so the backbone / generator / box-predictor adapters
-    can each return their slice from a single graph evaluation."""
+    """Run the combined SSD graph once and cache map, box, and class outputs."""
 
     def __init__(self, qmodel, feature_map_keys, num_maps):
         self.q = qmodel
@@ -1058,12 +615,7 @@ class _CombinedSsdHead:
 
 
 class _SsdBackboneAdapter:
-    """Drop-in for ``feature_extractor.classification_backbone``. extract_features
-    calls it FIRST, with the padded image (= the combined graph's input), so it
-    RUNS the full combined model once and caches (feature_maps, box, cls). It
-    returns ``num_taps`` placeholder tap tensors purely to satisfy
-    ``image_features[0]``/``[1]`` indexing in extract_features -- the
-    feature-map-generator adapter ignores them and returns the cached maps."""
+    """Run the combined graph and return placeholder backbone taps."""
 
     def __init__(self, head, num_taps):
         self.head = head
@@ -1071,32 +623,26 @@ class _SsdBackboneAdapter:
 
     def __call__(self, padded_image):
         maps, _box, _cls = self.head.run(padded_image)
-        # The returned taps are only handed to the (cache-returning) fmg adapter,
-        # so any tensors of the right count suffice; reuse a real feature map.
+        # The generator adapter ignores tap values but requires their count.
         return [maps[0]] * self.num_taps
 
 
 class _SsdGenAdapter:
-    """Drop-in for ``feature_extractor.feature_map_generator``: returns the cached
-    feature maps (the backbone adapter already ran the combined model) as the
-    meta-arch's OrderedDict contract expects."""
+    """Return cached feature maps using the meta-architecture key order."""
 
     def __init__(self, head):
         self.head = head
 
     def __call__(self, image_features):
         maps, _box, _cls = self.head._cache
-        # NB: no `strict=` -- under @tf.function autograph rewrites `zip` into its
-        # own `zip_`, which does not accept Python 3.10's strict keyword.
+        # AutoGraph's zip replacement does not accept ``strict``.
         return collections.OrderedDict(
             zip(self.head.feature_map_keys, maps)  # noqa: B905
         )
 
 
 class _SsdBoxPredictorAdapter(tf.keras.layers.Layer):
-    """Drop-in for ``_box_predictor``: returns the cached box/class tensors as
-    the {BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND} dict (the combined
-    model already computed them when the backbone adapter ran)."""
+    """Return cached tensors using the TFOD box-predictor dictionary contract."""
 
     def __init__(self, head, **kw):
         super().__init__(**kw)
@@ -1124,32 +670,24 @@ def _quantize_ssd_detection_model(
     for_export=False,
     fully_quantized=False,
 ):
-    """
-    Plain SSD QAT via ONE full-model combined functional graph (backbone + head)
-    + ONE quantize_apply. Call with the ORIGINAL (unfolded, unquantized) backbone
-    -- this path folds+quantizes the backbone together with the head so the
-    dual-use ``layer_15/expansion_output`` tap is interior. See the section banner.
+    """Fold and quantize plain SSD as one graph.
+
+    The input backbone must be original and unquantized so its dual-use tap
+    remains inside the combined quantization domain.
     """
     fe = detection_model.feature_extractor
     model, out_keys, num_maps, num_taps, bp_convs = _build_combined_ssd_functional(
         detection_model, image_size
     )
 
-    # Inlining the backbone REUSES its layers, so those layers now carry two
-    # inbound nodes (their original backbone-graph node + the one just created).
-    # ``fold_model`` reads ``inbound_nodes[0]`` (the original), which points at the
-    # backbone's own InputLayer and is not part of this combined graph. Clone the
-    # combined model to fresh single-node layers (copying the trained weights) so
-    # folding sees only this graph's connectivity.
+    # Clone because ``fold_model`` reads the first inbound node of reused layers.
     clean = tf.keras.models.clone_model(model)
     clean.set_weights(model.get_weights())
     folded = fold_model(clean)
 
-    # Box/class predictor convs are linear (no BN), so no "_folded" suffix; the
-    # variant is included defensively in case a configured tower conv folds BN.
+    # Include names produced when configured tower convolutions fold BatchNorm.
     weight_only = set(bp_convs) | {f"{n}_folded" for n in bp_convs}
 
-    # The plain-SSD graph is the whole model, so its input is the image.
     q = _quantize_full(
         folded,
         per_channel=per_channel,
@@ -1167,45 +705,14 @@ def _quantize_ssd_detection_model(
     return detection_model
 
 
-# =========================================================
-# FPNLite head QAT (SSD MobileNetV2 FPN).
-#
-# The FPN head is structurally different from the plain SSD head:
-#   * feature generation is a top-down FPN (KerasFpnTopDownFeatureMaps:
-#     projections + nearest-neighbour upsample + residual ADD + smoothing convs)
-#     followed by extra "coarse" stride-2 layers;
-#   * the box predictor is a WeightSharedConvolutionalBoxPredictor (one shared
-#     tower + shared box/class heads applied to every feature map, per-level BN).
-# Both use SeparableConv2D everywhere, which our fold/quant only handle once
-# split into DepthwiseConv2D + Conv2D(1x1).
-#
-# The WHOLE post-backbone head (generator + coarse blocks + weight-shared box
-# predictor) is rebuilt as ONE functional model and quantized in ONE pass. This
-# is required for the per-TENSOR scheme: a feature-map ReLU6 that fans out to the
-# internal RESIZE *and* to the box predictor must be interior to a single
-# quantize_apply graph, otherwise (across a separate-model boundary) conv+ReLU6
-# cannot fuse and TFLite emits a stray float-ReLU6 island (DEQUANTIZE -> ReLU6 ->
-# QUANTIZE per consumer) the NPU delegate cannot consume. One combined graph lets
-# it fuse: 0 stray quant/dequant AND (per-tensor) 0 per-channel weight tensors.
-# Keeping the head in one quantized functional graph avoids quantization-domain
-# boundaries between feature generation and prediction, which is particularly
-# important for per-channel conversion where several outputs intentionally remain
-# free-calibrated.
-#
-# Installation: the meta-arch calls extract_features (-> feature_maps) and the
-# box predictor as two separate steps, but the combined model must run ONCE. So
-# the generator adapter runs it and caches all outputs; the coarse + box-predictor
-# adapters return the cached tensors.
-# =========================================================
+# FPNLite uses one post-backbone graph to preserve ReLU6 fusion and scale domains.
+# Separable convolutions are split for folding; adapters return cached outputs.
 
 
 def _split_separable_conv(sep, tag):
-    """
-    Split a SeparableConv2D into (DepthwiseConv2D no-bias, Conv2D 1x1 +bias),
-    weights copied. Our fold/quant primitives are Conv2D/DepthwiseConv2D only
-    (TFLite splits separables the same way). ``tag`` makes the names unique --
-    the FPN / weight-shared graphs reuse one separable across feature maps, and
-    the per-map BatchNorm folds into a distinct Conv2D each, so they cannot share.
+    """Split a separable convolution into depthwise and pointwise layers.
+
+    ``tag`` separates reused FPN layers whose per-map BatchNorm folds differ.
     """
     cfg = sep.get_config()
     dw = tf.keras.layers.DepthwiseConv2D(
@@ -1233,13 +740,10 @@ def _split_separable_conv(sep, tag):
 
 
 def _apply(layer, x, counter, conv_sink=None):
-    """
-    Apply one reused head layer onto functional tensor(s), fold/quant/trace
-    friendly: SeparableConv2D -> split into DepthwiseConv2D + Conv2D(1x1); ReLU6
-    -> keras ReLU6 (so fold_model pre-folds it and TFLite fuses); other Lambda
-    (nearest-neighbour upsample) -> freshly-named copy. When ``conv_sink`` is
-    given, the Conv2D / DepthwiseConv2D names touched here are recorded (used to
-    force the box-predictor convs weight-only).
+    """Apply a reused head layer in a foldable functional graph.
+
+    Separable layers are split, ReLU6 is explicit, Lambdas receive unique names,
+    and convolution names are optionally recorded in ``conv_sink``.
     """
     if isinstance(layer, tf.keras.layers.SeparableConv2D):
         dw, pw = _split_separable_conv(layer, next(counter))
@@ -1258,9 +762,7 @@ def _apply(layer, x, counter, conv_sink=None):
 
 
 def _gen_body(fpn_gen, feature_items, counter):
-    """Replay KerasFpnTopDownFeatureMaps onto ``feature_items`` (list of
-    (key, tensor)); return (ordered_keys, ordered_tensors) in min..max level
-    order."""
+    """Replay FPN top-down layers and return keys and tensors by level."""
     top_down = feature_items[-1][1]
     for layer in fpn_gen.top_layers:
         top_down = _apply(layer, top_down, counter)
@@ -1288,8 +790,7 @@ def _gen_body(fpn_gen, feature_items, counter):
 
 
 def _coarse_body(coarse_layers, deepest, counter):
-    """Replay the extractor coarse stride-2 blocks, fed by the deepest top-down
-    map then each other; return the list of coarse feature tensors."""
+    """Replay chained coarse stride-2 blocks from the deepest FPN map."""
     last = deepest
     extra = []
     for block in coarse_layers:
@@ -1302,10 +803,10 @@ def _coarse_body(coarse_layers, deepest, counter):
 
 
 def _bp_body(box_predictor, feature_tensors, counter, conv_sink):
-    """Replay a WeightSharedConvolutionalBoxPredictor over the feature tensors;
-    return (box_out, cls_out). Convs touched are recorded in ``conv_sink`` and
-    forced weight-only (except any relu6-fed tower conv, which keeps its [0,6]
-    pin via ``_has_intrinsic_relu6`` precedence in ``_quantize_full``)."""
+    """Replay a weight-shared predictor and return box and class tensors.
+
+    Record its convolutions in ``conv_sink`` for weight-only output handling.
+    """
     from object_detection.core.box_predictor import (
         BOX_ENCODINGS,
         CLASS_PREDICTIONS_WITH_BACKGROUND,
@@ -1346,10 +847,9 @@ def _bp_body(box_predictor, feature_tensors, counter, conv_sink):
 
 
 def _build_combined_fpn_functional(detection_model, image_size):
-    """
-    Build ONE functional model: backbone FPN-input feature maps ->
-    [feature_maps..., box_out..., cls_out...]. Returns
-    (model, top_down_keys, num_coarse, num_maps, box_predictor_conv_names).
+    """Build one functional FPN head from backbone maps to predictions.
+
+    Return the model, output metadata, and predictor convolution names.
     """
     from object_detection.utils import ops as od_ops
 
@@ -1391,9 +891,7 @@ def _build_combined_fpn_functional(detection_model, image_size):
 
 
 class _CombinedFpnHead:
-    """Runs the combined model once and caches (feature_maps, box, cls) so the
-    generator / coarse / box-predictor adapters can each return their slice from
-    a single graph evaluation."""
+    """Run the combined FPN head once and cache all output groups."""
 
     def __init__(self, qmodel, top_down_keys, num_coarse, num_maps):
         self.q = qmodel
@@ -1414,8 +912,7 @@ class _CombinedFpnHead:
 
 
 class _GenAdapter:
-    """Drop-in for ``feature_extractor._fpn_features_generator``: runs the
-    combined model (caching everything) and returns just the top-down maps."""
+    """Run the combined FPN head and return its top-down maps."""
 
     def __init__(self, head):
         self.head = head
@@ -1431,8 +928,7 @@ class _GenAdapter:
 
 
 class _CoarseBlockAdapter:
-    """Drop-in for one ``feature_extractor._coarse_feature_layers`` entry:
-    returns the cached coarse map (the combined model already computed it)."""
+    """Return one cached coarse FPN map."""
 
     def __init__(self, head, index):
         self.head = head
@@ -1444,8 +940,7 @@ class _CoarseBlockAdapter:
 
 
 class _BoxPredictorAdapter(tf.keras.layers.Layer):
-    """Drop-in for ``_box_predictor``: returns the cached box/class tensors as
-    the {BOX_ENCODINGS, CLASS_PREDICTIONS_WITH_BACKGROUND} dict."""
+    """Return cached tensors using the TFOD box-predictor dictionary contract."""
 
     def __init__(self, head, **kw):
         super().__init__(**kw)
@@ -1473,22 +968,17 @@ def _quantize_fpn_detection_head(
     for_export=False,
     fully_quantized=False,
 ):
-    """
-    FPNLite head QAT via ONE combined functional model + ONE quantize_apply.
-    Call AFTER the backbone has been folded + quantized. See the section banner.
-    """
+    """Quantize a combined FPNLite head after quantizing its backbone."""
     fe = detection_model.feature_extractor
     model, td_keys, num_coarse, num_maps, bp_convs = _build_combined_fpn_functional(
         detection_model, image_size
     )
     folded = fold_model(model)
 
-    # Box-predictor tower convs fold their per-level BatchNorm into a "_folded"
-    # conv, so the post-fold name may carry that suffix.
+    # Include names produced by folding per-level BatchNorm.
     weight_only = set(bp_convs) | {f"{n}_folded" for n in bp_convs}
 
-    # The head's inputs are backbone taps, which are interior tensors of the
-    # exported graph (and pinned there by the backbone), so no input pin here.
+    # Backbone taps already define the head input quantization domain.
     q = _quantize_full(
         folded,
         per_channel=per_channel,

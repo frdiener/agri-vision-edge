@@ -1,21 +1,9 @@
-"""
-YOLOv7-tiny TFLite runtime.
+"""Run YOLOv7-tiny TFLite models that expose raw detection-head logits.
 
-The phenobench yolov7-tiny export keeps the three detection heads' **raw
-pre-sigmoid grid logits** (``[1, 3, gh, gw, 5 + num_classes]``, no baked-in
-decode/NMS), unlike the SSD models whose graph already emits post-NMS boxes. So
-this runtime reconstructs detections in Python — sigmoid, grid/anchor box
-assembly (yolov5/yolov7 convention), objectness × class confidence, then
-per-class NMS — and returns the same canonical :class:`Detection` list as
-:class:`~agri_vision_edge.runtime.inference.tflite.TFLiteRuntime`, so ``ave
-infer`` and ``ave benchmark`` treat both families identically.
-
-Input is 512×512 with ``[0, 1]`` normalization (vs the SSD 320×320 ``[-1, 1]``);
-both are read from the model, so no per-model flags are needed.
-
-The full YOLO training → tflite build path is not yet integrated in this package
-(see ``notebooks/yolov7_phenobench.ipynb`` + a sibling repo); this runtime only
-*runs* an already-exported tflite.
+The runtime decodes ``[1, 3, gh, gw, 5 + classes]`` grids with YOLOv7 anchors,
+objectness × class confidence, and per-class NMS, returning canonical
+:class:`Detection` objects. Input shape, quantization, and normalization are
+model-derived; model training and export are outside this package.
 """
 
 from __future__ import annotations
@@ -48,9 +36,8 @@ from .tflite import (
 _DEFAULT_IOU_THRESHOLD = 0.65
 _DEFAULT_MAX_DETECTIONS = 100
 
-# Stock yolov7-tiny anchors (cfg/training/yolov7-tiny.yaml — the phenobench-tiny
-# notebook trains the unmodified cfg), keyed by output stride. Verified to decode
-# the exported tflite's raw grid logits onto plants.
+# Stock yolov7-tiny anchors from cfg/training/yolov7-tiny.yaml, keyed by output
+# stride. The phenobench-tiny notebook trains the unchanged configuration.
 YOLO_ANCHORS = {
     8: [(10, 13), (16, 30), (33, 23)],
     16: [(30, 61), (62, 45), (59, 119)],
@@ -65,9 +52,7 @@ CANDIDATE_FLOOR = 1e-3
 
 
 class YoloTFLiteRuntime(BaseRuntime):
-    """
-    TensorFlow Lite runtime for raw-grid YOLOv7-tiny detectors.
-    """
+    """TensorFlow Lite runtime for raw-grid YOLOv7-tiny detectors."""
 
     def __init__(
         self,
@@ -86,9 +71,8 @@ class YoloTFLiteRuntime(BaseRuntime):
 
         self.labels = self.metadata.labels
 
-        # Keep both the requested and the effective delegate: a missing or
-        # unloadable delegate falls back to CPU, and the benchmark artifacts
-        # have to say so rather than claim the accelerator.
+        # Record both the requested and effective delegates so CPU fallbacks are
+        # visible in benchmark artifacts.
         _delegates, self.active_delegate = load_delegates_with_status(delegate_path)
 
         self.requested_delegate = (
@@ -133,10 +117,6 @@ class YoloTFLiteRuntime(BaseRuntime):
 
         return self._input_size
 
-    #
-    # Preprocessing
-    #
-
     def _quantize_input(self, image):
         """``[0, 1]`` normalization, then the model's input quantization."""
 
@@ -157,17 +137,12 @@ class YoloTFLiteRuntime(BaseRuntime):
 
         return np.clip(quantized, info.min, info.max).astype(dtype)
 
-    #
-    # Inference
-    #
-
     def predict(self, image):
 
         preprocess_start = self._mark()
         resize_start = preprocess_start
 
-        # Split out for the same reason as in the SSD runtime: this is the one
-        # step priced by the *source* resolution rather than by the model.
+        # Measure resize separately because its cost depends on source resolution.
         resized = cv2.resize(
             image,
             (self._input_size, self._input_size),

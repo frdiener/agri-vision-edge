@@ -38,12 +38,8 @@ def save_benchmark_artifacts(
         "predictions.json",
     )
 
-    # Same reasoning as `delegate_active` below: a run whose runtime produced
-    # garbage must not be indistinguishable from a good one in the results
-    # tree. Non-finite boxes in particular do NOT make the evaluator fail --
-    # pycocotools scores them as a match at every IoU threshold and reports an
-    # inflated AP -- so record the counters here, where the predictions were
-    # made, and say so on the console while the operator is still watching.
+    # Record prediction integrity because pycocotools can treat non-finite boxes
+    # as matches at every IoU threshold and report inflated AP.
     integrity = prediction_integrity(
         benchmark_result.predictions
     )
@@ -67,11 +63,8 @@ def save_benchmark_artifacts(
         "latency.json",
     )
 
-    # `delegate` is only what was requested. A delegate that is missing or
-    # fails to load falls back to CPU silently, so record what the runtime
-    # actually used as well -- otherwise a CPU run is indistinguishable from an
-    # accelerated one in the results, and every latency comparison built on
-    # them is wrong.
+    # Record the effective delegate so silent CPU fallbacks remain distinguishable
+    # from accelerated runs.
     active_delegate = getattr(runtime, "active_delegate", None)
 
     save_json(

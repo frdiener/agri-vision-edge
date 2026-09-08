@@ -1,36 +1,9 @@
-"""
-Batch TFLite conversion of trained TF model variants.
+"""Convert trained TFOD variants to metadata-bearing TFLite targets.
 
-Ports the conversion path of ``notebooks/tflite_conversion.py`` into a reusable
-function for the ``ave convert`` CLI: for a model variant under ``artifacts/tf/``
-it rebuilds the deployable TFLite models (default IoU threshold) and embeds
-ObjectDetector metadata. Conversion + metadata only -- no evaluation.
-
-For each variant the standard targets below are produced *as long as the backing
-stage is present* (``ptq/``, ``qat_per-tensor/`` or ``qat_per-channel/``):
-
-    fp32_ptq               plain float         (ptq stage)
-    int8_ptq_per-tensor    per-tensor PTQ      (ptq stage)
-    int8_ptq_per-channel   per-channel PTQ     (ptq stage)
-    int8_qat_per-tensor    per-tensor QAT      (qat_per-tensor stage)
-    int8_qat_per-channel   per-channel QAT     (qat_per-channel stage)
-
-PTQ per-channel reuses the per-tensor ``ptq/`` checkpoint (granularity is a
-converter flag); QAT trains a distinct checkpoint per granularity, so each has
-its own stage directory (``qat_per-tensor/`` and ``qat_per-channel/``).
-
-Each of those is emitted twice, once per NMS flavour:
-
-    _fastnms   class-agnostic NMS over each anchor's argmax class. This is
-               what ships to the device.
-    _regnms    per-class NMS, i.e. what the training checkpoint's
-               ``batch_multiclass_non_max_suppression`` does. Built as the
-               control that isolates the cost of the substitution.
-
-The pair differs only in the ``use_regular_nms`` attribute of the emitted
-``TFLite_Detection_PostProcess`` op -- same checkpoint, same graph, same
-calibration -- so any delta between them is attributable to post-processing
-alone.
+Available PTQ and QAT stages produce fp32 or INT8 per-tensor/per-channel models.
+Each target has shipping class-agnostic ``fastnms`` and control per-class
+``regnms`` forms. A pair differs only in ``use_regular_nms``, isolating the
+post-processing cost.
 """
 
 from __future__ import annotations
@@ -54,24 +27,16 @@ class ConversionTarget:
 
     #: Post-processing flavour baked into ``TFLite_Detection_PostProcess``.
     #: ``False`` (default) is the shipping one: class-agnostic "fast" NMS over
-    #: each anchor's argmax class. ``True`` reproduces the checkpoint's per-class
-    #: NMS and exists as the control for the substitution's cost -- it does not
-    #: change the graph, only the custom op's ``use_regular_nms`` attribute.
+    #: each anchor's argmax class. ``True`` is the per-class NMS control and
+    #: changes only the custom op's ``use_regular_nms`` attribute.
     regular_nms: bool = False
 
     @property
     def stage_candidates(self) -> tuple[str, ...]:
-        """
-        Variant subdirectories that can source this target, most preferred first.
+        """Return source stage names in preference order.
 
-        PTQ shares one checkpoint regardless of granularity -- there it is just
-        a converter flag.
-
-        QAT does too: the training graph does not depend on granularity (relu6
-        outputs are pinned either way), which is chosen when the export graph is
-        rebuilt. Training a run per granularity was tried and measured to gain
-        nothing, so ``qat_per-tensor/`` is the canonical run and
-        ``qat_per-channel/`` is used only when it is the sole QAT stage present.
+        PTQ and QAT checkpoints are granularity-independent; QAT prefers the
+        canonical ``qat_per-tensor`` stage.
         """
         if self.quantization == "ptq":
             return ("ptq",)
@@ -121,9 +86,8 @@ FAST_NMS_TARGETS: tuple[ConversionTarget, ...] = (
     ConversionTarget("int8", "qat", per_channel=True),
 )
 
-#: The per-class-NMS control for each of them. Same checkpoint, same graph, same
-#: calibration -- only the custom op's ``use_regular_nms`` attribute differs, so
-#: the pair isolates the post-processing substitution from everything else.
+#: Per-class NMS controls. Only the custom op's ``use_regular_nms`` attribute
+#: differs, isolating the post-processing substitution.
 REGULAR_NMS_TARGETS: tuple[ConversionTarget, ...] = tuple(
     replace(target, regular_nms=True) for target in FAST_NMS_TARGETS
 )
@@ -135,18 +99,7 @@ STANDARD_TARGETS: tuple[ConversionTarget, ...] = FAST_NMS_TARGETS + REGULAR_NMS_
 
 
 def stage_graph_flags(stage_name: str) -> tuple[bool, bool]:
-    """
-    ``(qat, per_channel)`` implied by a stage directory name.
-
-    The inverse of :attr:`ConversionTarget.stage_candidates`: given a stage
-    directory (``finetune`` / ``ptq`` / ``qat_per-tensor`` /
-    ``qat_per-channel``), say how its graph has to be rebuilt before the
-    checkpoint will restore. A QAT checkpoint stores *folded and fake-quantized*
-    variables, and the directory name is the only record of which.
-
-    Lives here rather than in ``tfod_trainer`` so it can be used -- and tested
-    -- without importing the vendored ``object_detection`` stack.
-    """
+    """Return the ``(qat, per_channel)`` graph flags encoded by ``stage_name``."""
     qat = stage_name.startswith("qat")
     return qat, stage_name.endswith("per-channel")
 
@@ -162,11 +115,9 @@ def _dataset_dir(variant_name: str, datasets_dir: Path) -> Path:
     """
     Locate the exported dataset bundle a variant was trained from.
 
-    The models are trained on the ``_no-partials`` bundles (partials dropped in
-    train, do-not-care in eval); the unsuffixed directories are earlier exports
-    kept around. They are not interchangeable -- their ``rep_dataset.json``
-    indices were drawn against different sample counts -- so prefer the
-    no-partials bundle and only fall back to the legacy name when it is absent.
+    Models use ``_no-partials`` bundles. Legacy unsuffixed exports have
+    ``rep_dataset.json`` indices based on different sample counts and are used
+    only when the preferred bundle is absent.
     """
     classes, tiled = _parse_variant(variant_name)
     stem = f"phenobench_{classes}{'_tiled' if tiled else ''}"
@@ -203,22 +154,10 @@ def _masks_dataset(raw_dir: Path):
 
 
 def _build_train_dataset(variant_name: str, datasets_dir: Path):
-    """
-    Rebuild the train split the representative-dataset indices were drawn from.
+    """Rebuild the training split in the order indexed by ``rep_dataset.json``.
 
-    ``rep_dataset.json`` stores *positions*, so this has to reproduce the
-    exported bundle's ordering exactly -- a dataset built with different tiling
-    still indexes fine and still yields plausible field images, it just
-    calibrates on the wrong ones.
-
-    Tiled bundles are cut from the FULL frames, so the tiling is applied to
-    ``phenobench_raw_full`` with the geometry the export recorded. (Applying it
-    to ``phenobench_raw_tiled`` instead re-cuts tiles that are already tiles:
-    512px training tiles became 256px sub-tiles and every index shifted.)
-    Bundles exported before the geometry was recorded are matched by the
-    materialized ``phenobench_raw_tiled`` as-is; either way
-    :func:`_check_calibration_dataset` verifies the result against the export's
-    own sample count.
+    Recorded tiling is reapplied to full frames; legacy bundles use the
+    materialized tiled dataset.
     """
     from phenobench import PhenoBench
 
@@ -252,7 +191,7 @@ def _build_train_dataset(variant_name: str, datasets_dir: Path):
 
     # Legacy bundle: no recorded geometry, but the materialized tiled dataset is
     # that geometry. Wrapped in a 1x1 grid purely to derive boxes from the
-    # instance masks -- unlike the full dataset it ships no `plant_bboxes/`.
+    # instance masks because it has no `plant_bboxes/` directory.
     raw_dir = datasets_dir / "phenobench_raw_tiled"
     if not raw_dir.exists():
         raise FileNotFoundError(f"Raw PhenoBench dataset not found: {raw_dir}")
@@ -271,8 +210,7 @@ def _check_calibration_dataset(dataset, dataset_dir: Path, indices: list) -> Non
     The indices are positions, not identifiers: a calibration dataset built with
     different geometry than the exported training set still indexes fine, still
     yields plausible field images, and silently calibrates on the wrong ones.
-    The export records its own sample count, so compare against that -- it is
-    the only cheap check that catches a renumbering.
+    Compare with the export's sample count to detect renumbering.
     """
     expected = _export_metadata(dataset_dir).get("train_samples")
     if expected is None:
@@ -306,9 +244,8 @@ def _representative_dataset_fn(
     train_dataset = _build_train_dataset(variant_name, datasets_dir)
     _check_calibration_dataset(train_dataset, dataset_dir, indices)
 
-    # SSDModule.inference_fn expects already-normalized [-1, 1] input, so the
-    # raw [0, 255] samples must be normalized for calibration -- feeding [0, 255]
-    # mis-calibrates the class head and caps scores at sigmoid(0) = 0.5.
+    # SSDModule.inference_fn expects normalized [-1, 1] input. Raw [0, 255]
+    # samples miscalibrate the class head and cap scores at sigmoid(0) = 0.5.
     def representative_dataset():
         return normalized_representative_dataset(
             dataset=train_dataset,
@@ -392,8 +329,8 @@ def _convert_one(
 
     # Fast NMS (the default) is what ships; regular NMS reproduces the
     # checkpoint's per-class `batch_multiclass_non_max_suppression` and is built
-    # as its control. Nothing else about the graph changes -- this only sets the
-    # `use_regular_nms` attribute of the TFLite_Detection_PostProcess op that
+    # as its control. Only the `use_regular_nms` attribute changes on the
+    # TFLite_Detection_PostProcess op that
     # MLIR legalizes the `dummy_post_processing` stub into.
     detection_module = SSDModule(
         pipeline_config,
@@ -467,21 +404,10 @@ def convert_variant(
     overwrite: bool = False,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
-    """
-    Convert every applicable target of ``variant_dir`` to a TFLite model.
+    """Convert available target stages and return the written TFLite paths.
 
-    A target is converted only when its backing stage directory is present;
-    existing outputs are skipped unless ``overwrite`` is set. Returns the list of
-    written ``.tflite`` paths.
-
-    ``targets`` defaults to :data:`STANDARD_TARGETS`, i.e. every deployable
-    model *and* its per-class-NMS control. Pass :data:`FAST_NMS_TARGETS` to
-    build only what ships.
-
-    ``native_resize`` (default True) builds FPN models with the NPU-delegatable
-    ``RESIZE_NEAREST_NEIGHBOR`` upsample instead of the ``PACK`` reshape trick, so
-    the full FPN graph delegates to the Teflon/etnaviv NPU; no-op for non-FPN
-    models.
+    Existing outputs are skipped unless ``overwrite``; ``native_resize`` selects
+    delegate-compatible FPN upsampling.
     """
     written: list[Path] = []
 

@@ -9,9 +9,8 @@
 # stems, for recollecting one subset in a single coherent batch.
 #
 # All models use the NPU delegate (--delegate, default /usr/lib/libteflon.so).
-# Note: the Teflon delegate targets INT8 — routing an fp32 graph through it
-# reports support for float conv ops and silently degrades results. Use --cpu
-# for runs without delegate.
+# The Teflon delegate targets INT8. An fp32 graph reports float convolution
+# support and silently degrades results. Use --cpu for runs without a delegate.
 #
 # Pass --cpu to disable the delegate for every model and write the results to
 # benchmark_results/<hostname>_cpu/ instead.
@@ -21,18 +20,12 @@
 #   --suffix unpatched            -> benchmark_results/<hostname>_unpatched/
 #   --suffix unpatched --cpu      -> benchmark_results/<hostname>_unpatched_cpu/
 #
-# This script only *measures*: it writes predictions.json / latency.json /
-# runtime.json and stops there. Scoring is a separate step -- run
-# scripts/evaluate_all.sh afterwards. Keeping the two apart matters on a device:
-# evaluation is pure host-side post-processing over predictions.json, so mixing
-# it into the sweep would only add heat, memory pressure and wall time between
-# two latency measurements without changing a single number.
+# This script writes predictions.json, latency.json, and runtime.json. Run
+# scripts/evaluate_all.sh separately for scoring. Host-side evaluation between
+# measurements would add heat, memory pressure, and wall time.
 #
-# The tiled split pairs test-bundle/images_tiled with annotations_*_tiled.json,
-# and both must come from the SAME tile geometry (currently 3x3, overlap=0.5 --
-# see notebooks 03/04). Nothing here can detect a mismatch: tile
-# file names are identical across grids, so inference would silently run on the
-# wrong crops.
+# The tiled images and annotations must use the same geometry (currently 3x3,
+# overlap=0.5; see notebooks 03/04). Tile names cannot reveal a grid mismatch.
 #
 # Any other extra arguments are forwarded to `ave benchmark`.
 
@@ -111,7 +104,7 @@ if [[ -n "${filter}" ]]; then
     selected=()
     for model in "${models[@]}"; do
         stem="$(basename "${model}" .tflite)"
-        # shellcheck disable=SC2053  -- the glob is the point.
+        # shellcheck disable=SC2053  # Intentional glob match.
         [[ "${stem}" == ${filter} ]] && selected+=("${model}")
     done
     models=(${selected[@]+"${selected[@]}"})

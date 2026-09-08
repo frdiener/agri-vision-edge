@@ -18,24 +18,9 @@ import pandas as pd
 def load_history_scalars(
     history: str | Path | list[dict],
 ) -> pd.DataFrame:
-    """
-    Load scalar metrics from a tfod_trainer training history.
+    """Return training-history records as a ``step``, ``tag``, ``value`` DataFrame.
 
-    This is the plain-metrics counterpart to
-    :func:`agri_vision_edge.evaluation.tensorboard.load_event_scalars`:
-    the trainer no longer writes TensorBoard event files, it appends one
-    flat record per logged step to ``metrics_history.json``. This turns
-    that into the same tidy long-format frame, so every ``plot_*`` helper
-    below works unchanged.
-
-    Args:
-        history:
-            Either the in-memory list of per-step records (each a flat
-            ``{"step": int, "<tag>": value, ...}`` dict) or a path to the
-            ``metrics_history.json`` the trainer writes.
-
-    Returns:
-        pd.DataFrame with columns ``step``, ``tag``, ``value``.
+    ``history`` may be an in-memory list of flat per-step records or a JSON path.
     """
     if isinstance(history, (str, Path)):
         history = json.loads(Path(history).read_text())
@@ -65,9 +50,7 @@ def load_history_scalars(
     return df
 
 
-# =========================================================
 # Global plotting defaults
-# =========================================================
 
 plt.rcParams["axes.spines.top"] = False
 plt.rcParams["axes.spines.right"] = False
@@ -148,29 +131,10 @@ def plot_metric_curves(
     save_path: str | Path | None = None,
     dpi: int = DEFAULT_DPI,
 ):
-    """
-    Generic multi-metric plotting utility.
+    """Plot selected metric tags and return the Matplotlib figure and axes.
 
-    Args:
-        df:
-            DataFrame from `load_event_scalars`.
-        tags:
-            Metric tags to plot.
-        title:
-            Figure title.
-        ylabel:
-            Y-axis label.
-        smoothing:
-            Exponential smoothing factor in [0, 1).
-        figsize:
-            Figure size.
-        save_path:
-            Optional export path.
-        dpi:
-            Export DPI for raster formats.
-
-    Returns:
-        Tuple[Figure, Axes]
+    ``smoothing`` is an exponential factor in ``[0, 1)``; ``save_path``
+    optionally writes the figure at ``dpi``.
     """
     if "tag" not in df.columns:
         raise ValueError(
@@ -428,10 +392,6 @@ def plot_checkpoint_metrics(
 
     precision_ax, recall_ax, loss_ax = axes
 
-    # =========================================================
-    # Precision metrics
-    # =========================================================
-
     precision_tags = [
         "DetectionBoxes_Precision/mAP",
         "DetectionBoxes_Precision/mAP@.50IOU",
@@ -458,10 +418,6 @@ def plot_checkpoint_metrics(
 
     precision_ax.legend(frameon=False)
 
-    # =========================================================
-    # Recall metrics
-    # =========================================================
-
     recall_tags = [
         "DetectionBoxes_Recall/AR@1",
         "DetectionBoxes_Recall/AR@10",
@@ -487,10 +443,6 @@ def plot_checkpoint_metrics(
     _prepare_axis(recall_ax)
 
     recall_ax.legend(frameon=False)
-
-    # =========================================================
-    # Loss metrics
-    # =========================================================
 
     loss_tags = [
         "Loss/total_loss",

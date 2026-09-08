@@ -1,24 +1,8 @@
-"""
-Partial-aware plant bounding-box generation from PhenoBench masks.
+"""Generate partial-aware plant boxes from PhenoBench masks.
 
-The upstream :class:`phenobench.PhenoBench` loader builds ``plant_bboxes`` only
-for the fully-visible semantic classes (``1`` crop, ``2`` weed) and silently
-drops the partial (border) plants labelled ``3`` (partial-crop) / ``4``
-(partial-weed); it also never surfaces the per-instance visibility. That is
-lossy for evaluation: the official PhenoBench protocol treats partials as
-*do-not-care* (see :mod:`agri_vision_edge.evaluation.partials`), which requires
-knowing *where* the partials are so a detection landing on one is not penalized.
-
-This module regenerates boxes for **all** instances directly from the
-``semantics`` / ``plant_instances`` / ``plant_visibility`` masks, carrying a
-per-box ``visibility`` (in ``[0, 1]``) and an ``is_partial`` flag. It mirrors the
-loader's ``(label, instance)``-scoped box construction (robust to instance ids
-reused across classes) and the upstream partiality criterion
-(``visibility <= threshold``), additionally flagging the border classes ``3``/``4``.
-
-The boxes are emitted in the same dict shape the loader uses
-(``label`` / ``corner`` / ``center`` / ``width`` / ``height``) plus ``visibility``
-and ``is_partial``, so the COCO / TFRecord exporters consume them unchanged.
+Unlike the upstream loader, this module retains border classes 3 and 4 as
+``is_partial`` boxes. Visibility is normalized to ``[0, 1]`` and instance IDs
+remain scoped by semantic label because IDs may be reused across classes.
 """
 
 from __future__ import annotations
@@ -40,30 +24,10 @@ def plant_boxes_from_masks(
     plant_visibility: np.ndarray | None = None,
     partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
 ) -> list[dict]:
-    """
-    Regenerate all plant boxes (including partials) with visibility.
+    """Generate boxes for raw PhenoBench semantic classes 1–4.
 
-    Parameters
-    ----------
-    semantics:
-        ``H x W`` semantic mask with the raw PhenoBench classes
-        (``1`` crop, ``2`` weed, ``3`` partial-crop, ``4`` partial-weed).
-    plant_instances:
-        ``H x W`` instance-id mask.
-    plant_visibility:
-        Optional ``H x W`` visibility mask (0..255). When given, each box gets a
-        ``visibility`` in ``[0, 1]`` and ``is_partial`` follows the upstream
-        criterion ``visibility <= partial_threshold``. Border classes ``3``/``4``
-        are always flagged partial regardless.
-    partial_threshold:
-        Visibility at or below which a box is partial (default ``0.5``).
-
-    Returns
-    -------
-    list[dict]
-        Boxes with keys ``label`` (remapped to ``1``/``2``), ``corner``,
-        ``center``, ``width``, ``height``, ``is_partial`` and -- when a
-        visibility mask is supplied -- ``visibility``.
+    Classes 3–4 are remapped and always partial; a 0–255 visibility mask adds
+    normalized ``visibility`` and marks values at or below the threshold partial.
     """
 
     boxes: list[dict] = []
@@ -121,18 +85,10 @@ def plant_boxes_from_masks(
 
 
 class PartialAwarePhenoBench:
-    """
-    Wrap a :class:`phenobench.PhenoBench` so ``plant_bboxes`` includes partials.
+    """Replace a PhenoBench sample's boxes with partial-aware boxes from its masks.
 
-    The wrapped dataset must expose the ``semantics``, ``plant_instances`` and
-    (optionally, but recommended) ``plant_visibility`` target types. Each sample
-    is returned with ``plant_bboxes`` replaced by the partial-aware boxes from
-    :func:`plant_boxes_from_masks`, so the COCO / TFRecord exporters can carry
-    the do-not-care boxes through with an ``ignore`` flag.
-
-    Use with ``ignore_partial=False`` on the underlying loader (so the raw
-    semantics ``3``/``4`` reach this wrapper); passing ``ignore_partial=True``
-    would have already masked them away.
+    The wrapped dataset must expose semantics and instances and must retain raw
+    partial classes with ``ignore_partial=False``; visibility is optional.
     """
 
     def __init__(

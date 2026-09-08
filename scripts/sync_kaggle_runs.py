@@ -1,43 +1,6 @@
 #!/usr/bin/env python3
 
-"""
-Pull a config's finetune + PTQ + QAT Kaggle kernel outputs and merge their manifests.
-
-Each config is trained as independent Kaggle notebooks that each publish only
-their own slice of the experiment:
-
-    finetune         ->  manifest.json                   + finetune/
-    ptq              ->  manifest.ptq.json               + ptq/
-    qat_per-tensor   ->  manifest.qat_per-tensor.json    + qat_per-tensor/
-    qat_per-channel  ->  manifest.qat_per-channel.json   + qat_per-channel/
-
-``finetune`` publishes the fp32 base model under ``finetune/``. ``ptq`` is a
-separate QAT-parity float run (its checkpoint is calibrated to int8 by the
-converter). ``qat_per-tensor`` is the per-tensor int8 QAT run (i.MX8M Plus) and
-``qat_per-channel`` the per-channel variant (i.MX93 Ethos-U) -- each a separate
-kernel/folder so it never clobbers the others. ``ptq`` and both QAT runs resume
-from the shared finetune ``finetune/`` export.
-
-This script downloads each kernel's output into one local config directory (the
-finetune's ``manifest.json`` and the ``manifest.<stage>.json`` fragments don't
-collide, and ``finetune/`` / ``<stage>/`` land side by side), then folds every
-fragment into the finetune's full ``manifest.json`` -- the same
-stage/artifact/result merge as ``ExperimentManifest.merge``, but idempotent
-(re-merging an already-merged stage overwrites instead of raising), so it is safe
-to re-run.
-
-Kaggle slug convention (override per stage with --slug if a kernel was titled
-differently): ``<owner>/<config '_'->'-' lowercased>-<stage>``, e.g.
-``freimutdiener/ssd-mn2-fpnlite-sc-phenobench-320-qat-per-tensor``.
-
-Usage (pulls finetune + ptq + qat_per-tensor + qat_per-channel by default):
-    scripts/sync_kaggle_runs.py                               # all eight SSD configs
-    scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320
-    scripts/sync_kaggle_runs.py ssd-mn2_sc_phenobench_320 --dest artifacts/tf/ssd-mn2_sc_phenobench_320
-    scripts/sync_kaggle_runs.py <config> --no-download          # re-merge what's on disk
-    scripts/sync_kaggle_runs.py <config> --stages finetune,ptq  # subset
-    scripts/sync_kaggle_runs.py --no-download                   # re-merge all eight on disk
-"""
+"""Download Kaggle stage outputs and merge their experiment manifests."""
 
 from __future__ import annotations
 
@@ -63,8 +26,7 @@ DEFAULT_OWNER = "freimutdiener"
 DEFAULT_STAGES = ["finetune", "ptq", "qat_per-tensor", "qat_per-channel"]
 ARTIFACTS_TF = Path(__file__).resolve().parent.parent / "artifacts" / "tf"
 
-# The eight SSD configs — {plain SSD, FPNLite} × {sc, mc} × {untiled, tiled} —
-# synced by default when no config slug is given on the command line.
+# Default SSD matrix: {plain SSD, FPNLite} × {sc, mc} × {untiled, tiled}.
 SSD_CONFIGS = [
     "ssd-mn2_sc_phenobench_320",
     "ssd-mn2_mc_phenobench_320",
@@ -85,9 +47,7 @@ def stage_manifest_name(stage: str) -> str:
 # Kaggle caps a notebook's title (hence its slug body) at 50 characters. When the
 # full ``...-qat-per-tensor`` / ``...-qat-per-channel`` body would exceed that,
 # the kernel is titled with the abbreviated ``...-qat-pt`` / ``...-qat-pc``
-# suffix instead. The internal stage name, fragment manifest, and artifact folder
-# stay ``qat_per-tensor`` / ``qat_per-channel`` regardless -- only the Kaggle slug
-# abbreviates.
+# suffix instead. Internal stage, manifest, and artifact names remain unchanged.
 KAGGLE_SLUG_MAX = 50
 
 # Long QAT stage suffix -> abbreviation used only when the slug body would exceed
@@ -102,9 +62,8 @@ _SLUG_ABBREVIATIONS = {
 def kernel_slug(owner: str, config: str, stage: str) -> str:
     """``<owner>/<config-and-stage as a kaggle slug>``.
 
-    Kaggle slugs are lowercase with hyphens only, so the whole ``config-stage``
-    body is hyphenated -- including the QAT stages ``qat_per-tensor`` /
-    ``qat_per-channel`` -> ``...-qat-per-tensor`` / ``...-qat-per-channel``. If
+    Kaggle slugs are lowercase with hyphens. This includes the QAT stage tokens
+    ``qat_per-tensor`` and ``qat_per-channel``. If
     that body would exceed Kaggle's 50-char title cap, the long suffix is
     abbreviated (``-qat-pt`` / ``-qat-pc``) to match how the kernel had to be
     titled (e.g. the FPNLite tiled configs).
@@ -118,9 +77,7 @@ def kernel_slug(owner: str, config: str, stage: str) -> str:
     return f"{owner}/{body}"
 
 
-# --------------------------------------------------------------------------
 # Download
-# --------------------------------------------------------------------------
 
 
 def download_kernel(slug: str, dest: Path, *, force: bool, quiet: bool) -> bool:
@@ -130,8 +87,8 @@ def download_kernel(slug: str, dest: Path, *, force: bool, quiet: bool) -> bool:
     ``kaggle kernels output`` downloads the output files individually (it does
     not zip, unlike ``kaggle datasets download``), but we still detect and
     extract a ``*.zip`` defensively in case that ever changes. The kernel
-    ``*.log`` is skipped. Returns False (with a warning) if the kernel can't be
-    fetched -- e.g. a qat run that hasn't been published yet.
+    ``*.log`` is skipped. Returns False with a warning when the kernel cannot be
+    fetched.
     """
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
@@ -166,19 +123,16 @@ def download_kernel(slug: str, dest: Path, *, force: bool, quiet: bool) -> bool:
         return True
 
 
-# --------------------------------------------------------------------------
 # Merge
-# --------------------------------------------------------------------------
 
 
 def merge_fragments(dest: Path, stages: list[str]) -> ExperimentManifest:
     """
     Fold every present ptq/qat fragment into the finetune ``manifest.json``.
 
-    Mirrors ``ExperimentManifest.merge`` (stages + artifact files + results) but
-    is idempotent: an already-merged stage is overwritten rather than raising,
-    and artifact files are de-duplicated, so re-running after a fresh download
-    -- or with --no-download -- converges to the same result.
+    Mirrors the stage, artifact, and result handling in
+    ``ExperimentManifest.merge``. Existing stages are overwritten and artifact
+    files are deduplicated, making repeated runs idempotent.
     """
     base_path = dest / "manifest.json"
     if not base_path.exists():
@@ -233,9 +187,7 @@ def print_summary(manifest: ExperimentManifest) -> None:
     print(f"  artifacts: {n_files} file(s) registered")
 
 
-# --------------------------------------------------------------------------
 # CLI
-# --------------------------------------------------------------------------
 
 
 def sync_config(config: str, args: argparse.Namespace) -> None:

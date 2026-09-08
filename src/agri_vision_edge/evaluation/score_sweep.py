@@ -1,32 +1,7 @@
-"""
-Precision / recall / F1 as a function of the confidence threshold.
+"""Compute confidence-threshold precision, recall, and F1 from COCO match tables.
 
-AP integrates over the whole ranking and cannot say where to put the score
-threshold. This sweeps that axis, at fixed IoU (0.50 and 0.75).
-
-``COCOeval.accumulate`` indexes precision by recall threshold and discards the
-score axis, so counts are taken one step earlier from ``COCOeval.evalImgs``,
-reusing accumulate's own bookkeeping (``cocoeval.py`` lines 375-376)::
-
-    tp = dtMatches & ~dtIgnore
-    fp = ~dtMatches & ~dtIgnore
-    n_gt = count(gtIgnore == 0)
-
-One matching pass serves every threshold: COCO matches greedily in descending
-score order, so dropping the low-score tail cannot change the assignment of any
-higher-scoring detection. The sweep is then a cumulative sum over score-sorted
-flags. Holds only without truncation -- see ``max_dets`` on
-:func:`compute_score_sweep`.
-
-Curves stop at the export's score floor. SSD graphs carry
-``nms_score_threshold`` (0.05 here) in their ``TFLite_Detection_PostProcess``
-op, so nothing below it is emitted and ``ave benchmark``'s
-``score_threshold=0.0`` cannot lift it. :meth:`ScoreSweep.best_f1` excludes that
-region.
-
-Host-only: pycocotools is in the ``prep`` dependency group. Consistent with the
-pycocotools path only -- the ``--faithful`` torchmetrics path exposes no
-equivalent match table, so these are not leaderboard-comparable.
+Sweeps require untruncated detections, and best-F1 selection excludes thresholds
+below the lowest emitted score.
 """
 
 from __future__ import annotations
@@ -110,9 +85,7 @@ class ScoreSweep:
 
     partial_threshold: float = 0.5
 
-    # -----------------------------------------------------------------
     # Derivation
-    # -----------------------------------------------------------------
 
     def counts(self, class_name: str = MICRO_CLASS) -> tuple[np.ndarray, ...]:
         """
@@ -238,17 +211,15 @@ class ScoreSweep:
             f"available: {list(self.iou_thresholds)}"
         )
 
-    # -----------------------------------------------------------------
-    # Serialisation
-    # -----------------------------------------------------------------
+    # Serialization
 
     def to_dict(self) -> dict:
         """
         JSON-ready form.
 
-        Cumulative counts on a fixed grid rather than per-detection rows: a run
-        has tens of thousands of detections but ~1k grid points, and the counts
-        reconstruct every curve exactly at grid resolution.
+        Cumulative counts use a fixed grid of about 1,000 points to avoid tens
+        of thousands of per-detection rows. They reconstruct each curve at grid
+        resolution.
         """
 
         return {
@@ -307,9 +278,7 @@ class ScoreSweep:
         )
 
 
-# =========================================================
 # Computation
-# =========================================================
 
 
 def _cumulative_counts(
@@ -355,18 +324,10 @@ def compute_score_sweep(
     score_grid: np.ndarray | None = None,
     max_dets: int | None = None,
 ) -> ScoreSweep:
-    """
-    Sweep precision / recall / F1 over the confidence threshold.
+    """Sweep confidence metrics for a prepared evaluation.
 
-    ``prepared`` must come from
-    :func:`agri_vision_edge.evaluation.coco.prepare_evaluation`, so the sweep
-    scores the same detections and ground truth as the headline metrics.
-
-    ``max_dets`` defaults to the largest detection count seen on any image, i.e.
-    no truncation. COCO's usual ``maxDets=100`` would cap recall and break
-    threshold-invariance: once truncation binds, raising the threshold frees
-    slots for previously discarded detections. Pass a value only to reproduce a
-    truncated COCO convention; ``max_dets_observed`` shows whether it binds.
+    ``max_dets`` defaults to the largest per-image detection count to avoid
+    truncation; an explicit limit may make results threshold-dependent.
     """
 
     # Imported here so reading a stored sweep never requires the evaluator.
@@ -382,7 +343,7 @@ def compute_score_sweep(
     category_ids = sorted(coco_gt.getCatIds())
 
     #
-    # How many detections a single image produced, before any truncation.
+    # Maximum detections per image before truncation
     #
 
     per_image_counts: dict[int, int] = {}
@@ -496,9 +457,7 @@ def compute_score_sweep(
     )
 
 
-# =========================================================
 # Artifact I/O
-# =========================================================
 
 #: Written beside ``metrics.json`` by ``ave evaluate``.
 SCORE_SWEEP_FILENAME = "score_sweep.json"

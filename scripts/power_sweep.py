@@ -119,59 +119,20 @@ def probe_clock(remote: Remote, samples: int = 7) -> dict[str, Any]:
 
 #: Named model selections.
 #:
-#: ``arch-matrix`` is the collapsed set: one representative per
-#: (architecture x precision/quantisation), 13 models instead of 43. The two
-#: dropped dimensions were checked against the existing ``latency.json`` sweeps
-#: on both boards rather than assumed, holding everything else fixed:
+#: ``arch-matrix`` selects one representative per architecture and
+#: precision/quantization pair. Existing board sweeps show small median spreads
+#: for class count (3.3%) and training tiling (3.4%), compared with architecture
+#: (20.3%) and precision (166.3%). The reference is untiled multi-class.
 #:
-#:   dimension varied              median spread   max
-#:   sc vs mc                            3.3 %    10.8 %
-#:   trained untiled vs tiled            3.4 %    14.2 %
-#:   ---- kept ----
-#:   ssd-mn2 vs fpnlite                 20.3 %    52.3 %
-#:   fp32 vs int8                      166.3 %   174.6 %
+#: yolov7-tiny has only a tiled-trained 512 export. Its input resolution remains
+#: an architecture property. Accuracy evaluation still requires the full matrix.
 #:
-#: The artifacts say why. sc and mc differ by +0.34 % (mn2) / +0.03 % (fpnlite)
-#: in file size, because only the class predictor changes width --
-#: num_anchors x (num_classes + 1), i.e. 2 vs 3 channels per anchor; everything
-#: upstream is the same workload. Untiled- and tiled-trained exports differ by
-#: -0.02 % / -0.05 %: the *same graph* with different weight values, so there is
-#: no mechanism by which their compute could differ.
+#: ``res-ladder`` uses untiled-trained models on untiled frames. Only this cell
+#: exists at every resolution. Fixing training tiling preserves the graph, while
+#: fixing evaluation tiling prevents source resize cost from confounding input
+#: resolution.
 #:
-#: The survivor of each collapse is the reference config, untiled mc.
-#:
-#: yolov7-tiny is the one exception, and deliberately so: it exists only as a
-#: tiled-trained 512 export, so it cannot follow "untiled". Training tiling is
-#: precisely the dimension shown above not to affect compute, so that part is
-#: free; the 512 input is a genuine difference and is *meant* to be there --
-#: input resolution is an architecture property, which is what this preset
-#: varies.
-#:
-#: This is about resource cost only. Accuracy obviously does depend on class
-#: count and training data -- `ave benchmark` still needs the full matrix.
-#:
-#: ``res-ladder`` is the input-resolution axis, and it is confined to
-#: **untiled-trained models evaluated on untiled frames** on purpose, on three
-#: separate grounds:
-#:
-#: * it is the only cell that exists across the whole ladder. 512 and 1024 were
-#:   only ever trained on full frames -- ``phenobench-tiled`` stops at 320 --
-#:   so a ladder that admitted tiled-trained models would have three rungs at
-#:   320 and one everywhere else;
-#: * training tiling was measured not to affect compute at all (-0.02 % /
-#:   -0.05 % in file size: the same graph with different weights), so nothing
-#:   is lost by fixing it;
-#: * evaluation tiling, unlike the other two, is *not* free -- it changes the
-#:   source resolution and therefore the resize inside every ``predict()``.
-#:   Leaving it open would confound the very axis this preset varies, since
-#:   input size and source size would move together.
-#:
-#: One post-processing flavour only, and it is ``regnms`` -- the *presented*
-#: configuration, not the toolchain default. ``benchmark_report.DEFAULT_NMS``
-#: is ``fastnms`` because that is what ``ave convert`` emits unasked, but the
-#: analysis pins ``NMS = br.REGULAR_NMS`` (notebooks/benchmark_analysis.py) and
-#: every accuracy rung in the report is per-class NMS. A power sweep at the
-#: other flavour would produce cost numbers that join to none of them.
+#: The ladder uses ``regnms`` to match the analysis and accuracy tables.
 #:
 #: That leaves 5 export schemes x 3 sizes x 2 architectures = 30 runs, ~1.5 h of
 #: measured loop at the default ``--seconds 120`` before cooldowns. Halve
@@ -703,10 +664,7 @@ def main(argv=None) -> int:
     meter_time = 2 * args.meter_settle if runs_to_execute and not args.no_meter else 0.0
     estimated_time = run_time * len(runs_to_execute) + cooldown_time + meter_time
 
-    # With a budget the estimate above is the *typical* case -- what a model
-    # that keeps up costs. The number worth knowing before starting an
-    # overnight sweep is the other one: what it costs if every model hits its
-    # ceiling. On an unpatched delegate that is not a hypothetical.
+    # Also report the worst case where every model consumes its full budget.
     if args.max_seconds > 0:
         worst_run_time = args.max_seconds + bracket_time
         worst_time = (
@@ -783,10 +741,8 @@ def main(argv=None) -> int:
         "meter_host": None if args.no_meter else args.meter_host,
         "device_repo": str(device_repo),
         "delegate": delegate,
-        # Recorded, not just applied. A delegate switch changes which nodes run
-        # where, so a power figure whose environment is not written down beside
-        # it is a number about an unknown machine -- and these sweeps are read
-        # months later, from the tree, by something that was not at the console.
+        # Record delegate environment changes that affect node placement and
+        # power.
         "env": base_env,
         "variants": [
             {"name": variant.name, "env": variant.env} for variant in variants
@@ -925,9 +881,7 @@ def main(argv=None) -> int:
             # an earlier partial sweep. Unlinking preserves any old hard links.
             (output_dir / "power.csv.gz").unlink(missing_ok=True)
 
-            # Staged over stdin rather than scp'd: the lab server needs no
-            # checkout of this repo, and the logger that runs is by
-            # construction the one in this tree.
+            # Stage over stdin so the lab server needs no repository checkout.
             logger_source = Path(args.meter_logger).read_text()
 
             copied = subprocess.run(
@@ -1089,7 +1043,7 @@ def main(argv=None) -> int:
             clock_sync["probes"].append(device_probe_before)
             record["device_clock_probe_before"] = device_probe_before
 
-            # ---- per-run meter clock probe (logger is sweep-wide) ----
+            # Per-run meter clock probe; the logger spans the sweep.
             if meter_started:
                 probe_before = probe_clock(meter_host)
                 probe_before["phase"] = "before"
@@ -1098,14 +1052,10 @@ def main(argv=None) -> int:
                 clock_sync["probes"].append(probe_before)
                 record["meter_clock_probe_before"] = probe_before
 
-            # ---- the run itself ----
             record["device_start_local_s"] = time.time()
 
-            # `ave resources --max-seconds` bounds itself, so this timeout is
-            # only for the case where it *cannot*: a board that wedges, an ssh
-            # that hangs, an in-flight Invoke that never returns. Without a
-            # bound here one such model stalls the whole sweep -- and the
-            # meter keeps logging into a trace nobody is producing load for.
+            # This outer timeout handles wedged boards, hung SSH sessions, and
+            # inference calls that never return.
             try:
                 result = subprocess.run(
                     [*device.ssh, command],
@@ -1173,7 +1123,7 @@ def main(argv=None) -> int:
                 print("  " + (tail[-1] if tail else "done"))
                 completed += 1
 
-            # ---- per-run meter clock probe (stop/fetch happens once below) ----
+            # Final per-run probe; meter stop and fetch happen once below.
             if meter_started:
                 probe_after = probe_clock(meter_host)
                 probe_after["phase"] = "after"

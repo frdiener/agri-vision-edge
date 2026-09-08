@@ -43,17 +43,7 @@ def _per_class_metrics(
     evaluator: COCOeval,
     coco_gt: COCO,
 ) -> dict:
-    """
-    Extract the 12 COCO metrics for each category from an *accumulated*
-    ``COCOeval``.
-
-    ``COCOeval`` already evaluates per category — ``eval['precision']`` has shape
-    ``[T, R, K, A, M]`` (IoU thresholds, recall thresholds, categories, area
-    ranges, max-detections) and ``eval['recall']`` has shape ``[T, K, A, M]``.
-    Slicing out a single category ``k`` and averaging exactly as
-    ``COCOeval.summarize`` does reproduces the per-class equivalent of the
-    aggregate stats. Returns ``{category_name: {metric: value}}``.
-    """
+    """Extract all 12 COCO summary metrics per category from an accumulated evaluator."""
 
     eval_result = getattr(evaluator, "eval", None)
 
@@ -118,12 +108,9 @@ class PreparedEvaluation:
     """
     A predictions/ground-truth pair that is ready to be scored.
 
-    Every consumer must go through :func:`prepare_evaluation` rather than
-    assembling its own ``COCO`` objects, so that derived analyses (the
-    confidence sweep in :mod:`agri_vision_edge.evaluation.score_sweep`) are
-    computed on *exactly* the same detections and ground truth as the headline
-    metrics. Filtering the two independently is how an F1 curve ends up
-    disagreeing with the AP50 printed next to it.
+    Every consumer must use :func:`prepare_evaluation`. This keeps derived
+    analyses and headline metrics on the same filtered detections and ground
+    truth.
     """
 
     #: Ground truth with partial ("do-not-care") annotations removed.
@@ -148,19 +135,11 @@ def prepare_evaluation(
     partial_threshold: float = DEFAULT_PARTIAL_THRESHOLD,
     allow_corrupt: bool = False,
 ) -> PreparedEvaluation | None:
-    """
-    Load, validate and filter a predictions/annotations pair for scoring.
+    """Load, validate, and partial-filter inputs for scoring.
 
-    Partial ("do-not-care") ground-truth annotations (flagged ``partial`` /
-    ``ignore`` / low ``visibility`` -- see
-    :mod:`agri_vision_edge.evaluation.partials`) are always excluded from the
-    scored ground-truth. When ``ignore_partials`` is set, the PhenoBench rule is
-    additionally applied to the predictions: any detection whose area is more
-    than ``partial_threshold`` contained inside a partial ground-truth box is
-    dropped, so a hit on a partial plant is not counted as a false positive.
-
-    Returns ``None`` when the predictions file is empty -- there is nothing to
-    score, and the ground truth is not even read.
+    Partial ground truth is always unscored; with ``ignore_partials``, detections
+    sufficiently contained by a partial box are also dropped. Empty predictions
+    return ``None`` without reading the annotations.
     """
 
     with open(predictions_path) as f:
@@ -337,8 +316,7 @@ def evaluate_and_sweep(
     if not score_sweep:
         return metrics, None
 
-    # `metrics` is returned untouched: the sweep is its own artifact, so
-    # re-evaluating an existing tree adds a file rather than rewriting one.
+    # Keep metrics unchanged because the sweep is a separate artifact.
     return metrics, compute_score_sweep(prepared)
 
 
@@ -349,8 +327,8 @@ def save_metrics(
     """
     Write metrics, returning whether the file changed.
 
-    An unchanged file is left alone, so backfilling score_sweep.json across an
-    evaluated tree does not touch recorded results at all -- not even mtimes.
+    An unchanged file is left alone, preserving content and modification time
+    while backfilling score_sweep.json.
     """
 
     payload = json.dumps(metrics, indent=2)
@@ -415,9 +393,8 @@ def evaluate_model_dir(
             score_sweep=score_sweep,
         )
     except CorruptPredictionsError as exc:
-        # Skip loudly rather than abort the sweep -- but do NOT write metrics,
-        # and drop any stale metrics.json so a corrupt run cannot keep passing
-        # itself off as evaluated in the results tree.
+        # Report corrupt runs without aborting the sweep. Remove stale metrics so
+        # the results tree cannot treat them as evaluated.
         print(f"[skip] {model_dir.name}: {exc}")
 
         metrics_path.unlink(missing_ok=True)
@@ -462,9 +439,8 @@ def print_operating_points(sweep):
     """
     Print the best-F1 confidence threshold for each IoU threshold.
 
-    Takes the sweep, not ``metrics``: operating points are derived from it on
-    demand and deliberately never written into metrics.json, which holds only
-    threshold-free aggregates.
+    Operating points are derived from the sweep on demand. metrics.json contains
+    only threshold-free aggregates.
     """
 
     if sweep is None:

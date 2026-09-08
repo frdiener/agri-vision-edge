@@ -99,9 +99,8 @@ case "${tiling}" in
         ;;
 esac
 
-# The graph is identical for both input regimes -- the model's input size is
-# fixed, and tiling only changes what is resized into it -- so partitioning is
-# collected under one regime rather than duplicated across both.
+# Both input regimes use the same fixed-size graph. Tiling changes only the
+# resized input, so one regime is enough to characterize partitioning.
 #
 # The platform directory mirrors benchmark_all.sh: $(hostname), then --suffix
 # for a tree that is the same board under a different delegate build

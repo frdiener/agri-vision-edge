@@ -1,12 +1,4 @@
-"""
-TFOD setup helpers.
-
-Responsible for:
-    - pipeline loading
-    - model construction
-    - optimizer creation
-    - checkpoint management
-"""
+"""Build TFOD models, optimizers, evaluators, and checkpoints."""
 
 from __future__ import annotations
 
@@ -27,9 +19,7 @@ from object_detection.utils import config_util, label_map_util, variables_helper
 
 @dataclass(slots=True)
 class Runtime:
-    """
-    Runtime objects needed during training.
-    """
+    """Live training objects and checkpoint managers."""
 
     configs: dict
 
@@ -50,8 +40,7 @@ class Runtime:
     #: the ground between, with its plateau counters already spent. This one is
     #: written every evaluation so an interrupted run continues where it
     #: stopped. Kept in a subdirectory so `export_run`, which opens its own
-    #: manager on the train dir, still finds only best checkpoints and exports
-    #: the best model rather than the newest one.
+    #: manager on the train dir, still finds only best checkpoints.
     last_manager: tf.train.CheckpointManager
 
     evaluators: list
@@ -84,9 +73,7 @@ class Runtime:
 def load_pipeline_configs(
     pipeline_path,
 ) -> dict:
-    """
-    Load TFOD pipeline config.
-    """
+    """Load and partition a TFOD pipeline configuration."""
 
     pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
 
@@ -108,9 +95,6 @@ def load_pipeline_configs(
 def build_detection_model(
     configs: dict,
 ):
-    """
-    Create TFOD model.
-    """
 
     return model_builder.build(
         model_config=configs["model"],
@@ -173,18 +157,7 @@ def extract_lr_params(optimizer_config):
 class _VariableLearningRate(
     tf.keras.optimizers.schedules.LearningRateSchedule
 ):
-    """
-    A ``LearningRateSchedule`` that simply returns a mutable variable's current
-    value, ignoring the step.
-
-    Passing a bare ``tf.Variable`` as ``learning_rate`` is unreliable across the
-    TF 2.11 legacy/new Keras optimizers (the new optimizer copies a Variable
-    into a fresh internal one, so later assignments would not propagate). A
-    schedule, by contrast, is always held by reference and invoked each
-    ``apply_gradients`` on BOTH optimizer implementations -- so reading ``var``
-    inside ``__call__`` gives the optimizer the live LR we control from the
-    training loop.
-    """
+    """Expose a mutable variable as a step-independent Keras learning-rate schedule."""
 
     def __init__(self, var):
         super().__init__()
@@ -353,18 +326,9 @@ def maybe_load_fine_tune_checkpoint(
     runtime,
     train_dataset,
 ):
-    """
-    Restore pretrained weights from the pipeline's fine-tune checkpoint.
+    """Load the pipeline's fine-tune checkpoint only on a cold start.
 
-    Mirrors ``object_detection.model_lib_v2.train_loop``: on a cold start
-    (no checkpoint in the train directory yet) the pretrained
-    detection/classification checkpoint referenced by the pipeline config is
-    loaded, so training fine-tunes from those weights instead of starting
-    from random initialization. Skipped when resuming an existing train-dir
-    checkpoint (handled by ``restore_weights``).
-
-    ``train_dataset`` is required to build the model variables (via a dummy
-    forward pass) before the object-based restore.
+    ``train_dataset`` supplies a batch used to build variables before restoration.
     """
 
     if runtime.manager.latest_checkpoint:
@@ -407,29 +371,11 @@ def restore_weights(
     runtime,
     train_dataset,
 ):
-    """
-    Initialize model weights before training.
+    """Restore resumable or pretrained weights and report whether training resumed.
 
-    Order mirrors ``object_detection.model_lib_v2.train_loop``:
-
-      1. When EMA (``optimizer.use_moving_average``) is enabled, build the
-         model and create the optimizer's shadow variables *first*, so they
-         exist before any restore and are themselves restored on resume.
-      2. If a checkpoint already exists in the train directory, resume from
-         it (this restores model, optimizer, shadow variables and step).
-         The rolling ``last/`` snapshot wins over the best-checkpoint history:
-         it is never older (both are written at the same evaluation, and only
-         one of them is conditional on an improvement), and resuming from the
-         *best* would silently rewind the run to it and redo everything since.
-      3. Otherwise, load the pretrained fine-tune checkpoint.
-
-    ``train_dataset`` is required to build the model on a real input batch.
-
-    Returns:
-        bool: True if training resumed from a checkpoint already in the train
-        directory (so the caller should also restore the trainer's own
-        bookkeeping, see ``TrainerState.load``), False if the weights came from
-        the pretrained fine-tune checkpoint (a cold start).
+    EMA variables are created before restoration, and the rolling ``last``
+    checkpoint takes precedence over best-checkpoint history. ``train_dataset``
+    supplies the batch needed to build model variables.
     """
 
     model_built = False
@@ -454,8 +400,8 @@ def restore_weights(
         # instead of failing, and the caller then trips over a model whose
         # `trainable_variables` is empty (ValueError out of
         # `ensure_optimizer_state_created`). The cold-start path below gets this
-        # for free -- `load_fine_tune_checkpoint` forces the same dummy forward
-        # pass -- which is why only resuming hit it.
+        # `load_fine_tune_checkpoint` performs this dummy forward on cold starts,
+        # so only resume paths need it here.
         if not model_built:
             _ensure_model_is_built(
                 detection_model,
@@ -482,29 +428,10 @@ def apply_graph_modifications(
     trainer_cfg,
     train_dataset,
 ):
-    """
-    Apply BatchNorm folding and backbone QAT.
+    """Apply full-model BatchNorm folding and fake quantization for QAT.
 
-    Mirrors the graph-modification block in
-    ``object_detection.model_lib_v2.train_loop``: when ``qat`` is set, fold
-    BatchNorms into the convs, then fake-quantize the backbone + SSD head (the
-    full int8 scheme, ``agri_vision_edge.tfod.qat``).
-
-    Must run after ``restore_weights`` (so the loaded weights are folded /
-    quantized) and before the train step is traced (so the modified backbone is
-    captured). Mutates ``runtime`` and ``detection_model`` in place.
-
-    Note: there is deliberately no optimizer reset here. PTQ/QAT resume from an
-    exported model-only ``ckpt-0`` (``load_fine_tune_checkpoint`` restores model
-    weights only, never the optimizer or step), so the optimizer built in
-    ``create_runtime`` is already fresh and starts at step 0. Keeping that single
-    optimizer instance also keeps ``runtime.ckpt`` coherent, so the
-    ``lr_plateau_restore_best`` warm restart actually restores the live model +
-    optimizer under QAT/PTQ.
-
-    Returns:
-        bool: True if the backbone graph was modified (QAT), so the caller can
-        run an initial evaluation of the new configuration.
+    Call after weight restoration and before tracing the train step. Mutates the
+    model and runtime, returning whether QAT modified the graph.
     """
 
     if not trainer_cfg.control.qat:

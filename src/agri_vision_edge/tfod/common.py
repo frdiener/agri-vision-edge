@@ -37,31 +37,10 @@ _FPN_KERAS_EXTRACTORS = (
 
 @contextmanager
 def fpn_native_resize_upsampling(enabled: bool = True) -> Iterator[None]:
-    """
-    Force keras SSD-FPN extractors to upsample with the native resize op.
+    """Temporarily make Keras SSD-FPN extractors use native nearest-neighbor resize.
 
-    By default the FPNLite top-down pathway upsamples via a reshape/tile trick
-    (``use_native_resize_op=False``), which TFLite emits as ``PACK`` (builtin op
-    83) + ``RESHAPE``. The Teflon/etnaviv NPU delegate (i.MX8M Plus, i.MX93) has
-    no ``PACK`` kernel, so every upsample becomes a CPU island that fragments the
-    FPN neck into many partitions and forces the surrounding tower convs onto the
-    CPU. Enabling ``use_native_resize_op`` replaces each 4-op ``PACK+RESHAPE``
-    island with a single ``RESIZE_NEAREST_NEIGHBOR`` (builtin op 97), which the
-    delegate *does* support -- the whole graph then runs on the NPU. The two
-    upsamplings are mathematically identical (nearest-neighbour 2x), so existing
-    checkpoints convert unchanged.
-
-    ``model_builder`` only wires ``use_native_resize_op`` for BiFPN, not the
-    regular FPN ``fpn`` branch, so this context manager temporarily overrides the
-    relevant ``SSD_KERAS_FEATURE_EXTRACTOR_CLASS_MAP`` entries for the duration of
-    ``model_builder.build``. The vendored ``object_detection`` is left untouched.
-
-    Args:
-        enabled: When False this is a no-op (default delegate-unfriendly upsample).
-
-    Usage:
-        with fpn_native_resize_upsampling(enabled):
-            detection_model = model_builder.build(config.model, is_training=False)
+    This preserves checkpoint semantics while avoiding delegate-incompatible
+    ``PACK`` upsampling; when ``enabled`` is false, the context is a no-op.
     """
     if not enabled:
         yield

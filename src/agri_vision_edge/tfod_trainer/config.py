@@ -13,13 +13,9 @@ class TrainingControlConfig:
     """
     Custom training-loop control policy.
 
-    The single home for every knob that drives OUR training loop rather than the
-    TFOD protobuf pipeline: metric-based checkpointing, early stopping, the
-    reduce-LR-on-plateau schedule, and the graph-modification flags (optimizer
-    reset + QAT). None of these are pipeline/model semantics (those live in
-    ``FineTuneConfig``) nor run orchestration/paths (those live in
-    ``FinetuneRunConfig``); they are the trainer's own contract, so they are
-    declared here exactly once and consumed via ``TrainerConfig.control``.
+    Defines metric checkpointing, early stopping, the plateau schedule, and
+    graph-modification flags for the custom loop. Pipeline semantics belong in
+    ``FineTuneConfig``; orchestration and paths belong in ``FinetuneRunConfig``.
     """
 
     log_every: int = 100
@@ -32,18 +28,11 @@ class TrainingControlConfig:
     # leaves FineTuneConfig.batch_size untouched.
     batch_size: int | None = None
 
-    # Epoch-based evaluation cadence. One "epoch" is a full pass over the
-    # training set: steps_per_epoch = ceil(train_samples / batch_size), where
-    # train_samples is read from the bundle's dataset_metadata.json and
-    # batch_size from the pipeline's train_config. Evaluation, best-checkpointing
-    # and the early-stopping / plateau bookkeeping then fire every
-    # `eval_every_epochs` epochs instead of every `log_every` steps, so eval load
-    # scales with the dataset -- a 3x3-tiled set carries ~9x the samples, hence
-    # ~9x the steps per epoch and far fewer (but not cheaper-per-eval) evals for
-    # the same num_steps, which is what makes the tiled runs fit the Kaggle time
-    # budget. The run always evaluates once more on the final step so the last
-    # (possibly partial) epoch is scored. Falls back to the legacy `log_every`
-    # step cadence when train_samples is unavailable (older bundles).
+    # Epoch-based evaluation cadence. steps_per_epoch is
+    # ceil(train_samples / batch_size), using bundle metadata and the pipeline
+    # batch size. Evaluation and stopping bookkeeping run every
+    # `eval_every_epochs` epochs and once at the final step. Older bundles
+    # without train_samples use the `log_every` step cadence.
     eval_every_epochs: float = 1.0
 
     # Optional training length expressed in epochs. When set, it OVERRIDES the
@@ -69,10 +58,8 @@ class TrainingControlConfig:
     save_metrics_history: bool = True
 
     # Custom metric-based early stopping (patience counted in eval intervals).
-    # 0 disables the stop (the default): the non-improvement counter is still
-    # advanced and logged (as `patience=N/off`), it just never terminates the
-    # run -- so the LR-plateau schedule is left to decide when to stop, while the
-    # counter stays visible for diagnostics.
+    # 0 disables the stop but continues logging the non-improvement counter as
+    # `patience=N/off`.
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
 
@@ -84,20 +71,12 @@ class TrainingControlConfig:
     # itself instead of a checkpoint below it.
     initial_eval_checkpoint: bool = False
 
-    # Metric-driven "reduce LR on plateau" schedule, layered on top of the
-    # existing best-metric / early-stopping tracker. When enabled the LR becomes
-    # a mutable tf.Variable (see tfod_trainer.setup): it warms up from the
-    # pipeline's warmup LR to its base, then -- each time the monitored metric
-    # fails to improve for `lr_plateau_patience` consecutive evals -- is
-    # multiplied by `lr_plateau_factor` (floored at `lr_plateau_min_lr`), after a
-    # `lr_plateau_cooldown` grace period following each drop. Decouples LR
-    # annealing from a guessed `num_steps` horizon, which is exactly what the
-    # cosine schedule cannot do once early stopping cuts the run short.
-    # Defaults tuned for accuracy over run time (empirically: aggressive
-    # patience/cooldown + a >0 min_delta collapse the LR before the model has
-    # exploited each level, and hurt final mAP). Keep each LR level long and only
-    # drop on a genuine flat; let num_steps bound the run rather than an
-    # aggressive exhausted-stall stop.
+    # Metric-driven plateau schedule layered on the best-metric and
+    # early-stopping tracker. The mutable LR warms from the pipeline value to its
+    # base, then drops by `lr_plateau_factor` after `lr_plateau_patience`
+    # non-improving evaluations. `lr_plateau_min_lr` sets the floor and
+    # `lr_plateau_cooldown` delays subsequent drops. Conservative defaults avoid
+    # reducing the LR before each level has stabilized.
     lr_plateau: bool = False
     lr_plateau_factor: float = 0.5
     lr_plateau_patience: int = 15
@@ -108,8 +87,7 @@ class TrainingControlConfig:
     # When set they overwrite the pipeline's cosine `learning_rate_base` /
     # `warmup_learning_rate` before rendering, so both the cosine schedule and
     # the plateau schedule (which reads these back from the rendered pipeline via
-    # `extract_lr_params`) pick them up -- letting the LR be configured here
-    # alongside the other schedule knobs instead of on `FineTuneConfig`. None
+    # `extract_lr_params`) pick them up. This keeps LR controls together. None
     # (the default) leaves the finetune config's values untouched. Named for the
     # plateau schedule (its usual caller) but they overwrite the pipeline keys
     # unconditionally.
@@ -131,9 +109,8 @@ class TrainingControlConfig:
     # best point, then refine more gently".
     lr_plateau_restore_best: bool = True
 
-    # Stop once the LR schedule is spent: after the plateau logic tries to reduce
-    # but is already at `lr_plateau_min_lr`, that is a "floored stall" -- further
-    # drops cannot help. Stop after this many such events (0 disables it; the
+    # Stop after this many stalls at `lr_plateau_min_lr`; further reductions are
+    # impossible. A value of 0 disables this stop. The
     # global `early_stopping_patience` still applies as a hard cap). Counted in
     # floored-stall events, each ~`lr_plateau_patience` (+cooldown) evals apart,
     # so this fires well before the generous global patience meant to span the
@@ -145,19 +122,12 @@ class TrainingControlConfig:
     # as if a stopping rule had fired, so the notebook goes on to export and
     # publish its artifacts.
     #
-    # This exists because of how hosted sessions die. A run that overruns the
-    # platform's limit (12 h on Kaggle) is killed outright: the export cells
-    # never execute and, in a batch "Save & Run All", the version fails and the
-    # output -- checkpoints included -- is discarded. A run that has no hope of
-    # converging inside one session must therefore stop *itself* early enough
-    # to publish, and be resumed in a following session from the checkpoint and
-    # `trainer_state.json` in its train dir. Set this comfortably below the
-    # platform limit: the budget is only checked at evaluation boundaries, so
-    # the overshoot is up to one train-plus-eval interval, and export,
-    # plotting and upload all happen afterwards.
+    # Hosted sessions discard all output when they exceed the platform limit.
+    # Set this budget low enough to publish checkpoints and `trainer_state.json`
+    # for a later session. Checks occur at evaluation boundaries, so allow one
+    # train-plus-evaluation interval plus export and upload time.
     #
-    # None (the default) means "no wall-clock limit" -- the metric-driven rules
-    # own termination, which is what every rung that fits a session should use.
+    # None disables the wall-clock limit and leaves termination to metric rules.
     max_runtime_hours: float | None = None
 
     # Enable quantization-aware training. False = plain finetune (-> PTQ at

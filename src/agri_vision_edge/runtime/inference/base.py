@@ -1,10 +1,4 @@
-"""
-Common runtime abstractions.
-
-Defines canonical detection structures and
-runtime interfaces shared across TFLite,
-ExecuTorch, and future runtimes.
-"""
+"""Canonical detection types and runtime interfaces."""
 
 from __future__ import annotations
 
@@ -17,15 +11,7 @@ import numpy as np
 
 @dataclass
 class Detection:
-    """
-    Canonical object detection result.
-
-    Bounding boxes use normalized coordinates:
-
-        [ymin, xmin, ymax, xmax]
-
-    compatible with TensorFlow SSD outputs.
-    """
+    """Detection with a normalized ``[ymin, xmin, ymax, xmax]`` bounding box."""
 
     category_id: int
 
@@ -35,16 +21,7 @@ class Detection:
 
 
 class BaseRuntime(ABC):
-    """
-    Abstract runtime interface.
-
-    All runtimes should expose a common
-    prediction API returning canonical
-    Detection objects.
-
-    Optionally, a runtime can also say *where* a ``predict()`` call spent its
-    time -- see :meth:`enable_phase_timing`.
-    """
+    """Runtime interface returning canonical :class:`Detection` objects."""
 
     #: Phase timing is off unless a caller asks for it, and it is a class-level
     #: default so no runtime has to remember to initialise it. ``ave benchmark``
@@ -62,18 +39,12 @@ class BaseRuntime(ABC):
         """
         Start recording where each ``predict()`` call spends its time.
 
-        The motivating question is what a *model* costs, and a raw
-        ``predict()`` figure does not answer it: the call begins by resizing
-        the source frame to the model's input, which is real deployment work
-        whose size is set by the input resolution rather than by the network.
-        Recording the phases in the same loop that measures power means the
-        breakdown comes from the run being characterised, not from a separate
-        measurement taken at a different die temperature.
+        ``predict()`` includes resizing the source frame to the model input.
+        Phase timing separates this source-resolution cost from network cost in
+        the same loop and thermal state as the power measurement.
 
-        Cost when enabled: a handful of ``time.perf_counter()`` calls per
-        inference, sub-microsecond against a millisecond-scale one. Cost when
-        disabled: one attribute lookup per phase and no clock read at all,
-        which is why this is a flag rather than a subclass.
+        Enabling timing adds several ``time.perf_counter()`` calls per inference.
+        Disabled timing performs one attribute lookup per phase.
         """
         self.timing_enabled = True
         self.phase_timings_ms = {}
@@ -90,9 +61,7 @@ class BaseRuntime(ABC):
     @property
     @abstractmethod
     def input_size(self) -> int:
-        """
-        Square input resolution.
-        """
+        """Square input resolution in pixels."""
         pass
 
     @abstractmethod
@@ -100,14 +69,5 @@ class BaseRuntime(ABC):
         self,
         image: np.ndarray,
     ) -> list[Detection]:
-        """
-        Run inference on an RGB uint8 image.
-
-        Args:
-            image:
-                RGB image array.
-
-        Returns:
-            List of detections.
-        """
+        """Run inference on an RGB uint8 image."""
         pass

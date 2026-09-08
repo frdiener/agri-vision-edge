@@ -7,15 +7,7 @@ from typing import Any
 
 
 def capture_environment() -> dict[str, Any]:
-    """
-    Capture runtime environment information useful for
-    experiment reproducibility.
-
-    Returns
-    -------
-    dict
-        JSON-serializable environment metadata.
-    """
+    """Return JSON-serializable runtime metadata for reproducibility."""
 
     environment = {
         "python": capture_python_environment(),
@@ -24,7 +16,6 @@ def capture_environment() -> dict[str, Any]:
             os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
 
-    # optional collectors
     tensorflow_info = capture_tensorflow_environment()
 
     if tensorflow_info is not None:
@@ -33,9 +24,6 @@ def capture_environment() -> dict[str, Any]:
     return environment
 
 
-# ============================================================
-# Python
-# ============================================================
 
 def capture_python_environment() -> dict[str, Any]:
 
@@ -47,9 +35,6 @@ def capture_python_environment() -> dict[str, Any]:
     }
 
 
-# ============================================================
-# System
-# ============================================================
 
 def capture_system_environment() -> dict[str, Any]:
 
@@ -62,15 +47,9 @@ def capture_system_environment() -> dict[str, Any]:
     }
 
 
-# ============================================================
-# TensorFlow
-# ============================================================
 
 def capture_tensorflow_environment() -> dict[str, Any] | None:
-    """
-    Capture TensorFlow runtime details if TensorFlow
-    is installed.
-    """
+    """Return TensorFlow runtime details, or ``None`` if unavailable."""
 
     try:
         import google.protobuf

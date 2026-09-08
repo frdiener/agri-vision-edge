@@ -62,9 +62,7 @@ def read_int_file(path: str) -> int | str:
         return ""
 
 
-# ---------------------------------------------------------------------------
 # system-wide counters
-# ---------------------------------------------------------------------------
 
 
 def read_cpu_times() -> dict[str, list[int]]:
@@ -144,9 +142,7 @@ def read_loadavg() -> float:
     return float(content.split()[0])
 
 
-# ---------------------------------------------------------------------------
 # thermal / frequency
-# ---------------------------------------------------------------------------
 
 
 def discover_thermal_zones() -> list[tuple[str, str]]:
@@ -185,9 +181,7 @@ def discover_cpufreq() -> list[tuple[str, str]]:
     return freqs
 
 
-# ---------------------------------------------------------------------------
 # process tree
-# ---------------------------------------------------------------------------
 
 
 def parse_proc_stat(pid: int) -> tuple[int, int, int] | None:
@@ -367,9 +361,7 @@ class ProcessTreeSampler:
         }
 
 
-# ---------------------------------------------------------------------------
 # sync chirp
-# ---------------------------------------------------------------------------
 
 
 def chirp(duration_seconds: float, workers: int) -> tuple[float, float]:
@@ -414,9 +406,7 @@ def _burn(deadline: float) -> None:
             value += 1
 
 
-# ---------------------------------------------------------------------------
 # static system description
-# ---------------------------------------------------------------------------
 
 
 def system_info() -> dict[str, Any]:
@@ -440,9 +430,7 @@ def system_info() -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
 # sampler thread
-# ---------------------------------------------------------------------------
 
 
 class ResourceSampler:
@@ -477,7 +465,7 @@ class ResourceSampler:
         self.anchor_start: dict[str, float] | None = None
         self.anchor_end: dict[str, float] | None = None
 
-    # -- lifecycle ---------------------------------------------------------
+    # Lifecycle
 
     def start(self) -> None:
         self.anchor_start = _anchor()
@@ -508,7 +496,7 @@ class ResourceSampler:
         self._run()
         self.anchor_end = _anchor()
 
-    # -- health ------------------------------------------------------------
+    # Health
 
     def cadence_report(self) -> dict[str, Any]:
         """Summarize the observed sampling cadence."""
@@ -531,7 +519,7 @@ class ResourceSampler:
             "interval_max_s": ordered[-1],
         }
 
-    # -- output ------------------------------------------------------------
+    # Output
 
     @property
     def header(self) -> list[str]:
@@ -579,7 +567,7 @@ class ResourceSampler:
             writer.writerow(self.header)
             writer.writerows(self._rows)
 
-    # -- internals ---------------------------------------------------------
+    # Internals
 
     def _run(self) -> None:
         previous_cpu = read_cpu_times()

@@ -1,28 +1,8 @@
-"""
-Read deployment configuration embedded in a converted TFLite model.
+"""Read labels, normalization, and post-processing metadata from TFLite models.
 
-The converter (:mod:`agri_vision_edge.conversion.metadata`) embeds standard
-TFLite ObjectDetector metadata into every exported ``.tflite``:
-
-- ``labels.txt`` — the category names, stored as an *associated file*. TFLite's
-  metadata populator appends associated files as a ZIP archive to the end of the
-  flatbuffer, so they are readable with the standard-library :mod:`zipfile`
-  module (a ZIP reader locates its central directory from the end of the file
-  and ignores the flatbuffer prefix).
-- ``NormalizationOptions`` — the input ``mean``/``std``, and
-- a ``DETECTOR_POSTPROCESSING`` custom blob — ``score_threshold``,
-  ``iou_threshold``, ``max_detections`` and the ``nms`` type. Both of these are
-  also mirrored into the ``<model>.metadata.json`` sidecar the converter writes
-  next to the model.
-
-This module reads that configuration back at runtime using **only the standard
-library** (``json`` + ``zipfile``), so it works on-device where ``tflite_support``
-is not installed — the ``device`` extra ships ``tflite-runtime`` only.
-``tflite_support``, when available (the prep/eval environment), is used as an
-additional fallback for the embedded normalization if the sidecar is absent.
-
-This replaces the earlier ``<model>.runtime.json`` sidecar, which nothing in the
-pipeline ever produced.
+Labels are read from the appended ``labels.txt`` ZIP entry using the standard
+library. Other settings prefer ``<model>.metadata.json`` and optionally fall
+back to ``tflite_support``, keeping device-side loading dependency-light.
 """
 
 from __future__ import annotations
@@ -101,7 +81,7 @@ class ModelMetadata:
         return meta
 
     #
-    # Labels — embedded associated file, read as a stdlib zip.
+    # Embedded labels
     #
 
     def _load_labels(self, model_path: Path, label_offset: int) -> None:
@@ -111,7 +91,7 @@ class ModelMetadata:
                     return
                 raw = archive.read(_LABELS_ASSOCIATED_FILE).decode("utf-8")
         except (zipfile.BadZipFile, OSError, KeyError):
-            # Not a zip-bearing model, or unreadable — leave labels empty.
+            # Unreadable models leave labels empty.
             return
 
         names = [line.strip() for line in raw.splitlines() if line.strip()]
@@ -123,7 +103,7 @@ class ModelMetadata:
         self.sources["labels"] = "embedded"
 
     #
-    # Normalization + post-processing — the sidecar the converter writes.
+    # Sidecar normalization and post-processing
     #
 
     def _load_from_sidecar(self, model_path: Path) -> bool:

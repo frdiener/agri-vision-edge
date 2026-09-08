@@ -1,53 +1,7 @@
-"""
-Faithful upstream PhenoBench detection evaluation.
+"""Adapt COCO predictions to the official PhenoBench detector evaluator.
 
-The lightweight path (:mod:`agri_vision_edge.evaluation.coco`) scores with
-pycocotools and merely *ports* the partial-plant rule, so its numbers stay
-comparable across the whole pipeline. For leaderboard comparability we also want
-the *official* number, which the PhenoBench authors compute with a different
-stack (torchmetrics' ``MeanAveragePrecision`` + their own partial filtering) in
-``phenobench.evaluation.evaluate_plant_bounding_boxes``.
-
-This module drives that upstream evaluator unchanged: it converts our COCO
-``predictions.json`` into the per-image YOLO ``.txt`` files it expects, stages a
-ground-truth tree containing exactly the evaluated images (symlinked from the raw
-PhenoBench dataset), and calls ``evaluate_plant_detection``. The heavy
-``torch`` / ``torchvision`` / ``torchmetrics`` dependencies live behind the
-optional ``faithful-eval`` extra and are imported lazily here, so the default
-lightweight path never needs them.
-
-Notes
------
-* Predictions must be in their annotation's pixel space and each annotation
-  ``file_name`` must match the corresponding PhenoBench mask filename.
-* The stock upstream evaluator hard-codes a ``1024 x 1024`` canvas and assumes
-  every frame has at least one plant. To support the tiled datasets (e.g. 512
-  tiles, some of which are empty background) we detect the (uniform) image size
-  from the annotations and, for the duration of the call, patch the upstream
-  canvas constants to it and make its ground-truth conversion empty-safe --
-  otherwise tiles are silently mis-scaled and empty tiles crash it. The
-  algorithm itself (torchmetrics mAP + the official partial filtering) is
-  untouched.
-* **Tiled eval is tile-wise**: it applies the official evaluator per tile, which
-  is internally consistent but is NOT the official full-frame leaderboard
-  number (that requires stitching tile predictions back to 1024 frames first).
-  A warning is emitted when the image size is not 1024.
-* Tiled ground truth must have been cut with the **same grid** as the exported
-  annotations. Different grids share the tile size and the ``_tile<N>`` names,
-  so a mismatch resolves every mask and scores against the wrong crops instead
-  of failing; :func:`check_tiling_consistency` compares the annotations' tile
-  count against the grid the tree recorded in ``tiling_config.json``.
-* Prediction labels are remapped from our COCO ``category_id`` to the upstream
-  semantic ids (``1`` crop, ``2`` weed) *by category name*. The multi-class
-  bundle happens to agree numerically, but the single-class (weed-only) bundle
-  numbers its sole ``weed`` category ``1`` -- writing that through unchanged
-  labels every weed as a crop and yields garbage.
-* The upstream ground truth always carries both classes, so ``mAP`` is averaged
-  over crop *and* weed even for a weed-only model, whose crop AP is
-  structurally 0. For single-class models the comparable number is the weed
-  entry of ``mAP_cls``, not ``mAP``; the emitted metrics therefore name the
-  classes (``class_names``) and record which of them the model can predict
-  (``predicted_classes``).
+Inputs must share annotation pixel geometry; tiled results remain tile-wise.
+Use ``mAP_plants`` when upstream metrics include unpredicted classes.
 """
 
 from __future__ import annotations
@@ -124,11 +78,9 @@ def upstream_label_map(coco: dict) -> dict[int, int]:
     """
     Map our COCO ``category_id`` to the upstream semantic label, by name.
 
-    Our bundles number their categories per class regime -- multi-class is
-    ``1 crop / 2 weed`` (which matches upstream), but single-class is ``1 weed``
-    (which does not). Matching on the name keeps both regimes correct; anything
-    outside the upstream vocabulary is a hard error, since silently writing an
-    unknown id through is exactly the failure mode this map exists to prevent.
+    Multi-class bundles use ``1 crop / 2 weed``; single-class bundles use
+    ``1 weed``. Name-based matching handles both regimes. Unknown names raise an
+    error.
     """
 
     label_map: dict[int, int] = {}
@@ -189,8 +141,7 @@ def annotation_tile_indices(image_index: dict[int, dict]) -> set[int] | None:
     """
     The ``_tile<N>`` indices used by the annotations, or ``None`` if untiled.
 
-    Returns ``None`` as soon as any file name lacks the marker -- a mixed set is
-    not a tiled bundle.
+    Returns ``None`` when any filename lacks the marker.
     """
 
     indices: set[int] = set()
@@ -213,16 +164,9 @@ def check_tiling_consistency(
     """
     Refuse a ground-truth tree cut with a different grid than the annotations.
 
-    This is the one mismatch staging cannot catch. Grids share the tile *size*
-    (2x2 and 3x3-with-half-overlap both yield 512 px tiles on a 1024 frame) and
-    the name space (``_tile0..``), so 2x2 annotations pointed at a 3x3 tree
-    resolve every mask and score against the **wrong crops** -- silently, with
-    plausible-looking numbers. Only the tile *count* separates them, so compare
-    that against the grid the tree recorded in ``tiling_config.json``.
-
-    No-ops for trees without a recorded geometry (legacy) -- there is nothing to
-    compare against, and the missing-mask error in :func:`_stage` still catches
-    the case where the names do not exist at all.
+    A 2x2 grid and a half-overlap 3x3 grid both produce 512 px tiles with shared
+    ``_tile<N>`` names. Compare tile counts with ``tiling_config.json`` to detect
+    this mismatch. Legacy trees without recorded geometry are not checked.
     """
 
     # Imported here, not at module scope: `agri_vision_edge.data` pulls in
@@ -265,39 +209,10 @@ def annotate_class_metrics(
     predicted_classes: list[str],
     images_without_predictions: int,
 ) -> dict:
-    """
-    Make upstream's ``mAP`` / ``mAP_cls`` readable, and flag when it is diluted.
+    """Add named per-class and plant-only metrics to upstream results.
 
-    Upstream builds its metric with ``MeanAveragePrecision(class_metrics=True)``
-    and reports ``mAP`` as the **unweighted mean over whichever classes appear**
-    in the union of ground truth and predictions. Two upstream quirks make that
-    set vary between runs of the *same* model family:
-
-    1. ``cvt_gt_to_bbox_map`` labels each instance with its raw ``semantics``
-       value and never applies ``convert_partial_semantics``, so PhenoBench's
-       partial ids ``3`` / ``4`` survive as extra classes.
-    2. ``filter_partials_boxes`` nests its ground-truth removal loop *inside*
-       the per-prediction loop, so an image with **zero** predictions keeps all
-       of its partial ground truth -- and with it those extra classes.
-
-    Together they mean a model that misses whole images is penalised twice: once
-    for the misses, and again because each extra class contributes ``0`` to the
-    average. Measured on the i.MX8MP sweep, the number of extra classes tracked
-    the count of prediction-less images exactly (0 -> 2 classes, a handful -> 3,
-    hundreds -> 4).
-
-    ``mAP_cls`` is ordered by ascending label id and crop (``1``) / weed (``2``)
-    are always present in the PhenoBench ground truth, so entries ``0`` and
-    ``1`` are always crop and weed and anything beyond them is a partial class.
-    This adds:
-
-    * ``ap_per_class`` -- ``{"crop": ..., "weed": ...}``.
-    * ``ap_partial_classes`` -- the phantom entries, if any.
-    * ``mAP_plants`` -- the comparable aggregate: the mean over the classes this
-      model can actually emit (crop + weed for multi-class, weed alone for a
-      weed-only model). This is what lines up with the pycocotools ``AP``.
-    * ``upstream_class_count`` / ``images_without_predictions`` -- the evidence
-      for how much ``mAP`` was diluted.
+    ``mAP_cls`` is label-ID ordered: crop and weed first, then leaked partial
+    classes that dilute the upstream aggregate.
     """
 
     per_class = list(results.get("mAP_cls") or [])
@@ -324,9 +239,7 @@ def annotate_class_metrics(
     results["upstream_class_count"] = len(per_class)
     results["images_without_predictions"] = images_without_predictions
 
-    # `class_names` used to claim ["crop", "weed"] unconditionally, which is
-    # wrong whenever the partial classes leak in -- keep it describing what
-    # `mAP_cls` actually holds.
+    # Include leaked partial classes so `class_names` describes `mAP_cls`.
     results["class_names"] = UPSTREAM_CLASS_NAMES[: len(per_class)] + [
         UPSTREAM_PARTIAL_LABELS.get(3 + i, f"extra-{i}")
         for i in range(max(0, len(per_class) - len(UPSTREAM_CLASS_NAMES)))
@@ -375,9 +288,9 @@ def _patch_upstream_for_size(width: int, height: int):
     """
     Adapt the upstream evaluator to ``width x height`` images, empty-safely.
 
-    The stock upstream hard-codes a ``1024 x 1024`` canvas (``convert.IMG_WIDTH``
-    / ``IMG_HEIGHT`` -- used to scale the normalized YOLO predictions and to
-    rasterize boxes in the partial filter) and its ``cvt_gt_to_bbox_map`` raises
+    Upstream hard-codes a ``1024 x 1024`` canvas in ``convert.IMG_WIDTH`` and
+    ``IMG_HEIGHT`` for YOLO scaling and partial-filter rasterization.
+    ``cvt_gt_to_bbox_map`` raises
     on a frame with no instances. We patch both for the duration of the call so
     tiled / non-1024 and empty-tile inputs evaluate correctly; the scoring
     algorithm is otherwise unchanged. Returns a ``restore()`` callable.
@@ -405,9 +318,8 @@ def _patch_upstream_for_size(width: int, height: int):
     _orig_cvt = saved["cvt_gt"]
 
     def _empty_safe_cvt_gt(instance_map, semantics, visibility):
-        # A tile with no plant instances yields an empty ground-truth (all its
-        # predictions become false positives) -- upstream's torch.stack chokes on
-        # that, so return the empty structure torchmetrics expects instead.
+        # Return the empty structure expected by torchmetrics when a tile has no
+        # plant instances; upstream's torch.stack rejects that case.
         ids = torch.unique(instance_map)
         ids = ids[ids != 0]
         if ids.numel() == 0:
@@ -504,44 +416,11 @@ def evaluate_faithful(
     split: str = "val",
     allow_corrupt: bool = False,
 ) -> dict:
-    """
-    Run the official PhenoBench plant-detection evaluation on our predictions.
+    """Evaluate annotation-space COCO predictions with official PhenoBench metrics.
 
-    Parameters
-    ----------
-    annotations_path:
-        COCO annotations JSON. Resolves ``image_id -> file_name`` for staging,
-        drives the prediction normalization, and determines the evaluation
-        canvas size (all images must share one size). Predictions come from the
-        benchmark already in this annotation-pixel space, so a model that ran
-        inference at a smaller resolution (e.g. 320) needs no special handling.
-    predictions_path:
-        COCO ``predictions.json`` in annotation-pixel space.
-    phenobench_dir:
-        Root of the PhenoBench dataset (the directory containing
-        ``train`` / ``val`` / ``test`` splits with their mask sub-folders). For
-        tiled evaluation this is the tiled raw dataset (512 tiles).
-    split:
-        Which split the predictions correspond to (``val`` by default).
-    allow_corrupt:
-        Score predictions containing non-finite boxes / out-of-range scores
-        instead of refusing them. The result is meaningless; see
-        :mod:`agri_vision_edge.evaluation.integrity`.
-
-    Returns
-    -------
-    dict
-        The upstream ``eval_results`` (``mAP`` / ``mAP_50`` / ``mAP_75`` and
-        per-class ``mAP_cls``) as torchmetrics percentages, annotated by
-        :func:`annotate_class_metrics`.
-
-        **Read ``mAP_plants``, not ``mAP``.** Upstream's ``mAP`` is an
-        unweighted mean over every class it happened to score, which includes
-        classes this model cannot emit (``crop`` for a weed-only model) and
-        PhenoBench's partial semantic ids when its partial filter did not run
-        (see :func:`annotate_class_metrics`). ``mAP_plants`` averages only the
-        classes in ``predicted_classes`` and is what lines up with the
-        pycocotools ``AP`` in ``metrics.json``.
+    ``phenobench_dir`` must contain masks matching the selected split and image
+    geometry. Returns percentage metrics augmented with named class AP and
+    ``mAP_plants``; corrupt predictions raise unless ``allow_corrupt`` is true.
     """
 
     evaluate_plant_detection = _require_upstream()

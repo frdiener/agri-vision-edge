@@ -1,36 +1,7 @@
-"""
-Canonical dataset definitions.
+"""Canonical dataset semantics and upstream-to-COCO label mappings.
 
-Dataset definitions centralize dataset semantics used across:
-
-- TFRecord export
-- COCO export
-- runtime metadata
-- visualization
-- evaluation
-
-All exported category IDs follow COCO conventions:
-
-    1-based contiguous integer IDs
-
-Dataset definitions additionally support:
-
-- semantic label remapping
-- binary detection variants
-- merged-category experiments
-- framework-independent evaluation
-
-The `label_mapping` field maps upstream dataset
-labels to exported category IDs.
-
-Example:
-
-    upstream PhenoBench labels:
-        1 -> crop
-        2 -> weed
-
-    weed-only export:
-        2 -> 1
+Exported category IDs are contiguous and 1-based. Labels absent from a
+``label_mapping`` are excluded from that dataset variant.
 """
 
 from __future__ import annotations
@@ -40,24 +11,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class DatasetDefinition:
-    """
-    Canonical dataset definition.
-
-    Attributes
-    ----------
-    name:
-        Human-readable dataset definition name.
-
-    categories:
-        Exported COCO-compatible categories.
-
-    label_mapping:
-        Mapping from upstream dataset labels
-        to exported category IDs.
-
-        Labels not present in the mapping
-        are ignored during export.
-    """
+    """COCO categories and their upstream label mapping."""
     name: str
     categories: list[dict]
     label_mapping: dict[int, int]

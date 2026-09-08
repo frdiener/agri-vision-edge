@@ -31,21 +31,18 @@
 # tiled-finetuned models. The lightweight pycocotools eval still runs for every
 # model. The excluded runs are excluded because upstream cannot express them:
 #
-#   * tiled_ runs  -- upstream is applied per 512 tile, which is internally
-#     consistent but NOT the official full-frame leaderboard number (that needs
-#     tile predictions stitched back to 1024 first); evaluation/faithful.py
-#     warns about this on every non-1024 run.
-#   * sc runs      -- upstream always averages over crop AND weed, so a
-#     weed-only model is scored on a class it structurally cannot predict.
+#   * tiled_ runs apply upstream evaluation per 512 tile. The official
+#     leaderboard metric requires predictions stitched back to 1024 frames.
+#   * sc runs cannot predict every class included in the upstream crop-and-weed
+#     average.
 #
 # Faithful eval is by far the slowest step here (torchmetrics + a staged
 # ground-truth tree per image), so this is the flag to use when only the
 # leaderboard-comparable numbers are wanted.
 #
-# datasets/phenobench_raw_tiled must be cut with the same grid as the exported
-# bundles (currently 3x3, overlap=0.5 -- notebooks 03/04); regenerate it with
-# scripts/materialize_raw_tiled.py. A mismatched grid is rejected by
-# `ave evaluate --faithful` rather than silently scored.
+# datasets/phenobench_raw_tiled must use the exported bundle grid (currently
+# 3x3, overlap=0.5; see notebooks 03/04). Regenerate it with
+# scripts/materialize_raw_tiled.py. `ave evaluate --faithful` rejects mismatches.
 
 set -uo pipefail
 
@@ -98,17 +95,14 @@ while [[ $# -gt 0 ]]; do
 done
 target_dir="${target_dir:-${repo_root}/benchmark_results/$(hostname)}"
 
-# --only-relevant only narrows the faithful step; on its own it would silently
-# do nothing, which for a long sweep is worth failing over.
+# --only-relevant requires --faithful to avoid a silent no-op.
 if [[ ${only_relevant} -eq 1 && ${faithful} -eq 0 ]]; then
     echo "--only-relevant only applies to --faithful; pass both" >&2
     exit 2
 fi
 
-# The runs whose upstream (faithful) number is comparable: multi-class, scored
-# on full 1024 frames. Both finetunes qualify -- `phenobench` (untiled) and
-# `phenobench-tiled` (tiled) models alike, as long as they are *evaluated*
-# untiled. See the header for why the rest are excluded.
+# Comparable upstream runs are multi-class models scored on full 1024 frames.
+# Both tiled and untiled finetunes qualify when evaluated on untiled inputs.
 is_relevant_for_faithful() {
     [[ "$1" == untiled_* && "$1" == *_mc_* ]]
 }

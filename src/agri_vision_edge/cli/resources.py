@@ -1,28 +1,9 @@
-"""
-Sustained-load resource measurement.
+"""Measure sustained inference resource use from an in-memory image pool.
 
-An additional measurement path not part of ``ave benchmark``.
-
-``ave resources`` asks **what does this model cost to run**.
-
-Images are decoded **once** into a small in-RAM pool and cycled.
-
-The run is bracketed like this::
-
-    [load + warmup]  chirp  ..gap..  MEASURED LOOP  ..gap..  chirp
-
-The gaps keep the synchronisation chirp out of the
-measured window and are themselves idle stretches immediately either side
-of the load, which is the local baseline the power analysis subtracts.
-
-Outputs, per run directory:
-
-``resources.csv.gz``    periodic CPU / memory / thermal / frequency samples
-``iterations.csv.gz``   per-inference epoch timestamps, latency, phase split,
-                        detection count
-``run.json``            config, delegate state, phase boundaries, latency
-                        breakdown, clock anchors
-``resources_meta.json`` sampler health, peak RSS, clock anchors
+Load and warm-up precede a chirp/gap/measured-loop/gap/chirp bracket. The gaps
+provide the local idle-power baseline; chirps align the off-board power trace.
+Each run records resource samples, per-inference timings, runtime configuration,
+phase boundaries, sampler health, and clock anchors.
 """
 
 from __future__ import annotations
@@ -53,9 +34,7 @@ def env_var(value: str) -> tuple[str, str]:
 
 
 def collect_images(path: Path, pool_size: int) -> list[Path]:
-    """
-    Pick a deterministic, evenly-spread pool of images from `path`.
-    """
+    """Select a deterministic, evenly spaced image pool."""
 
     if path.is_file():
         return [path]
@@ -94,9 +73,7 @@ def load_pool(paths: list[Path]) -> list[Any]:
 
 
 def check_output(detections) -> dict[str, Any]:
-    """
-    Is this runtime actually computing anything?
-    """
+    """Summarize whether runtime output is usable."""
 
     from agri_vision_edge.evaluation.integrity import prediction_integrity
 
@@ -135,12 +112,8 @@ def latency_stats(latencies_ms: list[float]) -> dict[str, float]:
     }
 
 
-#: Share of a ``--max-seconds`` budget the warm-up may consume. A model whose
-#: single inference takes seconds -- which is exactly the case the budget
-#: exists for -- would otherwise spend the entire budget on the 20 warm-up
-#: iterations and measure nothing at all. One iteration always runs regardless,
-#: because the integrity check reads its output and a run that cannot say
-#: whether the runtime produced garbage is worse than a slow one.
+#: Maximum warm-up share of a ``--max-seconds`` budget. One iteration always
+#: runs to support the output-integrity check.
 WARMUP_BUDGET_SHARE = 0.25
 
 
@@ -150,11 +123,9 @@ WARMUP_BUDGET_SHARE = 0.25
 MIN_USABLE_ITERATIONS = 10
 
 
-#: Phases a runtime may report, in execution order. ``postprocess`` is derived
-#: rather than measured -- it is whatever the call spent outside the three
-#: timed regions, which is exactly the detection decode -- and ``resize`` is a
-#: *part of* ``preprocess``, not a sibling of it. Both facts matter when
-#: reading the summary: the four do not sum to the total.
+#: Runtime phases in execution order. ``postprocess`` is the time outside the
+#: three measured regions. ``resize`` is part of ``preprocess``, so all four
+#: values do not sum to the total.
 PHASES = ("resize", "preprocess", "invoke", "postprocess")
 
 
@@ -433,12 +404,8 @@ def main(argv=None):
 
     cpu_count = os.cpu_count() or 1
 
-    # The budget starts here, before a single PNG is decoded, because the point
-    # is a predictable wall-clock ceiling per model and every second before the
-    # loop is a second of it. The closing gap + chirp is deliberately *outside*
-    # it: those exist so the off-board power trace can be aligned to this run
-    # at all, and a run whose trace cannot be joined is not a cheap run, it is
-    # a wasted one.
+    # Start the budget before image decoding to bound total setup and run time.
+    # Exclude the closing gap and chirp required to align the power trace.
     budget_deadline = (
         time.monotonic() + args.max_seconds if args.max_seconds > 0 else None
     )
@@ -501,10 +468,8 @@ def main(argv=None):
 
         warmup_detections = []
 
-        # Warm-up gets a slice of what is left rather than all of it. Its job
-        # is to get past the allocator, the delegate's first-call compile and
-        # the DVFS ramp, and on a model slow enough to need this budget those
-        # are done after a couple of iterations.
+        # Limit warm-up to a budget slice. A few iterations cover allocation,
+        # delegate compilation, and the DVFS ramp for slow models.
         if budget_deadline is None:
             warmup_deadline = None
         else:
@@ -540,7 +505,7 @@ def main(argv=None):
                     "--delegate none for a meaningful fp32 figure."
                 )
 
-        # ---- chirp / gap / measured loop / gap / chirp ----
+        # Bracket the measured loop for power alignment.
 
         if args.chirp_seconds > 0:
             start, end = chirp(args.chirp_seconds, cpu_count)
@@ -577,8 +542,8 @@ def main(argv=None):
             # Read, not kept: the runtime overwrites this dict on the next
             # call. Empty when --no-phases, or for a runtime that does not
             # instrument itself (the SavedModel one has no cv2 resize to
-            # report), in which case the columns stay blank rather than zero --
-            # zero would read as "free".
+            # report). Missing timings remain blank because zero would imply a
+            # free phase.
             timings = runtime.phase_timings_ms
 
             resize_ms = timings.get("resize")
@@ -708,12 +673,9 @@ def main(argv=None):
         )
 
     if budget["truncated"]:
-        # Said loudly, because the failure mode is silent: a truncated run
-        # writes exactly the same artifacts as a complete one and its mean
-        # latency looks entirely plausible. What it does not have is a steady
-        # state -- the loop was cut before current, clock and die temperature
-        # settled -- so the power average over it is not the same quantity as
-        # every other run's, and the two must not sit in one table.
+        # Truncated runs write normal-looking artifacts but may not reach steady
+        # current, clock, or die temperature. Their power is not comparable to
+        # complete runs.
         print(
             f"\n[warning] budget of {args.max_seconds:.0f}s exhausted during "
             f"{budget['truncated_at']}: {budget.get('measured_iterations', 0)} "
@@ -746,9 +708,7 @@ def main(argv=None):
 
 
 def _jsonable(value):
-    """
-    Interpreter details carry numpy arrays/dtypes; make them JSON-safe.
-    """
+    """Convert NumPy interpreter details to JSON-safe values."""
 
     if value is None:
         return None

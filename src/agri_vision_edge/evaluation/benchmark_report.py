@@ -27,9 +27,7 @@ from .score_sweep import (
     load_score_sweep,
 )
 
-# =========================================================
 # Run-name parsing
-# =========================================================
 
 _PRECISIONS = {"fp32", "fp16", "int8", "int16", "dynamic"}
 _SPLITS = {"val", "test", "train", "eval"}
@@ -174,9 +172,7 @@ def parse_run_name(name: str) -> dict | None:
     return info
 
 
-# =========================================================
 # Loading
-# =========================================================
 
 
 def _read_json(path: Path) -> dict | None:
@@ -382,9 +378,7 @@ def select_nms(df: pd.DataFrame, nms: str | None = DEFAULT_NMS) -> pd.DataFrame:
     return df[df["nms"].isna() | (df["nms"] == nms)]
 
 
-# =========================================================
 # Preprocessing cost
-# =========================================================
 
 #: Per-platform resize measurements written by ``scripts/benchmark_resize.py``.
 #: Stored as a file so the run-directory scan ignores it.
@@ -552,9 +546,7 @@ def resize_cost_table(
     return wide.reset_index()
 
 
-# =========================================================
 # Styling
-# =========================================================
 
 #: Colour-blind-friendly encodings reused across every figure.
 PRECISION_COLORS = {"fp32": "#4C72B0", "int8": "#DD8452", "fp16": "#55A868"}
@@ -754,9 +746,7 @@ def _short(series: pd.Series) -> pd.Series:
     return series.str.replace("SSD MobileNetV2", "MNv2")
 
 
-# =========================================================
 # Figures
-# =========================================================
 
 
 def plot_quantization_effect(
@@ -1405,13 +1395,22 @@ def platform_label(platform: str) -> str:
     """Convert a results-tree name to a short board/backend label."""
     name = platform
     backend = "CPU" if name.endswith("_cpu") else "NPU"
-    name = name.removesuffix("_cpu").removesuffix("_unpatched")
+    name = (
+        name.removesuffix("_cpu")
+        .removesuffix("_unpatched")
+        .removesuffix("_vendor-stack")
+    )
     pretty = {
         "frdm-imx8mp": "i.MX8MP",
         "frdm-imx93": "i.MX93",
         CPU_REFERENCE_PLATFORM: "x86",
     }.get(name, name)
-    suffix = " (unpatched)" if platform.endswith("_unpatched") else ""
+    # Name the alternate delegate stacks; the bare board is the mainline build.
+    suffix = ""
+    if platform.endswith("_unpatched"):
+        suffix = " (unpatched)"
+    elif platform.endswith("_vendor-stack"):
+        suffix = " (vendor BSP)"
 
     return f"{pretty} {backend}{suffix}"
 
@@ -1522,9 +1521,7 @@ def plot_accuracy_latency(
     return fig
 
 
-# =========================================================
 # Thesis tables
-# =========================================================
 
 #: Published PhenoBench plant-detection baselines, in percentage units.
 PHENOBENCH_BASELINES = (
@@ -1803,9 +1800,7 @@ def latency_table(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-# =========================================================
 # Sanity checks
-# =========================================================
 
 #: Quantized runs below this share of FP32 AP are classified as collapsed.
 QUANT_COLLAPSE_FRACTION = 0.5
@@ -1983,9 +1978,7 @@ def sanity_summary(issues: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-# =========================================================
 # Tables
-# =========================================================
 
 
 def quantization_delta_table(
@@ -2036,9 +2029,7 @@ def quantization_delta_table(
     return pd.DataFrame(rows)
 
 
-# =========================================================
 # The reference configuration, and collapsing onto it
-# =========================================================
 
 #: Deployability verdicts ordered from worst to best.
 DEPLOYABILITY_VERDICTS = ("failed", "unscoreable", "collapsed", "degraded", "ok", "-")
@@ -2369,9 +2360,7 @@ def collapsed_latency_table(
     )
 
 
-# =========================================================
 # Deployability
-# =========================================================
 
 
 def _skipped_frame(skipped: Iterable[str]) -> pd.DataFrame:
@@ -2640,9 +2629,7 @@ def deployability_summary(matrix: pd.DataFrame) -> pd.DataFrame:
     return counts[ordered].reset_index().rename(columns={"index": "platform"})
 
 
-# =========================================================
 # Post-processing substitution (fast vs per-class NMS)
-# =========================================================
 
 #: Pairing keys for fast and regular NMS; excludes only ``nms``.
 NMS_PAIR_KEYS = (
@@ -3108,9 +3095,7 @@ def degradation_ladder_table(
     return table.round(4) + 0.0
 
 
-# =========================================================
 # Deployment analysis stages
-# =========================================================
 # 1 baseline, 2 conversion/PTQ and NMS, 3 QAT, 4 deployability, 5 device latency, 6 ablations.
 # Stages 1-5 use REFERENCE_CONFIG; stage 6 varies one axis at a time.
 
@@ -3516,6 +3501,104 @@ def plot_device_latency(df: pd.DataFrame, **kwargs):
     return fig
 
 
+#: Suffix marking a board benchmarked through the vendor BSP delegate rather
+#: than the mainline mesa/Teflon stack. The bare tree is the mainline build.
+VENDOR_STACK_SUFFIX = "_vendor-stack"
+
+
+def discover_stack_pairs(df: pd.DataFrame) -> list[tuple[str, str]]:
+    """Return ``(mainline_tree, vendor_tree)`` pairs for boards run on both stacks.
+
+    The counterpart of :func:`discover_board_pairs`: that one pairs a board's
+    delegate with its own CPU, this one pairs two delegate stacks on the same
+    silicon.
+    """
+    if df.empty or "platform" not in df.columns:
+        return []
+
+    platforms = set(df["platform"].unique())
+
+    return sorted(
+        (vendor.removesuffix(VENDOR_STACK_SUFFIX), vendor)
+        for vendor in platforms
+        if vendor.endswith(VENDOR_STACK_SUFFIX)
+        and vendor.removesuffix(VENDOR_STACK_SUFFIX) in platforms
+    )
+
+
+def vendor_stack_latency_table(
+    df: pd.DataFrame,
+    *,
+    nms: str | None = DEFAULT_NMS,
+    metric: str = "median_latency_ms",
+) -> pd.DataFrame:
+    """Compare delegate latency using each board's shared configurations."""
+    if df.empty or metric not in df.columns:
+        return pd.DataFrame()
+
+    sel = add_scheme(select_nms(df, nms))
+    keys = ["arch_label", "classes", "dataset", "eval_tiling", "size", "scheme"]
+    if any(k not in sel.columns for k in keys):
+        return pd.DataFrame()
+
+    rows = []
+    for mainline, vendor in discover_stack_pairs(sel):
+
+        def _indexed(platform):
+            f = sel[sel["platform"] == platform].set_index(keys)[metric].dropna()
+            return f[~f.index.duplicated(keep="first")]
+
+        a, b = _indexed(mainline), _indexed(vendor)
+
+        for config in a.index.intersection(b.index):
+            rows.append(
+                {
+                    "Board": platform_label(mainline),
+                    **dict(zip(keys, config, strict=True)),
+                    "Mainline (ms)": round(float(a.loc[config]), 2),
+                    "Vendor (ms)": round(float(b.loc[config]), 2),
+                    "Speedup": round(float(a.loc[config] / b.loc[config]), 3),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(
+        ["Board", "arch_label", "size", "scheme"], ignore_index=True
+    )
+
+
+def plot_vendor_stack_latency(df: pd.DataFrame, **kwargs):
+    """Plot mainline and vendor delegate latency side by side per configuration."""
+    table = vendor_stack_latency_table(df, **kwargs)
+    if table.empty:
+        return None
+
+    labels, caption = _label_components(table.rename(columns={"Board": "platform"}))
+    labels = labels + " | " + table["scheme"].map(scheme_label)
+    groups = list(labels)
+
+    fig, ax = plt.subplots(figsize=(9, max(3.0, 0.34 * len(groups)) + 1.4))
+    _grouped_bars(
+        ax,
+        groups,
+        ["Mainline (mesa/Teflon)", "Vendor BSP"],
+        {
+            "Mainline (mesa/Teflon)": list(table["Mainline (ms)"]),
+            "Vendor BSP": list(table["Vendor (ms)"]),
+        },
+        PALETTE,
+        ylabel="median latency (ms)",
+        title=_captioned("Inference latency, mainline vs vendor delegate", caption),
+        fmt="{:.0f}",
+        horizontal=True,
+    )
+    ax.legend(title="delegate stack", loc="lower right")
+    fig.tight_layout()
+    return fig
+
+
 #: Reference deviations used by the ablation table.
 ABLATION_AXES = (
     ("Reference (mc, trained full, eval full)", {}),
@@ -3718,9 +3801,7 @@ def master_table(df: pd.DataFrame) -> pd.DataFrame:
     return out.round(round_map)
 
 
-# =========================================================
 # Coverage / completeness
-# =========================================================
 
 #: Export schemes expected for each model variant in the default-NMS coverage matrix.
 DEFAULT_SCHEMES = (
@@ -3906,9 +3987,7 @@ def coverage_summary(coverage_long: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index()
 
 
-# =========================================================
 # Resource / power sweeps (a separate measurement path)
-# =========================================================
 
 #: Resource metrics reported by power sweeps; energy is listed first.
 RESOURCE_METRICS = (
@@ -4403,9 +4482,7 @@ def plot_coverage(coverage_long: pd.DataFrame):
     return fig
 
 
-# =========================================================
 # Export helpers
-# =========================================================
 
 
 #: Fixed gallery colours for crop and weed boxes.
@@ -4571,9 +4648,7 @@ def plot_detection_gallery(
     return fig
 
 
-# =========================================================
 # Confidence-threshold sweeps
-# =========================================================
 
 #: Colours for the three swept metrics.
 SWEEP_METRIC_COLORS = {

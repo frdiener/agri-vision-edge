@@ -8,20 +8,7 @@ from typing import Any
 def capture_git_metadata(
     repo_dir: str | Path | None = None,
 ) -> dict[str, Any] | None:
-    """
-    Capture git repository metadata.
-
-    Parameters
-    ----------
-    repo_dir:
-        Path inside the git repository.
-        Defaults to current working directory.
-
-    Returns
-    -------
-    dict or None
-        JSON-serializable git metadata.
-    """
+    """Return Git metadata for ``repo_dir``, or ``None`` outside a repository."""
 
     repo_dir = Path(repo_dir or ".")
 
@@ -36,9 +23,6 @@ def capture_git_metadata(
     }
 
 
-# ============================================================
-# Core helpers
-# ============================================================
 
 def is_git_repository(
     repo_dir: str | Path,
@@ -114,9 +98,6 @@ def get_git_remote_origin(
         return None
 
 
-# ============================================================
-# Internal
-# ============================================================
 
 def run_git_command(
     repo_dir: str | Path,

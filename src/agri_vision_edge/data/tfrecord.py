@@ -44,29 +44,10 @@ def create_tf_example(
     categories,
     is_partial=None,
 ):
-    """
-    Create TensorFlow Example.
+    """Create a TF Example from an RGB image and normalized boxes.
 
-    Args:
-        image:
-            RGB image.
-
-        boxes:
-            Normalized bounding boxes.
-
-        labels:
-            Exported class labels.
-
-        categories:
-            Exported category definitions.
-
-        is_partial:
-            Optional per-box partial ("do-not-care") flags (0/1), aligned with
-            ``boxes``. Written as the canonical ``image/object/is_partial`` and
-            mirrored into ``image/object/is_crowd`` so the TFOD eval input
-            pipeline surfaces it as ``groundtruth_is_crowd`` (PhenoBench has no
-            genuine crowds), letting the trainer's ignore_partials knob identify
-            partial ground-truth without a custom decoder. Defaults to all-zero.
+    Per-box ``is_partial`` flags default to zero and are mirrored to ``is_crowd``
+    so the standard TFOD decoder exposes them during evaluation.
     """
 
     class_names = build_class_names(
@@ -209,36 +190,10 @@ def build_record(
     skip_negatives=True,
     include_partials=False,
 ):
-    """
-    Build TFRecord dataset.
+    """Write selected dataset samples to a resized TFRecord.
 
-    Args:
-        target:
-            Output TFRecord path.
-
-        dataset:
-            PhenoBench dataset. To carry partials, wrap it in
-            ``agri_vision_edge.data.plant_boxes.PartialAwarePhenoBench`` so each
-            ``plant_bboxes`` entry gains an ``is_partial`` flag.
-
-        dataset_definition:
-            Canonical dataset definition.
-
-        indices:
-            Optional subset indices.
-
-        target_size:
-            Target image size.
-
-        skip_negatives:
-            Do not include images without GT instances.
-
-        include_partials:
-            When ``True``, partial ("do-not-care") plants are written to the
-            record flagged (``image/object/is_partial`` / ``is_crowd``) so the
-            trainer's ignore_partials eval knob can suppress detections on them.
-            When ``False`` (the default) partial boxes are dropped and the
-            output is unchanged from the pre-partials behaviour.
+    ``skip_negatives`` omits samples without ground truth; ``include_partials``
+    retains do-not-care boxes with ``is_partial`` and ``is_crowd`` flags.
     """
 
     writer = tf.io.TFRecordWriter(

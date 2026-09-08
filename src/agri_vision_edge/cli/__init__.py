@@ -1,16 +1,7 @@
-"""
-agri-vision-edge command-line interface (``ave``).
+"""Command dispatcher for ``ave``.
 
-A single entry point with subcommands. Subcommand modules are imported lazily
-on dispatch, so e.g. ``ave infer`` (which needs ``tflite_runtime``, the
-``device`` extra) does not force that import when running ``ave benchmark`` on a
-host that only has ``tf.lite``.
-
-Runnable three ways, all reaching the same ``main``:
-
-  * installed:      ``ave <command> ...``        (the ``[project.scripts]`` entry)
-  * bare checkout:  ``PYTHONPATH=src python -m agri_vision_edge.cli <command> ...``
-  * via shim:       ``scripts/ave <command> ...``
+Subcommands are imported only when selected, avoiding unnecessary optional
+runtime dependencies.
 """
 
 from __future__ import annotations

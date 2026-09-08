@@ -1,24 +1,4 @@
-"""
-Inference utilities for TensorFlow Object Detection (TF-OD) models.
-
-This module provides a clean interface for:
-- loading exported SavedModels
-- preprocessing input images
-- running inference
-- applying optional Non-Maximum Suppression (NMS)
-- visualizing detections
-
-Typical usage:
-
-    detect_fn = load_saved_model("/path/to/saved_model")
-    category_index = load_label_map("label_map.pbtxt")
-
-    vis, detections = detect_image(
-        detect_fn,
-        image_path="image.png",
-        category_index=category_index,
-    )
-"""
+"""Inference and visualization helpers for TFOD SavedModels."""
 
 from pathlib import Path
 
@@ -37,98 +17,47 @@ from PIL import Image
 PathLike = str | Path
 
 
-# ---------------------------------------------------------------------
 # Loading utilities
-# ---------------------------------------------------------------------
 
 def load_saved_model(model_dir: PathLike):
-    """
-    Load a TensorFlow SavedModel exported by TF-OD.
-
-    Args:
-        model_dir:
-            Path to exported_model/saved_model directory.
-
-    Returns:
-        Callable TensorFlow detection function.
-    """
+    """Load a TFOD SavedModel detection function."""
     return tf.saved_model.load(str(model_dir))
 
 
 def load_label_map(label_map_path: PathLike) -> dict:
-    """
-    Load TF-OD label map.
-
-    Args:
-        label_map_path:
-            Path to label_map.pbtxt.
-
-    Returns:
-        category_index dictionary used by visualization.
-    """
+    """Load a TFOD label map as a visualization category index."""
     return label_map_util.create_category_index_from_labelmap(
         str(label_map_path),
         use_display_name=True,
     )
 
 
-# ---------------------------------------------------------------------
 # Preprocessing
-# ---------------------------------------------------------------------
 
 def preprocess_image(
     image: np.ndarray,
     image_size: int | None = 320,
 ) -> np.ndarray:
-    """
-    Preprocess image for TF-OD inference.
-
-    Args:
-        image:
-            RGB image as NumPy array (H, W, 3).
-        image_size:
-            Optional target size (square resize). If None, no resizing.
-
-    Returns:
-        Preprocessed RGB image.
-    """
+    """Optionally resize an RGB image to a square TFOD input."""
     if image_size is not None:
         image = cv2.resize(image, (image_size, image_size))
 
     return image
 
 
-# ---------------------------------------------------------------------
 # Inference
-# ---------------------------------------------------------------------
 
 def run_inference(
     detect_fn,
     image: np.ndarray,
 ) -> dict[str, tf.Tensor]:
-    """
-    Run TF-OD inference on an RGB image.
-
-    Args:
-        detect_fn:
-            Loaded TF SavedModel callable.
-        image:
-            RGB image (H, W, 3).
-
-    Returns:
-        Detection dictionary containing:
-            - detection_boxes
-            - detection_scores
-            - detection_classes
-    """
+    """Run a TFOD detection function on one RGB image."""
     input_tensor = tf.convert_to_tensor(image[tf.newaxis, ...])
     detections = detect_fn(input_tensor)
     return detections
 
 
-# ---------------------------------------------------------------------
 # Postprocessing
-# ---------------------------------------------------------------------
 
 def apply_nms(
     detections: dict[str, tf.Tensor],
@@ -136,25 +65,7 @@ def apply_nms(
     score_threshold: float = 0.05,
     max_detections: int = 50,
 ) -> dict[str, tf.Tensor]:
-    """
-    Apply Non-Maximum Suppression (NMS) to TF-OD detections.
-
-    This reduces overlapping bounding boxes by keeping only the highest
-    scoring boxes per region.
-
-    Args:
-        detections:
-            Raw TF-OD detection dictionary.
-        iou_threshold:
-            Intersection-over-Union threshold for suppression.
-        score_threshold:
-            Minimum score for a box to be considered.
-        max_detections:
-            Maximum number of boxes to keep.
-
-    Returns:
-        Filtered detection dictionary with same structure.
-    """
+    """Apply NMS and return a detection dictionary with a batch dimension."""
     boxes = detections["detection_boxes"][0]
     scores = detections["detection_scores"][0]
     classes = detections["detection_classes"][0]
@@ -174,9 +85,7 @@ def apply_nms(
     }
 
 
-# ---------------------------------------------------------------------
 # Visualization
-# ---------------------------------------------------------------------
 
 def visualize_detections(
     image: np.ndarray,
@@ -185,24 +94,7 @@ def visualize_detections(
     score_threshold: float = 0.0,
     max_boxes: int = 50,
 ) -> Image.Image:
-    """
-    Visualize TF-OD detections on an image.
-
-    Args:
-        image:
-            RGB image (H, W, 3).
-        detections:
-            Detection dictionary (optionally NMS-filtered).
-        category_index:
-            Label map dictionary.
-        score_threshold:
-            Minimum score for visualization (typically 0.0 if NMS applied).
-        max_boxes:
-            Maximum boxes to draw.
-
-    Returns:
-        PIL Image with rendered bounding boxes.
-    """
+    """Render TFOD detections on an RGB image."""
     image_vis = image.copy()
 
     viz_utils.visualize_boxes_and_labels_on_image_array(
@@ -220,9 +112,7 @@ def visualize_detections(
     return Image.fromarray(image_vis)
 
 
-# ---------------------------------------------------------------------
 # High-level API
-# ---------------------------------------------------------------------
 
 def detect_image(
     detect_fn,
@@ -234,39 +124,10 @@ def detect_image(
     apply_nms_flag: bool = True,
     nms_iou_threshold: float = 0.5,
 ) -> tuple[Image.Image, dict[str, tf.Tensor]]:
-    """
-    Run full TF-OD inference pipeline on an image.
+    """Load, optionally resize, infer, filter, and annotate one RGB image.
 
-    Steps:
-        1. Load image from disk
-        2. Convert to RGB
-        3. Resize (optional)
-        4. Run inference
-        5. Apply NMS (optional)
-        6. Visualize detections
-
-    Args:
-        detect_fn:
-            Loaded TF SavedModel callable.
-        image_path:
-            Path to input image.
-        category_index:
-            Label map dictionary.
-        image_size:
-            Optional resize target (must match training if used).
-        score_threshold:
-            Score threshold for NMS (and fallback visualization).
-        max_boxes:
-            Maximum number of detections to keep/draw.
-        apply_nms_flag:
-            Whether to apply NMS postprocessing.
-        nms_iou_threshold:
-            IoU threshold for NMS.
-
-    Returns:
-        Tuple:
-            - PIL Image with detections
-            - Raw or filtered detection dictionary
+    ``image_size`` must match the model's training size when set. Returns the
+    annotated PIL image and the raw or NMS-filtered detections.
     """
     image = cv2.imread(str(image_path))
     if image is None:

@@ -82,8 +82,8 @@ def benchmark_model(
 
     # The factory selects SSD (post-NMS) vs YOLOv7-tiny (raw grids) by output
     # shape; score_threshold is pinned to 0.0 (overriding any embedded metadata
-    # default) so COCO eval sees every detection the runtime is given — the
-    # YOLO runtime floors candidates internally to keep NMS tractable.
+    # default) so COCO eval sees every emitted detection. The YOLO runtime floors
+    # candidates internally to keep NMS tractable.
     #
     # This does not lift the baked-in floor on SSD exports
 

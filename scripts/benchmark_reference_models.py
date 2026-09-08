@@ -1,50 +1,11 @@
 #!/usr/bin/env python3
-"""
-Score the pre-conversion SavedModel reference for every training stage.
+"""Benchmark pre-conversion SavedModel references for deployable stages.
 
-This is the rung above TFLite in the deployment chain: without it, the
-conversion loss (TFOD post-processing -> TFLite_Detection_PostProcess) and the
-quantization loss are folded together and both get attributed to quantization.
-
-Runs each stage's SavedModel through the *same* ``ave benchmark`` path the
-device runs use, so ``predictions.json`` is produced by identical code against
-identical annotations and is directly comparable.
-
-Both exports of each stage are scored, into separate results trees:
-
-    benchmark_results/tf-savedmodel/       saved_model/       score floor 0.05
-    benchmark_results/tf-savedmodel-nms0/  saved_model_nms0/  score floor 0
-
-The floored tree is the apples-to-apples rung -- the TFLite exports bake the
-same 0.05 floor into their graphs. The floor-free tree is the true ceiling, and
-the difference between the two says what the floor costs, which is what decides
-whether re-converting and re-benchmarking everything without it is worth the
-device time. The floor binds only for the single-class models; the multi-class
-ones hit the 100-detection cap first.
-
-Which stages are scored follows ``ConversionTarget.stage_candidates``, so each
-reference is the checkpoint its INT8 exports were actually converted from:
-
-    ptq             -> fp32_ptq, int8_ptq_per-tensor, int8_ptq_per-channel
-    qat_per-tensor  -> int8_qat_per-tensor, int8_qat_per-channel
-
-Two stages are deliberately not scored. ``finetune`` is the source of no
-conversion target. ``qat_per-channel`` is preferred by nothing: granularity is a
-conversion-time choice that does not change the QAT training graph, so
-``int8_qat_per-channel`` resolves to ``qat_per-tensor`` whenever it exists --
-which it does for every variant. (Those directories are also stale: rebuilding
-``ssd-mn2-fpnlite_mc_phenobench-tiled_320/qat_per-channel`` fails with 246
-weight fake-quant variables absent from its checkpoint, i.e. it was trained
-against a since-changed graph. Nothing deployed derives from it.)
-
-The reference run names therefore carry no granularity token -- a float
-checkpoint has no weight granularity.
-
-Usage
------
-    python scripts/benchmark_reference_models.py [--variant NAME ...]
-                                                 [--stages ptq ...]
-                                                 [--override]
+Using the normal benchmark path separates conversion/post-processing loss from
+quantization loss. Stock exports with a 0.05 score floor and floor-free
+``saved_model_nms0`` exports are written to separate result trees. PTQ and the
+canonical per-tensor QAT stage are scored because they source the deployed
+TFLite targets; float reference names omit quantization granularity.
 """
 
 from __future__ import annotations
@@ -124,9 +85,8 @@ def main(argv=None) -> int:
 
                 print(f"[run]  {platform}/{run_name}")
 
-                # `ave benchmark` names the output directory after the model
-                # stem, which is `saved_model[_nms0]` for every stage -- so the
-                # run is produced under that name and renamed afterwards.
+                # `ave benchmark` uses the repeated `saved_model[_nms0]` stem.
+                # Rename the staged result to the unique run name afterwards.
                 staged = output_root / model.name
 
                 result = subprocess.run(

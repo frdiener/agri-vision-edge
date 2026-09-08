@@ -1,39 +1,10 @@
-"""
-TensorFlow SavedModel runtime — the pre-conversion reference.
+"""Run the pre-conversion TFOD SavedModel reference through the common API.
 
-Every other runtime here reads a ``.tflite``. This one reads the SavedModel the
-trainer exported, which is the rung above TFLite in the deployment chain::
-
-    SavedModel (TF float, TFOD post-processing)   <- this module
-      -> TFLite fp32          conversion + TFLite_Detection_PostProcess
-      -> TFLite int8 (CPU)    quantization
-      -> TFLite int8 (NPU)    delegation
-
-Without it the first two losses are folded together and both get attributed to
-quantization, even though the TFLite export swaps TFOD's post-processing for a
-different NMS implementation.
-
-It implements :class:`~.base.BaseRuntime` unchanged, which is the point: ``ave
-benchmark`` then produces the same ``predictions.json`` through the same COCO
-export, and ``ave evaluate`` scores it against the same annotations with the
-same pycocotools call. The reference is commensurable with the device numbers
-by construction rather than by careful reimplementation.
-
-Two differences from the TFLite path are inherent and worth knowing when
-reading the delta:
-
-* **Resampling.** The serving signature takes ``uint8 [1, None, None, 3]`` and
-  resizes *inside* the graph (``fixed_shape_resizer``), so the image is fed at
-  native resolution. The TFLite runtimes resize externally with ``cv2``. Part
-  of any SavedModel-vs-TFLite gap is therefore resampling, not post-processing.
-* **Score floor.** The pipeline's ``batch_non_max_suppression.score_threshold``
-  is baked into the graph and cannot be overridden here, unlike the TFLite
-  runtimes where ``ave benchmark`` pins it to 0. Use a
-  ``saved_model_nms0`` export (see
-  :func:`agri_vision_edge.tfod_trainer.export.export_scoring_saved_model`) when
-  the floor binds -- it does for the single-class models, whose detections stop
-  dead at 0.05, though not for the multi-class ones, which hit the
-  100-detection cap first.
+This separates conversion and TFLite post-processing loss from quantization
+loss while keeping prediction export and scoring identical to device runs.
+Two differences remain. SavedModel resizes native-resolution input inside the
+graph, and its NMS score floor is baked in. Use a ``saved_model_nms0`` export
+when the floor must be removed.
 """
 
 from __future__ import annotations
@@ -52,7 +23,7 @@ SAVED_MODEL_PROTO = "saved_model.pb"
 
 
 def is_saved_model_dir(path: str | Path) -> bool:
-    """Whether ``path`` is a SavedModel directory rather than a ``.tflite``."""
+    """Return whether ``path`` is a SavedModel directory."""
     path = Path(path)
     return path.is_dir() and (path / SAVED_MODEL_PROTO).exists()
 
@@ -61,9 +32,8 @@ def _resizer_size(model_dir: Path) -> int:
     """
     The graph's fixed input resolution, read from a neighbouring pipeline.config.
 
-    Informational only -- unlike the TFLite runtimes nothing is resized against
-    it, because the graph does its own resizing. Returns 0 when no config is
-    found, which is not an error: the model still runs.
+    This value is informational because the graph performs its own resizing.
+    Returns 0 when no configuration is found.
     """
     for candidate in (
         model_dir / "pipeline.config",
@@ -97,9 +67,8 @@ def decode_detections(
     """
     Turn the serving signature's arrays into :class:`~.base.Detection` objects.
 
-    Split out from :meth:`SavedModelRuntime.predict` so the decode -- the part
-    with the off-by-one risks (``num_detections`` slicing, the 1-based class
-    ids) -- is testable without loading TensorFlow or a real model.
+    This isolates the off-by-one risks in ``num_detections`` slicing and
+    1-based class IDs for tests that do not load TensorFlow.
     """
     count = int(count)
 
@@ -132,11 +101,9 @@ class SavedModelRuntime(BaseRuntime):
     """
     Run a TFOD-exported SavedModel behind the common runtime interface.
 
-    The serving signature already emits post-NMS detections in exactly
-    :class:`~.base.Detection`'s layout -- ``detection_boxes`` are normalized
-    ``[ymin, xmin, ymax, xmax]`` -- so no box conversion is involved.
-    ``detection_classes`` carry the exporter's ``label_id_offset``, i.e. they
-    are 1-based and line up with our COCO ``category_id`` directly.
+    The serving signature emits normalized ``[ymin, xmin, ymax, xmax]`` boxes
+    in :class:`~.base.Detection` layout. ``detection_classes`` includes the
+    exporter's 1-based ``label_id_offset`` and matches COCO ``category_id``.
     """
 
     #: Recorded in runtime.json so the report can hold the reference rows apart

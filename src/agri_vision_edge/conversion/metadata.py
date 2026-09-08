@@ -89,22 +89,9 @@ def write_object_detector_metadata(
     num_classes: int,
     extra_metadata: dict[str, object] | None = None,
 ) -> Path:
-    """
-    Embed ObjectDetector metadata and labels into a TFLite model.
+    """Embed labels and ``(pixel - 127.5) / 127.5`` normalization metadata.
 
-    The model expects normalized input:
-
-        normalized = (pixel - 127.5) / 127.5
-
-    The normalization metadata remains the same for float and quantized
-    models. Quantized models additionally carry their tensor quantization
-    parameters in the TFLite graph.
-
-    ``extra_metadata`` is an optional mapping of post-processing parameters that
-    the standard schema cannot express (e.g. ``iou_threshold``, ``nms`` type,
-    ``max_detections``, ``score_threshold``). It is JSON-encoded into a
-    ``CustomMetadata`` entry named :data:`DETECTOR_PARAMS_KEY` on the subgraph,
-    and so also appears in the emitted ``*.metadata.json``.
+    ``extra_metadata`` is JSON-encoded under :data:`DETECTOR_PARAMS_KEY`.
     """
     if not model_path.is_file():
         raise FileNotFoundError(f"TFLite model not found: {model_path}")

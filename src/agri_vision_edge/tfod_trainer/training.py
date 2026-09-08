@@ -82,16 +82,12 @@ def create_train_dataset(
 def ensure_optimizer_state_created(runtime, detection_model):
     """Create optimizer/EMA slot variables without taking a training step.
 
-    Keras optimizers generally create momentum/variance slots lazily on their
-    first ``apply_gradients`` call.  A checkpoint written before that point can
-    restore model weights but cannot rewind optimizer state, which turns a
-    later plateau restart into a model-only rewind with stale momentum.
+    Keras optimizers create slots on the first ``apply_gradients`` call. Creating
+    them before checkpointing allows plateau restarts to restore optimizer state.
 
-    This must run after graph modifications, because BN folding or QAT may
-    replace the model's trainable variables.  ``_create_all_weights`` is the
-    TensorFlow 2.12/legacy-optimizer path used by TFOD and also lets optimizer
-    wrappers such as MovingAverage create their shadow/slot variables.  The
-    public ``build`` path covers newer Keras optimizers.
+    Run this after graph modifications that may replace trainable variables.
+    ``_create_all_weights`` supports TFOD's legacy optimizer and wrappers;
+    ``build`` supports newer Keras optimizers.
     """
     variables = list(detection_model.trainable_variables)
     if not variables:
@@ -169,10 +165,9 @@ def save_best_checkpoint(
     Record ``metric_value`` as the new best, checkpoint the weights and write
     ``best_metric.json``.
 
-    Tracks the true strict maximum only -- it does NOT touch the early-stopping
-    or plateau stall counters, which advance on their own delta-gated references
-    (see ``train``). This decoupling lets the export keep the genuine best while
-    a jittery-but-slightly-improving run can still trigger LR drops / early stop.
+    Tracks only the strict maximum. Early-stopping and plateau counters use
+    separate delta-gated references in ``train``. This preserves the best export
+    while allowing noisy small gains to trigger LR drops or early stopping.
     """
     state.best_metric = metric_value
 
@@ -220,23 +215,10 @@ def maybe_reduce_lr_on_plateau(
     current_step,
     metric_value,
 ):
-    """
-    ReduceLROnPlateau step, called on every *non-improving* evaluation.
+    """Process a non-improving evaluation for the plateau LR schedule.
 
-    Counts consecutive non-improving evals; once the count reaches
-    ``lr_plateau_patience`` (and no cooldown is active) it multiplies ``lr_var``
-    by ``lr_plateau_factor`` (floored at ``lr_plateau_min_lr``) and opens a
-    ``lr_plateau_cooldown`` grace window. When ``lr_plateau_restore_best`` is set
-    the best checkpoint is restored first (warm restart: best weights + optimizer
-    slots, current step count preserved) before the lower LR is applied.
-
-    No-op unless the plateau schedule is active. Independent of the
-    early-stopping patience counter, so LR drops happen before early stopping.
-
-    Returns:
-        bool: True when the LR schedule is exhausted -- i.e. the plateau logic
-        has hit the ``lr_plateau_min_lr`` floor for ``lr_plateau_exhausted_patience``
-        stalls and the caller should stop training.
+    Returns true when the minimum LR has stalled for the configured exhausted
+    patience; restoring the best checkpoint preserves ``current_step``.
     """
     if not trainer_cfg.control.lr_plateau or runtime.lr_var is None:
         return False
@@ -329,12 +311,9 @@ def assert_finite_model(detection_model, step):
     """
     Abort training if any model weight is non-finite.
 
-    A BatchNorm moving_variance can overflow to NaN/Inf on a transient
-    activation spike without the (batch-statistic) training loss ever showing
-    it -- but eval and the exported SavedModel use the moving statistics, so a
-    single poisoned BN silently turns the model to garbage. Fail loudly here,
-    before a corrupted checkpoint is saved or exported, rather than shipping a
-    broken `ptq/`.
+    A transient activation spike can overflow BatchNorm ``moving_variance``
+    without affecting the batch-statistic training loss. Evaluation and export
+    use the moving statistics, so reject non-finite weights before checkpointing.
     """
     # Only float variables support tf.math.is_finite; skip int counters etc.
     bad = [
@@ -355,13 +334,10 @@ def assert_finite_model(detection_model, step):
 @dataclass
 class TrainOutcome:
     """
-    Why the training loop returned.
+    Training-loop outcome.
 
-    ``budget_exhausted`` is the one the caller must not ignore: it means the run
-    stopped on the clock rather than on a stopping rule, so the model is
-    *unconverged* and the train dir has to be carried into another session. Every
-    other outcome (a metric-driven stop, or reaching the step horizon) means the
-    run is done and the train dir is disposable.
+    ``budget_exhausted`` marks an unconverged run stopped by the clock. Its train
+    directory must carry into another session. Other outcomes complete the run.
     """
 
     stop_reason: str | None = None
@@ -506,9 +482,8 @@ def train(
             metric_value,
         )
 
-        # Seed the decoupled stall references to the baseline too, so the first
-        # training evals are measured against it (an initial dip below baseline
-        # is then correctly a non-improvement rather than a reset from -inf).
+        # Seed both stall references so initial regressions count as
+        # non-improvements.
         state.es_ref = metric_value
         state.plateau_ref = metric_value
 
@@ -557,9 +532,8 @@ def train(
             f"falling back to eval every {eval_interval} steps."
         )
 
-    # Wall-clock budget, measured from here so it covers training and the
-    # evaluations interleaved with it -- at high resolution the evals are the
-    # larger half, and a budget that ignored them would overshoot badly.
+    # Include interleaved evaluations in the wall-clock budget. They dominate
+    # runtime at high resolution.
     wall_clock_start = time.time()
     runtime_budget_seconds = (
         control.max_runtime_hours * 3600
@@ -599,8 +573,7 @@ def train(
         # step so the LR variable tracks the ramp before plateau reductions.
         apply_lr_warmup(runtime, current_step)
 
-        # Evaluate on the (epoch or step) cadence, and always on the final step
-        # so the last -- possibly partial -- epoch is scored and checkpointed.
+        # Evaluate on schedule and at the final step, including a partial epoch.
         is_final_step = current_step >= train_steps
         if current_step % eval_interval != 0 and not is_final_step:
             continue
@@ -632,17 +605,15 @@ def train(
             for k, v in train_metrics.items()
         ]
 
-        # Scheduler / tracker state as of the last completed eval: the running
-        # best, the early-stopping patience, and -- when the plateau schedule is
-        # active -- its stall counter and cooldown window.
+        # Report tracker state from the last evaluation, including plateau stall
+        # and cooldown counters when enabled.
         best_tag = trainer_cfg.control.metric_name.split("/")[-1]
         best_str = (
             "n/a"
             if state.best_metric == float("-inf")
             else f"{state.best_metric:.4f}"
         )
-        # early_stopping_patience == 0 means the stop is disabled; the counter
-        # is still tracked, so show its limit as "off" rather than "/0".
+        # Display "off" when zero disables early stopping.
         es_patience = trainer_cfg.control.early_stopping_patience
         es_limit = es_patience if es_patience else "off"
         sched_parts = [
@@ -696,8 +667,8 @@ def train(
             ]
         )
 
-        # 1) Checkpointing tracks the TRUE strict best, so the export never
-        #    misses a genuinely better model -- even a microscopic gain.
+        # 1) Checkpoint every strict improvement, including gains below the
+        #    stopping-rule noise threshold.
         if metric_value > state.best_metric:
             print(
                 f"New best {trainer_cfg.control.metric_name}: {metric_value:.5f} "
@@ -729,15 +700,12 @@ def train(
                 f"{state.patience_counter}/{es_limit}"
             )
 
-        # The stop conditions below record their reason rather than breaking
-        # immediately, so the trainer state can be persisted once, after the
-        # counters settle, on every path out of the eval block.
+        # Record the stop reason and persist settled counters once after the
+        # evaluation block.
         stop_reason = None
 
-        # 0) Wall-clock budget. Checked first and independently of the metric:
-        #    this is not a statement about convergence but about the session
-        #    being about to end, and stopping here is what lets the run export
-        #    and be resumed rather than be killed mid-step.
+        # 0) Check the wall-clock budget first. A graceful stop preserves an
+        #    unconverged run for export and resumption.
         if runtime_budget_seconds is not None:
             elapsed = time.time() - wall_clock_start
             if elapsed >= runtime_budget_seconds:
@@ -801,9 +769,8 @@ def train(
         # Persist the resume point now that this eval's counters have settled
         # (and after any LR reduction), so both artifacts describe a *completed*
         # evaluation. The checkpoint carries weights/optimizer/step, the state
-        # file carries everything else; restoring one without the other is what
-        # makes a resumed run diverge from an uninterrupted one. Deliberately
-        # written before the stop, so a graceful end is also recorded.
+        # file carries everything else. Write both before stopping so graceful
+        # completion is recorded and resumes match uninterrupted runs.
         runtime.last_manager.save()
         state.save(trainer_cfg.state_path)
 

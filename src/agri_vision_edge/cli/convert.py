@@ -1,16 +1,7 @@
-"""
-Batch-convert trained TF model variants to deployable TFLite models.
+"""Convert trained TF variants to deployable TFLite models.
 
-For each variant under ``artifacts/tf/`` (or a single named variant), build the
-standard int8/fp32 TFLite models -- one per training stage that is present
-(``ptq`` -> int8/int8 per-channel/fp32, ``qat_per-tensor`` -> int8,
-``qat_per-channel`` -> int8 per-channel) -- with the default IoU threshold,
-embedding ObjectDetector metadata. Conversion only; no evaluation.
-
-Each model is built in both NMS flavours (``--nms``): the deployable
-``_fastnms`` one and its ``_regnms`` control, which keeps the checkpoint's
-per-class NMS so the post-processing substitution can be priced separately from
-the conversion itself.
+Builds available FP32, PTQ, and QAT targets with embedded ObjectDetector
+metadata. Fast and regular NMS variants isolate post-processing cost.
 """
 
 from __future__ import annotations

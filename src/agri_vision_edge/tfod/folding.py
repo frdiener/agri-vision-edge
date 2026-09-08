@@ -1,31 +1,4 @@
-"""
-Generic BatchNorm folding + ReLU6 pre-folding for TFOD Keras graphs.
-
-A single ``fold_model`` reconstructs any functional Keras graph with the
-Batch-Normalization layers removed and every ReLU6 pre-folded into the
-convolution that produces it:
-
-    Conv2D       -> BatchNorm -> ReLU6   becomes   Conv2D(activation=relu6)
-    DepthwiseConv2D -> BatchNorm -> ReLU6           DepthwiseConv2D(activation=relu6)
-    Conv2D       -> BatchNorm            becomes   Conv2D(linear, bias folded)
-
-while preserving residual connections, non-conv activations (e.g. the FPN
-nearest-neighbour upsample ``Lambda``), feature-map outputs and the overall
-graph topology.
-
-Pre-folding the ReLU6 into the conv is what makes the downstream int8 pin land
-on the right tensor: because the conv's output tensor now *is* the post-ReLU6
-tensor, TFLite fuses conv+ReLU6 into one op whose output range is the known
-[0, 6] (scale 6/255, zero_point -128). This is load-bearing for the QAT scheme
-(see ``qat.quantize_backbone``): the same folded representation is used for the
-MobileNetV2 backbone and for the functionally-rebuilt SSD / FPN detection heads,
-so a single quantization path covers all of them.
-
-``fold_model`` is topology-generic. It makes no MobileNetV2 assumptions, so it
-works equally on the subclassed backbone's functional graph and on the rebuilt
-feature-map generator / FPN head graphs (which mix split depthwise/pointwise
-convs, residual adds and upsample lambdas).
-"""
+"""Fold BatchNorm and ReLU6 layers into convolutions in TFOD Keras graphs."""
 
 from __future__ import annotations
 
@@ -146,19 +119,10 @@ def _fold_conv(conv, bn, activation):
 
 
 def fold_model(model: tf.keras.Model) -> tf.keras.Model:
-    """
-    Fold every ``conv (-> BN) (-> ReLU6)`` chain in a functional Keras model,
-    baking the BatchNorm into a bias-enabled conv and the ReLU6 into that conv's
-    intrinsic ``activation``. Every other layer (residual ``Add``, upsample
-    ``Lambda``, ``Reshape``, ...) is reused verbatim, so the graph topology and
-    all weights are preserved exactly.
+    """Return a graph with conv/BatchNorm/ReLU6 chains folded into convolutions.
 
-    Works on any functional graph -- the subclassed MobileNetV2 backbone and the
-    rebuilt SSD / FPN head graphs alike. Both the per-tensor and per-channel
-    quantization schemes use this fold: the per-channel scheme relies on TFLite's
-    calibration of the fused conv+relu6 output, which is bounded by 6 (so
-    zero_point -128, scale <= 6/255) and the per-tensor scheme pins it with a
-    fixed [0, 6] output quantizer on the conv (``ReLU6ConvQuantConfig``).
+    Other layers, topology, outputs, and weights are preserved; the fused ReLU6
+    output remains bounded to ``[0, 6]`` for quantization.
     """
     consumers: dict[str, list] = collections.defaultdict(list)
     for layer in model.layers:

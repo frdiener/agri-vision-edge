@@ -27,22 +27,7 @@ def utc_now_iso() -> str:
 
 @dataclass
 class ExperimentManifest:
-    """
-    Lightweight framework-agnostic experiment manifest.
-
-    Designed for:
-    - multi-stage ML pipelines
-    - Kaggle notebook modular workflows
-    - edge deployment benchmarking
-    - quantization studies
-    - artifact lineage tracking
-
-    Stages are immutable snapshots of:
-    - config
-    - metrics
-    - artifacts
-    - runtime/environment information
-    """
+    """Framework-agnostic manifest of experiment stages and artifacts."""
 
     name: str
     task: str | None = None
@@ -59,9 +44,7 @@ class ExperimentManifest:
         )
     )
 
-    # =========================================================
     # Initialization
-    # =========================================================
 
     def __post_init__(self) -> None:
 
@@ -74,19 +57,13 @@ class ExperimentManifest:
             "schema_version": "2.0",
         }
 
-    # =========================================================
     # Generic section helpers
-    # =========================================================
 
     def set_section(
         self,
         section: str,
         values: dict[str, Any],
     ) -> None:
-        """
-        Replace an entire top-level section.
-        """
-
         self._validate_section(section)
 
         self.data[section] = values
@@ -96,17 +73,11 @@ class ExperimentManifest:
         section: str,
         values: dict[str, Any],
     ) -> None:
-        """
-        Merge values into a top-level section.
-        """
-
         self._validate_section(section)
 
         self.data[section].update(values)
 
-    # =========================================================
     # Environment / Dataset / Checkpoint
-    # =========================================================
 
     def set_environment(
         self,
@@ -129,9 +100,7 @@ class ExperimentManifest:
 
         self.data["checkpoint"].update(kwargs)
 
-    # =========================================================
     # Stage handling
-    # =========================================================
 
     def add_stage(
         self,
@@ -143,15 +112,7 @@ class ExperimentManifest:
         runtime: dict[str, Any] | None = None,
         notes: dict[str, Any] | None = None,
     ) -> None:
-        """
-        Add a pipeline stage snapshot.
-
-        Example stages:
-        - finetune
-        - qat
-        - conversion
-        - runtime_eval
-        """
+        """Add a stage snapshot, refusing duplicate names."""
 
         if stage_name in self.data["stages"]:
             raise ValueError(
@@ -177,10 +138,6 @@ class ExperimentManifest:
         runtime: dict[str, Any] | None = None,
         notes: dict[str, Any] | None = None,
     ) -> None:
-        """
-        Update existing stage contents.
-        """
-
         if stage_name not in self.data["stages"]:
             raise ValueError(
                 f"Unknown stage: {stage_name}"
@@ -203,9 +160,7 @@ class ExperimentManifest:
         if notes:
             stage["notes"].update(notes)
 
-    # =========================================================
     # Results
-    # =========================================================
 
     def add_result(
         self,
@@ -215,9 +170,7 @@ class ExperimentManifest:
 
         self.data["results"][name] = value
 
-    # =========================================================
     # Global artifacts
-    # =========================================================
 
     def add_artifact(
         self,
@@ -227,10 +180,6 @@ class ExperimentManifest:
         stage: str | None = None,
         description: str | None = None,
     ) -> None:
-        """
-        Register a global artifact.
-        """
-
         artifact = {
             "path": str(path),
         }
@@ -249,24 +198,14 @@ class ExperimentManifest:
             []
         ).append(artifact)
 
-    # =========================================================
     # Merge support
-    # =========================================================
 
     def merge(
         self,
         other: ExperimentManifest,
     ) -> None:
-        """
-        Merge another manifest into this one.
+        """Merge another manifest, refusing duplicate stage names."""
 
-        Intended for:
-        - modular notebook workflows
-        - stage aggregation
-        - distributed experiment execution
-        """
-
-        # Merge stages
         for stage_name, stage_data in other.data[
             "stages"
         ].items():
@@ -281,7 +220,6 @@ class ExperimentManifest:
                 stage_name
             ] = stage_data
 
-        # Merge artifacts
         self.data["artifacts"].setdefault(
             "files",
             []
@@ -292,14 +230,11 @@ class ExperimentManifest:
             )
         )
 
-        # Merge results
         self.data["results"].update(
             other.data["results"]
         )
 
-    # =========================================================
     # Serialization
-    # =========================================================
 
     def to_dict(self) -> dict[str, Any]:
         return self.data
@@ -355,9 +290,7 @@ class ExperimentManifest:
 
         return manifest
 
-    # =========================================================
     # Internal helpers
-    # =========================================================
 
     @staticmethod
     def _validate_section(

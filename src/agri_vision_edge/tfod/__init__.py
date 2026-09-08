@@ -9,11 +9,8 @@ from .config import (
 )
 from .folding import fold_mobilenetv2_backbone
 
-# NOTE: the QAT helpers (quantize_backbone / quantize_detection_model) live in
-# .qat, which imports tensorflow_model_optimization at module load. They are
-# exposed lazily via __getattr__ below so that importing `agri_vision_edge.tfod`
-# for a plain (non-QAT) workflow does not require tfmot -- it is only pulled in
-# when a QAT helper is actually accessed.
+# Import QAT helpers lazily because .qat loads tensorflow_model_optimization at
+# module import time. Plain workflows do not require tfmot.
 
 
 __all__ = [
@@ -37,8 +34,7 @@ __all__ = [
 ]
 
 
-# Lazy access to the QAT helpers (see note above): only imports .qat -- and thus
-# tensorflow_model_optimization -- when one of these names is actually used.
+# Names that trigger the lazy .qat import.
 _QAT_LAZY = {"quantize_backbone", "quantize_detection_model"}
 
 

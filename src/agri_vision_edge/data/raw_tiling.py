@@ -1,34 +1,11 @@
-"""
-Materialize a *raw* PhenoBench tree as tiles on disk.
+"""Materialize an in-memory PhenoBench tiling as a raw on-disk tree.
 
-:mod:`agri_vision_edge.data.tiling` tiles a dataset **in memory** (that is what
-the export notebooks and the trainer consume). This module writes the same cut
-out to a second PhenoBench-shaped directory tree -- ``phenobench_raw_tiled`` --
-which the parts of the pipeline that need *files* rather than samples read:
+Files use zero-based row-major ``{stem}_tile{index}.png`` names matching
+``TiledPhenoBench``. Geometry and names must match the exported annotations: two
+grids can share names for different crops and silently score against the wrong
+ground truth. ``tiling_config.json`` records the geometry for validation.
 
-* ``ave benchmark`` runs inference over ``test-bundle/images_tiled``;
-* ``ave evaluate --faithful`` stages ground-truth masks per evaluated image out
-  of ``--phenobench-dir`` (see :mod:`agri_vision_edge.evaluation.faithful`).
-
-Both look images up **by file name**, so the materialized tree is only correct
-while its geometry *and* its naming match the exported bundle the models were
-trained and annotated against:
-
-* geometry comes from :func:`~agri_vision_edge.data.tiling.compute_tiles`, the
-  same function :class:`~agri_vision_edge.data.tiling.TiledPhenoBench` uses;
-* names are ``{stem}_tile{index}.png`` with ``index`` starting at **0**, in the
-  row-major order ``compute_tiles`` returns -- identical to
-  ``TiledPhenoBench.__getitem__``.
-
-This coupling is silent when it breaks: a 2x2 tree and a 3x3 tree share the
-names ``_tile0.._tile3`` while ``_tile1.._tile3`` denote different crops, so a
-stale tree evaluates against the wrong ground truth instead of raising. The
-geometry is therefore recorded in ``tiling_config.json`` and can be checked with
-:func:`read_tiling_config`.
-
-Tiles are cut with :meth:`PIL.Image.Image.crop`, which preserves the source mode
-(the ``I;16`` instance/semantic masks stay 16-bit); no numpy round-trip is
-involved.
+PIL cropping preserves source modes, including 16-bit annotation masks.
 """
 
 from __future__ import annotations
@@ -231,39 +208,13 @@ def materialize_tiled_dataset(
     progress=None,
     exist_ok: bool = False,
 ) -> dict:
-    """
-    Write ``source_root`` out as a tiled PhenoBench tree at ``dest_root``.
+    """Write a tiled PhenoBench tree and return its config and split counts.
 
-    Parameters
-    ----------
-    source_root:
-        A raw PhenoBench root (``phenobench_raw_full``) containing
-        ``<split>/<subdir>/*.png``.
-    dest_root:
-        Destination root. Refused when it already exists unless ``exist_ok``.
-    rows, cols, overlap:
-        Tile geometry, passed straight to
-        :func:`~agri_vision_edge.data.tiling.compute_tiles`. ``overlap`` is a
-        **fraction** in ``[0, 1)``, not pixels. The defaults (3x3 / 0.5, i.e.
-        uniform 512px tiles on a 1024 frame) are the geometry the export
-        notebooks ``03``/``04`` use.
-    splits:
-        Splits to process; missing ones are skipped.
-    subdirs:
-        Sub-directories to cut. A sub-directory absent from a split (e.g. the
-        annotation masks in ``test``) is skipped.
-    workers:
-        Process-pool size. ``None``/``1`` runs inline.
-    progress:
-        Optional callable taking an iterable and ``desc=`` (e.g. ``tqdm``).
-    exist_ok:
-        Allow writing into an existing ``dest_root``.
-
-    Returns
-    -------
-    dict
-        The recorded tiling config plus per-split counts, as written to
-        ``dest_root/tiling_config.json`` / returned for logging.
+    ``overlap`` is a fraction in ``[0, 1)``, not pixels. Missing splits and
+    subdirectories are skipped. Existing destinations are refused unless
+    ``exist_ok`` because mixing geometries under colliding names is unsafe.
+    ``workers`` values above one use a process pool; ``progress`` accepts an
+    iterable and ``desc=``.
     """
 
     source_root = Path(source_root)
@@ -342,8 +293,7 @@ def materialize_tiled_dataset(
         for job in _run(iter(jobs)):
             total_written += _tile_frame(job)
 
-    # Record the geometry so a consumer can tell this tree apart from one cut
-    # with a different grid -- the file names alone cannot.
+    # Record geometry because filenames do not identify the source grid.
     tile_width = tile_height = None
 
     probe_split = next(iter(split_stats))

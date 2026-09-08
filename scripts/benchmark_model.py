@@ -1,25 +1,8 @@
 #!/usr/bin/env python3
-"""
-Run ``benchmark_model`` across a directory of ``.tflite`` files and collect
-the results into a CSV and a JSONL sidecar.
+"""Benchmark TFLite models with TensorFlow Lite's ``benchmark_model`` tool.
 
-For each model ``tflite_runtime`` is used to read the actual input tensor
-shape, dtype and quantization parameters so the source image can be correctly
-preprocessed and fed via ``--input_layer_value_files``.
-
-Delegate flags
---------------
-teflon    --external_delegate_path (default /usr/lib/libteflon.so)
-xnnpack   --use_xnnpack=true
-none      no delegate flags (CPU baseline)
-
-Usage
------
-    scripts/benchmark_model.py artifacts/tflite \\
-        --image datasets/test-bundle/images/img.png
-
-    scripts/benchmark_model.py artifacts/tflite \\
-        --delegate xnnpack --num-runs 10
+Writes CSV and JSONL results. When given an image, reads each model's input
+shape, dtype, and quantization parameters before creating the raw input tensor.
 """
 
 from __future__ import annotations
@@ -38,9 +21,7 @@ from statistics import mean
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-# ---------------------------------------------------------------------------
 # Filename parsing
-# ---------------------------------------------------------------------------
 
 NAME_RE = re.compile(
     r"""
@@ -107,9 +88,7 @@ def parse_name(path: Path) -> dict:
     return dict(_EMPTY_NAME)
 
 
-# ---------------------------------------------------------------------------
 # benchmark_model output parsing
-# ---------------------------------------------------------------------------
 
 TIMING_RE = re.compile(
     r"Inference timings in us:\s*"
@@ -192,9 +171,7 @@ def parse_output(text: str) -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
 # Input tensor introspection and preprocessing
-# ---------------------------------------------------------------------------
 
 
 def get_input_spec(model_path: Path) -> dict | None:
@@ -258,9 +235,7 @@ def prepare_input(image_path: Path, spec: dict, tmp_dir: Path) -> Path:
     return out_path
 
 
-# ---------------------------------------------------------------------------
 # Benchmark runner
-# ---------------------------------------------------------------------------
 
 
 def benchmark(
@@ -339,9 +314,7 @@ def benchmark(
     }
 
 
-# ---------------------------------------------------------------------------
 # Output helpers
-# ---------------------------------------------------------------------------
 
 
 def write_csv(rows: list[dict], csv_path: Path) -> None:
@@ -353,9 +326,7 @@ def write_csv(rows: list[dict], csv_path: Path) -> None:
             writer.writerow({f: row.get(f, "") for f in fields})
 
 
-# ---------------------------------------------------------------------------
 # Entry point
-# ---------------------------------------------------------------------------
 
 
 def main(argv=None) -> int:

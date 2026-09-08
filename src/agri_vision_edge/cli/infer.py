@@ -1,17 +1,7 @@
-"""
-Run a TFLite detector on images and draw the predicted boxes.
+"""Run an SSD or YOLO TFLite detector and render its predicted boxes.
 
-Two detector families are supported, auto-detected from the model's output
-tensors (via :func:`agri_vision_edge.runtime.inference.factory.build_runtime`),
-so the same command runs either — exactly like ``ave benchmark``:
-
-- **SSD MobileNetV2** (primary) — four post-NMS outputs
-  (boxes / scores / classes / count): ``TFLiteRuntime``. Input 320×320, ``[-1, 1]``.
-- **YOLOv7-tiny** — three raw grid outputs decoded in ``YoloTFLiteRuntime``
-  (sigmoid + anchor/grid reconstruction + per-class NMS). Input 512×512, ``[0, 1]``.
-
-Both the input resolution and the normalization are read from the model, so the
-320-vs-512 difference needs no per-model flag; ``--size`` is only an override.
+The runtime reads input size and normalization from the model; ``--size`` only
+overrides models with configurable input handling.
 """
 
 from __future__ import annotations

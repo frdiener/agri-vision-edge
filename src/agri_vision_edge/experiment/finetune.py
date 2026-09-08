@@ -146,10 +146,8 @@ class FineTuneConfig:
     # governed instead by ``control.max_epochs`` (which overrides this entirely
     # when set) plus the early-stopping / plateau schedule. Caveat: this same
     # value is rendered as the cosine LR schedule's ``total_steps`` (see
-    # ``tfod.config``), so with ``lr_plateau=False`` a huge ``num_steps`` flattens
-    # the cosine decay -- set it explicitly for plain-cosine finetunes, or use
-    # ``lr_plateau=True`` (which replaces the cosine schedule with the mutable,
-    # plateau-driven LR and makes ``total_steps`` irrelevant).
+    # ``tfod.config``). Set ``num_steps`` explicitly for plain-cosine finetunes.
+    # ``lr_plateau=True`` replaces the cosine schedule and ignores total_steps.
     num_steps: int = 1_000_000
 
     # Upstreams:
@@ -166,10 +164,8 @@ class FineTuneConfig:
     # positive value (e.g. 10.0) only if a run shows genuine gradient blow-up.
     gradient_clipping_by_norm: float = 0.0
 
-    # NOTE: early stopping and the reduce-LR-on-plateau schedule are NOT pipeline
-    # semantics -- they drive our custom training loop, not the TFOD protobuf --
-    # so they live in ``tfod_trainer.config.TrainingControlConfig`` (surfaced on
-    # ``FinetuneRunConfig.control``), keeping this class a pure pipeline wrapper.
+    # Early stopping and plateau scheduling belong to the custom loop in
+    # ``TrainingControlConfig``. This class contains only pipeline semantics.
 
     #
     # Image sizing

@@ -86,39 +86,10 @@ def export_coco_annotations(
     indices=None,
     include_partials=False,
 ):
-    """
-    Export dataset split as COCO annotations.
+    """Write and return COCO annotations for the selected dataset indices.
 
-    Args:
-        target:
-            Output annotations.json path.
-
-        dataset:
-            PhenoBench dataset configured with:
-
-                target_types=["plant_bboxes"]
-
-            To carry partials, wrap it in
-            ``agri_vision_edge.data.plant_boxes.PartialAwarePhenoBench`` so each
-            ``plant_bboxes`` entry gains ``is_partial`` / ``visibility``.
-
-        dataset_definition:
-            Canonical dataset definition.
-
-        indices:
-            Optional subset indices.
-
-        include_partials:
-            When ``True``, partial ("do-not-care") plants are emitted as
-            annotations flagged ``ignore=1`` plus a custom ``partial=1`` and, if
-            available, ``visibility``. They are kept out of scoring by default
-            and consumed by the ``ignore_partials`` evaluation knob (see
-            :mod:`agri_vision_edge.evaluation.partials`). When ``False`` (the
-            default) partial boxes are skipped and the output is unchanged from
-            the pre-partials behaviour.
-
-    Returns:
-        COCO dictionary.
+    When ``include_partials`` is true, partial boxes are emitted with ``ignore``
+    and ``partial`` flags and optional visibility; otherwise they are omitted.
     """
 
     target = Path(target)

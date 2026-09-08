@@ -1,33 +1,9 @@
-"""
-Parse delegation continuity from `ave benchmark` `delegate_debug.log` files.
+"""Parse delegation continuity from ``delegate_debug.log`` files.
 
-The logs provide the quantities used here: accepted operation count, delegated
-partition count, and the fraction of accepted operations in the largest
-partition.
-
-Teflon uses TensorFlow Lite's `ReplaceNodeSubsetsWithDelegateKernels` to group
-accepted operations into maximal dependency-preserving regions. The backend
-therefore determines which operations are supported, while TensorFlow Lite
-determines the resulting partitions. Partition counts are directly comparable
-between Etnaviv and Ethos-U.
-
-Current patched builds emit one line per delegated region as::
-
-```
-teflon: ===== subgraph #0: 94 operations, 255 tensors =====
-```
-
-Older unpatched builds use::
-
-```
-teflon: compiling graph: 255 tensors 98 operations
-```
-
-Both forms are accepted. Operation lines also differ slightly between Etnaviv
-and Ethos-U; the parser accepts both dialects.
-
-`continuity_table` processes one platform at a time for presentation only;
-the resulting continuity metrics are defined identically on both platforms.
+Teflon selects supported operations; TensorFlow Lite groups them into maximal
+dependency-preserving regions. The parser accepts current Etnaviv subgraph lines
+and older Ethos-U ``compiling graph`` lines, making partition counts comparable
+across backends.
 """
 
 from __future__ import annotations
@@ -44,11 +20,9 @@ _BACKEND_RE = re.compile(r"loaded\s+(\w+)\s+driver")
 #: One operation, either dialect. ``op: N`` and the glyph are Etnaviv-only.
 #: ``kind`` accepts lower case on purpose. Etnaviv prints the operator's name
 #: only when it recognises the builtin code, and writes ``unknown`` otherwise.
-#: The one operator that reaches this path in every SSD export is builtin 32,
-#: ``CUSTOM``, which carries ``TFLite_Detection_PostProcess``. An upper-case
-#: class silently dropped that line, so the operator vanished from the totals
-#: as well as from the rejection list -- the graph looked two operators short
-#: and the detection post-processing looked delegated when nothing accepts it.
+#: Every SSD export sends builtin 32, ``CUSTOM``, through this path for
+#: ``TFLite_Detection_PostProcess``. Requiring uppercase previously omitted the
+#: operator from totals and the rejection list.
 _OP_RE = re.compile(
     r"^\s*(?P<idx>\d+)\s+"
     r"(?:op:\s*(?P<code>\d+)\s+)?"
@@ -85,10 +59,9 @@ class Delegation:
     def k(self) -> int | None:
         """Number of delegated regions, or ``None`` when nothing was delegated.
 
-        Measured on both backends: each region is printed once, so ``K`` is the
-        count of those lines. A ``K`` of 1 therefore records a contiguous
-        accepted set rather than an inability to split -- the Ethos-U path
-        reports two regions for the YOLOv7-tiny exports.
+        Each backend prints every region once, so ``K`` counts those lines. A
+        value of 1 records a contiguous accepted set. Ethos-U reports two
+        regions for YOLOv7-tiny exports.
         """
         return len(self.partitions) or None
 
@@ -105,10 +78,8 @@ class Delegation:
     def r_largest(self) -> float | None:
         """Share of the delegated operations sitting in the largest partition.
 
-        This is the continuity measure. It is deliberately quoted against the
-        *delegated* operations rather than against the whole graph, so that a
-        model with a small accepted region that is nonetheless contiguous is not
-        confused with one whose accepted region is scattered.
+        The denominator includes only delegated operations. This distinguishes
+        a small contiguous accepted region from a scattered one.
         """
         if not self.ops_delegated or self.largest is None:
             return None
@@ -132,10 +103,7 @@ def parse_delegate_log(path: str | Path) -> Delegation:
 
         m = _COMPILE_RE.search(line)
         if m:
-            # Older wording for the same per-region print, carried on the i.MX93
-            # image. Appending is correct rather than a fallback: a graph split
-            # into several regions emits this line once per region, as the
-            # two-region YOLOv7-tiny runs on that board show.
+            # The i.MX93 image uses this older wording once per region.
             out.partitions.append(int(m.group("ops")))
             continue
 
@@ -202,9 +170,8 @@ def continuity_table(
 ) -> pd.DataFrame:
     """Continuity per export scheme for **one** platform.
 
-    ``platform`` is required rather than optional, for readability rather than
-    because the columns are incommensurable: one table per board keeps the
-    schemes on a page without a platform column repeating down every row.
+    ``platform`` is required to keep each table to one board and omit a
+    repetitive platform column.
     """
     from agri_vision_edge.evaluation.benchmark_report import parse_run_name
 
@@ -217,8 +184,7 @@ def continuity_table(
     meta = meta[meta.notna()]
     for key in ("arch_label", "eval_tiling", "classes", "dataset", "nms"):
         sel[key] = [m.get(key) for m in meta]
-    # Built here rather than via ``scheme_name`` so this module stays usable on a
-    # frame of parsed logs alone, without a benchmark-results frame to attach to.
+    # Build locally so parsed logs do not require a benchmark-results frame.
     sel["scheme"] = [
         "_".join(
             [str(m.get("precision")), str(m.get("quant"))]

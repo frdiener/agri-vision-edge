@@ -1,33 +1,8 @@
-"""
-Partial-plant ("do-not-care") filtering for detection evaluation.
+"""Apply PhenoBench do-not-care filtering for partially visible plants.
 
-PhenoBench's plants that are only partially visible -- because they are cut off
-by the image border (the semantic ``partial-crop`` / ``partial-weed`` classes) or
-otherwise mostly occluded -- are treated as *do-not-care* by the official
-benchmark: a missed partial is not a false negative, and a detection that fires
-on a partial is not a false positive. See
-``phenobench.evaluation.evaluate_plant_bounding_boxes`` /
-``phenobench.evaluation.auxiliary.filter.filter_partials_boxes``.
-
-This module ports that exact rule with **numpy only** (no torch), so the
-lightweight pycocotools evaluation path -- and on-device evaluation, where only
-the core ``numpy`` dependency is available -- can reproduce it. The heavyweight,
-byte-for-byte upstream reproduction (torchmetrics mAP) lives behind the optional
-``eval-faithful`` path in :mod:`agri_vision_edge.evaluation.faithful`.
-
-Upstream criterion (``filter_partials_boxes``), replicated here:
-
-* A ground-truth box is *partial* when its visibility is ``<= threshold``
-  (default ``0.5``).
-* Every partial ground-truth box is dropped from scoring.
-* A prediction is dropped when the fraction of *its own area* that lies inside
-  any single partial ground-truth box exceeds ``threshold``.
-
-Upstream measures that fraction by rasterizing both boxes onto the full image
-canvas and dividing the intersection pixel count by the prediction pixel count.
-For axis-aligned boxes this equals the analytic ``intersection_area /
-prediction_area`` computed here (canvas-size independent, and free of the
-inclusive ``+1`` pixel rounding, whose effect is sub-pixel).
+Partial ground truth has visibility at most the threshold and is unscored; a
+prediction is ignored when more than the threshold fraction of its own area is
+inside one partial box.
 """
 
 from __future__ import annotations
@@ -38,12 +13,7 @@ DEFAULT_PARTIAL_THRESHOLD = 0.5
 
 
 def xywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
-    """
-    Convert ``[x, y, w, h]`` boxes (COCO convention) to ``[x0, y0, x1, y1]``.
-
-    Accepts an ``(N, 4)`` array; returns an ``(N, 4)`` array. An empty input
-    yields an empty ``(0, 4)`` array.
-    """
+    """Convert an ``(N, 4)`` COCO box array to corner coordinates."""
 
     boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
 
@@ -104,26 +74,10 @@ def partial_prediction_mask(
     partial_gt_boxes_xywh: np.ndarray,
     threshold: float = DEFAULT_PARTIAL_THRESHOLD,
 ) -> np.ndarray:
-    """
-    Boolean mask over predictions: ``True`` where a prediction must be dropped.
+    """Return which predictions overlap a partial box beyond ``threshold``.
 
-    A prediction is dropped when the fraction of its own area contained in *any*
-    single partial ground-truth box is strictly greater than ``threshold``
-    (upstream uses ``score > 0.5``).
-
-    Parameters
-    ----------
-    pred_boxes_xywh:
-        ``(n_pred, 4)`` predictions in ``[x, y, w, h]``.
-    partial_gt_boxes_xywh:
-        ``(n_gt, 4)`` partial ground-truth boxes in ``[x, y, w, h]``.
-    threshold:
-        Containment threshold (default ``0.5``).
-
-    Returns
-    -------
-    ``(n_pred,)`` boolean array. All ``False`` when there are no partial GT
-    boxes.
+    Inputs use ``[x, y, w, h]``. The strict comparison matches upstream; an
+    empty partial set returns an all-false ``(n_pred,)`` mask.
     """
 
     pred_boxes_xywh = np.asarray(pred_boxes_xywh, dtype=np.float64).reshape(-1, 4)
@@ -176,12 +130,7 @@ def split_annotations_by_partial(
     annotations: list[dict],
     threshold: float = DEFAULT_PARTIAL_THRESHOLD,
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Split COCO annotations into ``(scored, partial)`` lists.
-
-    ``scored`` are the normally-evaluated ground-truth boxes; ``partial`` are the
-    do-not-care boxes (per :func:`is_partial_annotation`).
-    """
+    """Split annotations into ``(scored, do_not_care)`` lists."""
 
     scored: list[dict] = []
     partial: list[dict] = []

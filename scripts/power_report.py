@@ -1,51 +1,10 @@
 #!/usr/bin/env python3
-"""
-Join a power sweep's three timelines and summarise it.
+"""Summarize power, energy, CPU, memory, and temperature for a power sweep.
 
-Reads a sweep directory produced by ``scripts/power_sweep.py`` and answers, per
-model: how much power the board drew, how much energy one inference cost, how
-busy the CPU was, how much memory was resident, and how hot it got.
-
-The join
---------
-Three clocks are involved and none of them agree:
-
-======================  =========================================  ============
-series                  as recorded                                origin
-======================  =========================================  ============
-``power.csv.gz``        lab server ``CLOCK_MONOTONIC`` (``t_ns``)   arbitrary
-``resources.csv.gz``    board epoch                                 board NTP
-``iterations.csv.gz``   board epoch                                 board NTP
-======================  =========================================  ============
-
-Everything is mapped onto the **dev host's** epoch clock:
-
-* the power trace's ``t_ns`` is converted via the paired ``(epoch, monotonic)``
-  anchor taken on the lab server when the logger started, then shifted by the
-  measured lab-server offset;
-* board timestamps are shifted by the measured board offset.
-
-Both offsets come from ssh round-trip probes taken either side of each run, so
-drift across the run is visible; the two probes are averaged and their spread
-is reported.
-
-Why the chirp matters
----------------------
-The offsets above are *estimates*. ``ave resources`` therefore saturates the
-board's cores for a moment either side of the measured loop, which puts a step
-into the power trace at a time the board recorded locally. This script finds
-those edges and reports the residual between where the clock probe says the
-chirp was and where the power trace says it was.
-
-That residual is the real, end-to-end alignment error. A residual of tens of
-milliseconds against a two-minute window is irrelevant to mean power; a
-residual of seconds means the join is wrong, and the summary says so instead of
-quietly reporting a number.
-
-Usage::
-
-    scripts/power_report.py resource_results/<device>/<stamp>
-    scripts/power_report.py <sweep-dir> --org      # thesis table
+Meter monotonic timestamps and board epoch timestamps are mapped to the dev
+host's epoch using paired SSH clock probes. Probe drift is reported, and
+board-generated power chirps provide an independent end-to-end alignment check;
+large residuals mark the joined power figures as invalid.
 """
 
 from __future__ import annotations
@@ -68,54 +27,17 @@ def open_maybe_gzip(path: Path):
     return open(path, newline="")
 
 
-#: Slack added to each known-busy phase before it is excluded from the chirp
-#: search. Phases are recorded at their own boundaries, so consecutive ones
-#: leave sub-second slivers between them, and removing the phases but not the
-#: slivers makes a sliver look like an edge.
+#: Exclusion padding around known-busy phases, in seconds.
 PHASE_PAD_S = 0.5
 
-#: Where on a chirp's rise to call the edge, as a fraction of its amplitude
-#: above idle. Half-amplitude is too low when the chirp is weak: on the i.MX93
-#: two A55 cores lift the rail only ~0.55 W over idle, which puts the
-#: half-amplitude threshold (2.245 W) inside the ambient band (2.20-2.29 W), so
-#: the detector triggers on noise. Measured over both sweeps, sweeping the
-#: fraction:
-#:
-#: ====== ================= ==================
-#: frac   i.MX93 verified    i.MX8MP verified
-#: ====== ================= ==================
-#: 0.50   40/83 (med 1.125s) 75/83 (med 0.039s)
-#: 0.60   63/83 (med 0.024s) 75/83
-#: 0.75   69/83 (med 0.027s) 75/83
-#: 0.80   69/83              75/83
-#: ====== ================= ==================
-#:
-#: The i.MX8MP is insensitive -- its chirp clears everything by 0.7 W -- so
-#: this is free there, and 0.75 sits mid-plateau rather than on either edge.
+#: Fraction of chirp amplitude used for rising-edge detection.
 CHIRP_THRESHOLD_FRACTION = 0.75
 
-#: Largest chirp residual still called an aligned join.
-#:
-#: Set by what a displaced join actually damages, which is not the 120 s loop
-#: -- shifting that by a second changes its mean by under 1 % -- but the 5 s
-#: idle gaps the *net* baseline comes from. Slide those far enough and they
-#: sample the loop instead, which is how a deliberately injected 2 s error once
-#: turned a correct 4.50 W / 2.50 W-net reading into 3.67 W / -0.86 W. Half a
-#: gap keeps the idle window inside idle, so the bound is ``gap / 2``.
-#:
-#: Checked against the data rather than assumed: across both sweeps the runs
-#: rejected at the old 1.0 s bound (residuals 1.1-2.0 s) have idle baselines
-#: indistinguishable from the accepted ones -- 2.337 W vs 2.333 W on the
-#: i.MX8MP, 1.976 W vs 1.976 W on the i.MX93. Their joins are sound; the
-#: residual is chirp-detection noise, which on the i.MX93 is expected because
-#: two A55 cores lift the rail only ~0.55 W.
+#: Maximum accepted chirp alignment residual, in seconds.
 ALIGNMENT_TOLERANCE_S = 2.5
 
-#: Traces already reported as truncated, keyed by content identity rather than
-#: by path. The sweep links its single trace into every run directory, so the
-#: same bytes arrive here under 83 names -- and a sync that does not preserve
-#: hard links turns them into 83 separate copies with distinct inodes, so
-#: neither the path nor the inode collapses them. Name, size and mtime do.
+#: Truncated traces already reported, keyed by name, size, and mtime. A sweep
+#: may copy or hard-link one trace into every run directory.
 _TRUNCATED_REPORTED: set[tuple[str, int, int]] = set()
 
 
@@ -130,19 +52,7 @@ def _file_identity(path: Path) -> tuple[str, int, int] | None:
 
 
 def read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
-    """
-    Header and rows, tolerating a gzip stream that was never closed.
-
-    The meter logger writes its trace incrementally and finalizes the gzip
-    footer on a clean exit. When it is killed instead -- and it has to be
-    killed whenever the meter wedges it past SIGINT -- the data is all there
-    but the end-of-stream marker is not, and Python's ``gzip`` raises
-    ``EOFError`` on reaching the end rather than returning what it decoded, the
-    way ``gzip -dc`` does. Losing 1.5 million rows over a missing 8-byte
-    trailer is not a reasonable response to a trace that is otherwise intact,
-    so a truncated stream keeps everything up to the break and says how much
-    it kept.
-    """
+    """Read CSV rows, retaining decoded rows from a gzip stream without a footer."""
     rows: list[list[str]] = []
     truncated = False
 
@@ -152,8 +62,7 @@ def read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
                 rows.append(row)
     except (EOFError, gzip.BadGzipFile, OSError) as exc:
         truncated = True
-        # The shared power trace is re-read once per run in the sweep, so warn
-        # per file rather than per read.
+        # Warn once for each shared trace.
         identity = _file_identity(path)
         first_time = identity is None or identity not in _TRUNCATED_REPORTED
 
@@ -172,8 +81,7 @@ def read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
     if not rows:
         return [], []
 
-    # A kill can land mid-line, leaving a final row with too few fields. It is
-    # one sample out of millions; drop it rather than let it parse as zeroes.
+    # Drop an incomplete final row left by termination during a write.
     if truncated and len(rows) > 1 and len(rows[-1]) != len(rows[0]):
         rows.pop()
 
@@ -276,10 +184,8 @@ def integrate(samples: list[tuple[float, float]], window: Window) -> float:
     """
     Trapezoidal energy in joules over `window`.
 
-    Trapezoid rather than ``mean * duration`` because the meter's sample
-    spacing is only nominally uniform: the FNB58 reports four samples per USB
-    packet and packets can be late, so weighting each interval by its actual
-    width matters at the edges.
+    Trapezoidal integration weights the FNB58's nonuniform packet intervals by
+    their actual widths.
     """
 
     inside = [(t, value) for t, value in samples if window.contains(t)]
@@ -303,30 +209,10 @@ def find_edge(
     exclude: Iterable[Window] = (),
     keep: Iterable[Window] = (),
 ) -> float | None:
-    """
-    Locate a chirp's rising edge near `around` at
-    :data:`CHIRP_THRESHOLD_FRACTION` of its amplitude.
+    """Find a chirp's fractional-amplitude rising edge near ``around``.
 
-    A relative threshold is used because idle and load power vary by board and
-    workload. The search walks backward from the highest sample in the window:
-    inference and warmup can also exceed the threshold, so scanning forward can
-    mistake them for the chirp edge.
-
-    `exclude` removes intervals where the board was doing other work, such as
-    decode, model load, warmup, and inference. These phases can draw as much as or
-    more than the chirp and may otherwise dominate the search. Excluded intervals
-    are padded by `PHASE_PAD_S` so short gaps between phases do not become false
-    edges after removal. `keep` exempts the recorded chirp windows from this
-    padding so a chirp starting immediately after an excluded phase is preserved.
-
-    The check remains independent of the recorded phase times: if the trace is
-    shifted, the exclusions and keep windows shift with it while the real chirp
-    does not, causing verification to fail rather than correcting the trace toward
-    the expected position.
-
-    This is reliable while the true offset is smaller than `search`. If the chirp
-    falls outside the search window, the detected peak may belong to another event;
-    such a residual is treated as unverified.
+    The search scans backward from the local peak, ignoring ``exclude`` windows
+    except regions in ``keep``; it returns ``None`` when no reliable edge exists.
     """
 
     nearby = [
@@ -345,7 +231,7 @@ def find_edge(
     peak_index = max(range(len(nearby)), key=lambda i: nearby[i][1])
     amplitude = nearby[peak_index][1] - baseline
 
-    # Too small a step to identify reliably; refuse rather than return noise.
+    # Reject steps too small for reliable identification.
     if amplitude <= 0.05 * max(baseline, 0.1):
         return None
 
@@ -546,7 +432,7 @@ def analyse_run(run_dir: Path) -> dict[str, Any] | None:
             iterations_path, measure, device_offset
         )
 
-    # ---- power ----
+    # Power
     power_path = run_dir / "power.csv.gz"
     anchor = sweep_run.get("meter_anchor")
 
@@ -608,12 +494,10 @@ def analyse_run(run_dir: Path) -> dict[str, Any] | None:
         power["energy_per_inference_mj"] = 1000.0 * energy / inferences
         power["net_energy_per_inference_mj"] = 1000.0 * net_energy / inferences
 
-    # ---- alignment cross-check ----
+    # Alignment cross-check
     alignment = {}
 
-    # Everything the board was busy with that is not a chirp. Each can out-draw
-    # the chirp, and each has a known position, so they are removed from the
-    # edge search rather than left to compete with it.
+    # Exclude known busy phases that can draw more power than the chirp.
     busy = [
         Window(local(phases[start]) - PHASE_PAD_S, local(phases[end]) + PHASE_PAD_S)
         for start, end in (

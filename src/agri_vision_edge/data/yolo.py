@@ -1,28 +1,8 @@
-"""
-YOLO (Darknet/Ultralytics) export utilities.
+"""Export PhenoBench samples to the YOLOv7 image/label layout.
 
-Materializes a PhenoBench dataset into the on-disk layout expected by the
-official YOLOv7 trainer (WongKinYiu/yolov7), whose dataloader
-(`LoadImagesAndLabels`) reads images and one ``.txt`` label file per image
-rather than a TFRecord/COCO bundle:
-
-    <root>/
-    ├── images/<split>/<stem>.png
-    ├── labels/<split>/<stem>.txt
-    └── data.yaml
-
-Each label line is::
-
-    <class> <cx> <cy> <w> <h>
-
-with a 0-based class index and box coordinates normalized to ``[0, 1]`` by the
-image dimensions (YOLO convention).
-
-The exporter consumes the same ``plant_bboxes`` samples used by the COCO export
-(:mod:`agri_vision_edge.data.coco`), so it works transparently over a plain
-``PhenoBench(target_types=["plant_bboxes"])`` dataset (full images) or a
-``TiledPhenoBench`` wrapper (per-tile regenerated boxes). Class identity and
-semantic remapping come from a canonical :class:`DatasetDefinition`.
+Labels use ``<class> <cx> <cy> <w> <h>`` with contiguous zero-based classes and
+coordinates normalized to ``[0, 1]``. Full and tiled datasets share the same
+``plant_bboxes`` interface and :class:`DatasetDefinition` remapping.
 """
 
 from __future__ import annotations
@@ -40,12 +20,9 @@ from .datasets import DatasetDefinition
 def yolo_class_names(
     dataset_definition: DatasetDefinition,
 ) -> list[str]:
-    """
-    Ordered class names for ``data.yaml``.
+    """Return class names in zero-based YOLO order.
 
-    YOLO class indices are 0-based and contiguous; the canonical
-    ``DatasetDefinition`` uses 1-based COCO category IDs, so name ``i`` here
-    corresponds to exported category ID ``i + 1``.
+    Name ``i`` corresponds to the definition's one-based category ``i + 1``.
     """
 
     categories = sorted(
@@ -70,8 +47,7 @@ def phenobench_bbox_to_yolo(
 
     xmin, ymin, xmax, ymax = phenobench_bbox_to_xyxy(bbox)
 
-    # Clip to the image frame -- tiled boxes are already in-tile, but border
-    # fragments can land a single pixel outside after rounding.
+    # Clip rounding-induced one-pixel overflow at tile borders.
     xmin = min(max(xmin, 0.0), image_width)
     xmax = min(max(xmax, 0.0), image_width)
     ymin = min(max(ymin, 0.0), image_height)
@@ -96,49 +72,13 @@ def export_yolo_split(
     source_images_dir: str | Path | None = None,
     include_partials: bool = False,
 ) -> dict:
-    """
-    Export one dataset split as images + YOLO label files.
+    """Export one split under ``images/<split>`` and ``labels/<split>``.
 
-    Args:
-        dataset:
-            A PhenoBench-style dataset yielding samples with ``image`` (PIL) and
-            ``plant_bboxes`` (e.g. ``PhenoBench(target_types=["plant_bboxes"])``
-            or a ``TiledPhenoBench`` wrapper).
-
-        dataset_definition:
-            Canonical definition supplying the label remapping. Boxes whose
-            upstream label is absent from ``label_mapping`` are skipped.
-
-        output_dir:
-            Dataset root; ``images/<split>`` and ``labels/<split>`` are created
-            beneath it.
-
-        split:
-            Split name (``train`` / ``val``) used for the sub-directories.
-
-        indices:
-            Optional subset of dataset indices (defaults to the whole dataset).
-
-        min_box_size:
-            Drop boxes whose normalized width or height is below this value
-            (degenerate fragments). ``0.0`` keeps everything.
-
-        include_partials:
-            When ``False`` (the default), partial ("do-not-care") boxes
-            (``is_partial``) are dropped -- YOLO has no do-not-care flag, and the
-            official upstream evaluator re-derives partial handling from the raw
-            masks at eval time, so partials are simply excluded from the label
-            files. When ``True`` they are written as ordinary boxes.
-
-        source_images_dir:
-            Optional directory of original image files. When a sample's image
-            exists there (i.e. full, un-tiled images), the original PNG is
-            copied verbatim instead of re-encoded via PIL -- much faster and
-            byte-exact. Samples without a matching source file (e.g. tiles) fall
-            back to encoding ``sample["image"]``.
-
-    Returns:
-        Summary dict with image and box counts.
+    Labels absent from ``dataset_definition.label_mapping`` are skipped.
+    ``min_box_size`` is a normalized width/height floor. Partials are excluded
+    by default because YOLO has no do-not-care flag. When ``source_images_dir``
+    contains a sample, its image is copied byte-for-byte instead of re-encoded.
+    Returns image and box counts.
     """
 
     output_dir = Path(output_dir)
@@ -214,8 +154,7 @@ def export_yolo_split(
 
             lines.append(f"{yolo_class} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
 
-        # An image with no boxes still gets an (empty) label file so YOLOv7
-        # treats it as a valid background image rather than missing-label.
+        # Empty label files mark valid background images for YOLOv7.
         (labels_dir / f"{stem}.txt").write_text("\n".join(lines))
 
         num_images += 1
@@ -239,24 +178,11 @@ def write_data_yaml(
     test_split: str | None = None,
     dest: str | Path | None = None,
 ) -> Path:
-    """
-    Write the YOLOv7 ``data.yaml`` describing splits and classes.
+    """Write YOLOv7 split and class metadata.
 
-    ``train`` / ``val`` are written as **absolute** image-directory paths
-    beneath ``output_dir``. This matters: WongKinYiu/yolov7 ignores the
-    ultralytics ``path:`` key and resolves ``train`` / ``val`` relative to its
-    own working directory, so relative paths would be looked up under the
-    ``yolov7/`` clone and fail. (YOLOv7 finds labels by swapping ``images`` for
-    ``labels`` in the image path, so the sibling layout still works.)
-
-    Args:
-        output_dir:
-            Dataset root holding ``images/<split>`` and ``labels/<split>``.
-
-        dest:
-            Where to write the ``data.yaml`` file. Defaults to
-            ``output_dir/data.yaml``; pass a writable location when
-            ``output_dir`` is a read-only mount (e.g. a Kaggle input dataset).
+    Split paths are absolute because WongKinYiu/yolov7 ignores ``path:`` and
+    resolves relative paths from its own checkout. ``dest`` may be outside a
+    read-only ``output_dir``.
     """
 
     output_dir = Path(output_dir)

@@ -1,33 +1,9 @@
-"""
-Export the best checkpoint of a finetune / QAT run.
+"""Export a finetune or QAT run's best checkpoint in TF model-zoo layout.
 
-This is the export analog of the rest of ``tfod_trainer``: it reimplements
-the inference-graph export here, keeping the custom fold / quantize logic in
-``agri_vision_edge`` and using upstream symbols from ``object_detection``:
-
-  * ``model_builder.build`` to construct the inference model,
-  * ``exporter_lib_v2.DETECTION_MODULE_MAP`` for the serving modules and
-  * ``config_util.save_pipeline_config`` to write the pipeline.
-
-It produces the standard TF model-zoo layout::
-
-    <export_dir>/
-    ├── checkpoint/ckpt-0.*   # model-only, restorable as a "detection" checkpoint
-    ├── pipeline.config
-    └── saved_model/          # fp32 SavedModel for test inference
-
-The graph modifications default to whatever the run used, so a QAT export
-reproduces the trained fake-quantized graph while a plain finetune exports a
-clean fp32 detection checkpoint.
-
-Because the layout matches a zoo base model, the export directory is drop-in
-usable as the ``model_path`` of a follow-up ``FinetuneRunConfig``. That makes
-"resume QAT from a finetune" identical to "finetune from the COCO17 checkpoint":
-both load a model-only checkpoint via ``fine_tune_checkpoint_type="detection"``
-and then (for QAT) fold + quantize the freshly restored weights — avoiding the
-``model_lib_v2`` pain point of resuming through a full train-dir checkpoint
-(model + optimizer + step), which is why the old workaround was to copy the
-finetune ``train`` directory.
+The export contains a model-only checkpoint, pipeline config, and SavedModel.
+QAT recreates the trained folded/fake-quantized graph; plain finetuning exports
+clean fp32 weights. The model-only layout can seed a later run without restoring
+an earlier optimizer or global step.
 """
 
 from __future__ import annotations
@@ -52,8 +28,8 @@ class ExportResult:
 
 #: Sub-directory holding the scoring re-export (see
 #: :func:`export_scoring_saved_model`). Sits beside the stage's own
-#: ``saved_model/`` rather than replacing it -- the stock export is what the
-#: TFLite conversion is traced from and must not move.
+#: The scoring export sits beside ``saved_model/``. TFLite conversion traces the
+#: stock export at its original path.
 SCORING_EXPORT_NAME = "saved_model_nms0"
 
 
@@ -66,25 +42,10 @@ def export_scoring_saved_model(
     qat_per_channel: bool | None = None,
     input_type: str = "image_tensor",
 ) -> Path:
-    """
-    Re-export a stage's checkpoint with the NMS score threshold removed.
+    """Re-export a stage with a configurable baked-in NMS score threshold.
 
-    The stage ``saved_model/`` bakes the pipeline's
-    ``batch_non_max_suppression.score_threshold`` (0.05 for these runs) into the
-    graph, and it cannot be overridden at inference time. That is fatal for a
-    *reference* measurement: COCO AP integrates the whole precision/recall
-    curve, so a floored detector loses the low-score tail and scores below the
-    TFLite export it is supposed to be the ceiling for. ``ave benchmark`` pins
-    the TFLite runtimes to ``score_threshold=0`` for exactly this reason; this
-    is the equivalent for the SavedModel, where the only way through is to
-    re-export.
-
-    Everything else is held fixed -- same checkpoint, same graph
-    modifications, same ``iou_threshold`` and ``max_total_detections`` -- so the
-    result differs from the stock export in the score floor alone.
-
-    Writes ``<stage_dir>/saved_model_nms0/`` plus the patched
-    ``pipeline.config`` beside it, and returns the SavedModel directory.
+    All other graph and post-processing settings remain fixed. Returns the
+    SavedModel directory, defaulting to ``<stage_dir>/saved_model_nms0``.
     """
     from agri_vision_edge.third_party import setup_tensorflow_models
 
@@ -134,9 +95,8 @@ def export_scoring_saved_model(
 
         ensure_model_is_built_for_qat(detection_model, pipeline_config)
 
-        # Reproduce the *trained* graph, not the conversion rewrite: this export
-        # stands in for the model as trained, so it mirrors `export_run` and
-        # deliberately does not pass `for_export`.
+        # Reproduce the trained graph used by `export_run`; omit the conversion
+        # rewrite selected by `for_export`.
         quantize_detection_model(
             detection_model,
             resolution,
@@ -175,23 +135,10 @@ def export_run(
     qat: bool | None = None,
     qat_per_channel: bool | None = None,
 ) -> ExportResult:
-    """
-    Export the best checkpoint of ``cfg``'s run to a checkpoint + SavedModel.
+    """Export a run's latest best checkpoint and SavedModel.
 
-    ``cfg`` may be a ``FinetuneRunConfig`` or a plain dict. The best checkpoint
-    is the latest one in ``cfg.train_dir`` (the trainer only saves on metric
-    improvement, so latest == best).
-
-    By default the export mirrors how the run was trained:
-      * ``qat`` defaults to ``cfg.qat``: False yields a clean fp32 detection
-        checkpoint (ready to seed a follow-up QAT run); True reproduces the full
-        int8 graph (fold BN + fake-quant backbone + head).
-      * ``qat_per_channel`` defaults to ``cfg.qat_per_channel``. It no longer
-        changes the training graph -- pin placement is chosen when the export
-        graph is rebuilt for conversion -- so both settings produce the same
-        variables and restore either checkpoint.
-
-    Pass either explicitly to override.
+    ``cfg`` may be a mapping. QAT graph settings default to the training
+    configuration and may be overridden explicitly.
     """
     from agri_vision_edge.third_party import setup_tensorflow_models
 

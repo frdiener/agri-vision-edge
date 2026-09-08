@@ -1,20 +1,8 @@
-"""
-Detector-runtime factory.
+"""Build a detector runtime from a model path and output layout.
 
-Picks the right :class:`~.base.BaseRuntime` for a model, so callers
-(``ave infer`` / ``ave benchmark``) stay model-agnostic:
-
-- **a SavedModel directory** → the pre-conversion TF reference:
-  :class:`~.saved_model.SavedModelRuntime`.
-- **4 outputs** → SSD MobileNetV2 (post-NMS boxes/scores/classes/count):
-  :class:`~.tflite.TFLiteRuntime`.
-- **3 outputs** → YOLOv7-tiny raw grids: :class:`~.yolo.YoloTFLiteRuntime`.
-
-TFLite models are dispatched on output shape; the SavedModel is dispatched on
-the path first, because peeking at it with ``Interpreter`` would raise.
-
-Imports are deferred into the function so importing this module stays light
-(neither runtime — nor TensorFlow — is pulled in until a runtime is built).
+SavedModel directories are detected before TFLite inspection. TFLite models
+with four outputs use SSD decoding; other layouts use the YOLO runtime. Runtime
+imports remain lazy to avoid loading optional dependencies during CLI dispatch.
 """
 
 from __future__ import annotations

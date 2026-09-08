@@ -1,21 +1,4 @@
-"""
-One-call finetune / QAT run, driven by a single config object (or dict).
-
-This is the reusable core behind ``notebooks/finetuning.py``: the notebook is
-a thin marimo UI over ``FinetuneRunConfig`` + ``run_finetune``, and the same
-two can be driven head-less from Python::
-
-    from agri_vision_edge.tfod_trainer import FinetuneRunConfig, run_finetune
-
-    run_finetune(FinetuneRunConfig(
-        model_path="models/ssd_mobilenet_v2_320x320_coco17_tpu-8",
-        dataset_bundle_path="datasets/phenobench_sc_tiled",
-        num_classes=1,
-        output_dir="runs/finetune",
-    ))
-
-QAT is the same call with ``qat=True`` (and optionally ``qat_per_channel``) set.
-"""
+"""Configure and run TFOD finetuning or quantization-aware training."""
 
 from __future__ import annotations
 
@@ -38,42 +21,11 @@ _LEGACY_CONTROL_KEYS = frozenset(
 
 @dataclass
 class FinetuneRunConfig:
-    """
-    The single master configuration for one finetune (or QAT) job.
+    """Master configuration for one finetuning or QAT job.
 
-    This is the whole notebook / Python API and the object committed to the
-    experiment manifest (see :meth:`to_mapping` / :meth:`from_mapping`). Its
-    fields fall into three cohesive groups:
-
-    Orchestration (top level):
-        model_path:
-            Pretrained base model directory. Must contain ``pipeline.config``
-            and ``checkpoint/ckpt-0.*`` (the TF model-zoo layout).
-        dataset_bundle_path:
-            Dataset directory containing ``label_map.pbtxt``, ``train.record``
-            and ``val.record``.
-        num_classes:
-            Number of detection classes.
-        output_dir:
-            Where the as-run pipeline config and checkpoints are written.
-        resume_full:
-            Resume OUR OWN converged export (matching num_classes), restoring
-            the box/class prediction heads too (fine_tune_checkpoint_type=
-            "full"), as opposed to bootstrapping from a foreign detection
-            checkpoint (e.g. COCO, different num_classes) whose heads must be
-            dropped and reinitialised ("detection"). QAT always resumes our own
-            export, so it implies this; a plain-float PTQ base (qat=False) that
-            resumes the finetune export must set it explicitly, otherwise its
-            heads are dropped and it retrains from cold. Independent of
-            quantization.
-
-    ``finetune`` (a :class:`FineTuneConfig`):
-        The pure pipeline / model semantics rendered into the TFOD protobuf.
-
-    ``control`` (a :class:`TrainingControlConfig`):
-        Every custom training-loop knob -- early stopping, reduce-LR-on-plateau,
-        logging / checkpointing, and the QAT flags (``qat`` / ``qat_per_channel``).
-        These are consumed by the trainer via :meth:`to_trainer_config`.
+    ``resume_full`` restores prediction heads from a matching exported model;
+    leave it false when bootstrapping from a foreign detection checkpoint. QAT
+    always performs a full-model resume.
     """
 
     model_path: Path
@@ -91,7 +43,7 @@ class FinetuneRunConfig:
         self.dataset_bundle_path = Path(self.dataset_bundle_path)
         self.output_dir = Path(self.output_dir)
 
-    # --- QAT convenience (read-through to control) ---------------------
+    # QAT convenience properties
 
     @property
     def qat(self) -> bool:
@@ -101,7 +53,7 @@ class FinetuneRunConfig:
     def qat_per_channel(self) -> bool:
         return self.control.qat_per_channel
 
-    # --- derived paths -------------------------------------------------
+    # Derived paths
 
     @property
     def base_pipeline_config(self) -> Path:
@@ -135,20 +87,14 @@ class FinetuneRunConfig:
     def train_dir(self) -> Path:
         return self.output_dir / "train"
 
-    # --- (de)serialization for the manifest / head-less dicts ----------
+    # Manifest serialization
 
     @classmethod
     def from_mapping(cls, data) -> FinetuneRunConfig:
-        """
-        Build from a plain dict (e.g. a manifest stage config or UI dict),
-        expanding the nested ``finetune`` / ``control`` (and ``augmentation``)
-        sub-dicts into their dataclasses.
+        """Build from a mapping, expanding nested configuration dataclasses.
 
-        Backward compatible with the pre-nesting layout: ``early_stopping_*``
-        found inside ``finetune`` and any flat control knobs (``qat``,
-        ``qat_per_channel``, ``lr_plateau*``, ``log_every``, ...) sitting at the
-        top level are folded into ``control``, so historical manifests keep
-        loading. A legacy ``reset_optimizer`` (now removed) is dropped.
+        Legacy flat control keys are folded into ``control`` and obsolete
+        ``reset_optimizer`` values are ignored.
         """
         data = dict(data)
 
@@ -171,9 +117,8 @@ class FinetuneRunConfig:
                 finetune["augmentation"] = AugmentationConfig(**augmentation)
             data["finetune"] = FineTuneConfig(**finetune)
 
-        # `reset_optimizer` was removed (vestigial once PTQ/QAT resume from an
-        # exported model-only ckpt-0 rather than the finetune train dir). Drop any
-        # legacy occurrence -- top level or nested -- so old manifests still load.
+        # `reset_optimizer` became obsolete when PTQ/QAT began resuming from
+        # model-only exports. Drop legacy keys so old manifests still load.
         data.pop("reset_optimizer", None)
         control_data.pop("reset_optimizer", None)
 
@@ -296,20 +241,7 @@ def read_train_samples(cfg: FinetuneRunConfig) -> int | None:
 
 
 def compute_steps_per_epoch(cfg: FinetuneRunConfig) -> int | None:
-    """
-    Derive ``steps_per_epoch = ceil(train_samples / batch_size)``.
-
-    ``batch_size`` is the finetune config's batch size (rendered verbatim into
-    the pipeline's ``train_config``; each training step consumes exactly one
-    batch) and ``train_samples`` comes from the bundle metadata. Both are known
-    before the pipeline is rendered, so this can run pre-render -- which is what
-    lets ``run_finetune`` fold a ``max_epochs`` horizon into ``num_steps`` before
-    the cosine schedule's ``total_steps`` is baked in. Uses ``ceil`` so a
-    training set that is not a whole multiple of the batch size still counts its
-    trailing partial batch as the epoch's final step, keeping epoch boundaries
-    aligned to integer step counts. Returns ``None`` when the sample count is
-    unavailable.
-    """
+    """Return ``ceil(train_samples / batch_size)``, or ``None`` without metadata."""
     train_samples = read_train_samples(cfg)
     batch_size = int(cfg.finetune.batch_size)
     if not train_samples or batch_size <= 0:
@@ -318,23 +250,10 @@ def compute_steps_per_epoch(cfg: FinetuneRunConfig) -> int | None:
 
 
 def apply_config_overrides(cfg: FinetuneRunConfig) -> int | None:
-    """
-    Fold the ``control`` overrides into ``cfg.finetune`` before the pipeline is
-    rendered, so a single place (``control``) can drive keys that otherwise live
-    on the pipeline config, and return the resulting ``steps_per_epoch``:
+    """Apply training-control overrides to ``cfg.finetune`` in place.
 
-    - ``batch_size``          -> ``batch_size``
-    - ``max_epochs``          -> ``num_steps`` (also the cosine ``total_steps``)
-    - ``warmup_epochs``       -> ``warmup_steps`` (cosine + plateau warmup ramp)
-    - ``lr_plateau_base_lr``  -> ``learning_rate_base``
-    - ``lr_plateau_warmup_lr``-> ``warmup_learning_rate``
-
-    Order matters: ``batch_size`` is resolved first because it feeds
-    ``steps_per_epoch`` (= ceil(train_samples / batch_size)), which in turn
-    drives the epoch-derived horizons (``max_epochs`` / ``warmup_epochs``). The
-    epoch-derived overrides need a known ``steps_per_epoch`` (skipped when it is
-    ``None``); the ``batch_size`` / LR overrides are applied unconditionally when
-    set. Each applied override is logged. Mutates ``cfg.finetune`` in place.
+    Batch size is resolved before epoch-derived step counts. Returns the resulting
+    steps per epoch, or ``None`` when dataset size is unavailable.
     """
     control = cfg.control
 
@@ -398,11 +317,8 @@ def run_finetune(cfg) -> RunResult:
     if not isinstance(cfg, FinetuneRunConfig):
         cfg = FinetuneRunConfig.from_mapping(cfg)
 
-    # Resolve all control overrides (folding them into cfg.finetune) BEFORE
-    # rendering, so batch_size / max_epochs -> num_steps / warmup_epochs ->
-    # warmup_steps land in the pipeline keys -- num_steps also being the cosine
-    # schedule's total_steps -- keeping the LR decay aligned with the actual run
-    # length. Returns the epoch geometry the trainer needs.
+    # Resolve control overrides before rendering so derived step counts enter the
+    # pipeline and keep cosine decay aligned with the run length.
     steps_per_epoch = apply_config_overrides(cfg)
 
     write_pipeline(cfg)

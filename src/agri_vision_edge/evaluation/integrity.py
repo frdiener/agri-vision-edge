@@ -1,31 +1,9 @@
-"""
-Sanity checks on COCO predictions before they are scored.
+"""Reject malformed COCO predictions before scoring.
 
-A broken runtime does not always produce *obviously* broken metrics. The failure
-this module exists to stop was measured on the i.MX8MP: the Teflon delegate,
-handed an **fp32** SSD graph, returned ``NaN`` boxes and a constant garbage score
-tensor -- and the pipeline reported **AP 85.8** for it, higher than any healthy
-INT8 run.
-
-The mechanism is in ``pycocotools``. ``COCOeval.evaluateImg`` matches a detection
-to a ground-truth box with::
-
-    if ious[dind, gind] < iou: continue
-
-With a ``NaN`` IoU that comparison is ``False``, so the branch is *not* taken and
-the detection is accepted as a match -- at **every** IoU threshold, because the
-comparison never depends on the threshold. Every detection therefore matches
-some ground truth, and AP@0.50 = AP@0.55 = ... = AP@0.95.
-
-That gives the fingerprint: **``AP == AP50`` (to full float precision) means the
-boxes are not real.** A genuine detector's AP is always well below its AP50.
-
-Scores outside ``[0, 1]`` are the second symptom. They cannot corrupt AP by
-themselves (only the ranking matters), but a "score" of 6.0 means the tensor
-being read is not a score tensor, so it is treated as corruption too.
-
-Degenerate (non-positive area) boxes are *reported* but not fatal -- a detector
-can legitimately emit one.
+``pycocotools`` treats a NaN IoU comparison as a match, so delegated fp32 runs
+with NaN boxes can report implausibly high AP and ``AP == AP50`` instead of
+failing. Non-finite boxes or scores and scores outside ``[0, 1]`` are therefore
+fatal. Degenerate boxes are reported but allowed.
 """
 
 from __future__ import annotations
@@ -131,8 +109,7 @@ def prediction_integrity(predictions) -> PredictionIntegrity:
     )
 
 
-#: Appended to every corruption message -- the cause is almost always upstream
-#: of the evaluator, in the runtime that produced the predictions.
+#: Appended to corruption messages caused by invalid runtime predictions.
 _HINT = (
     "This is a broken inference run, not a scoring problem: pycocotools turns a "
     "NaN IoU into a match at every IoU threshold, so such a run reports a high "
