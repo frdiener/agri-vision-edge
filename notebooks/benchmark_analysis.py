@@ -123,8 +123,8 @@ def _(BENCHMARK_ROOT, br):
     # Each analysis selects its scope through `view(...)`.
     runs, skipped = br.load_benchmark_results(BENCHMARK_ROOT)
 
-    # Report per-class NMS. `br.DEFAULT_NMS` remains the `ave convert` default.
-    NMS = br.REGULAR_NMS
+    # Reports use checkpoint-matched, per-class NMS by default.
+    NMS = br.DEFAULT_NMS
 
     # Exclude a duplicate SavedModel control and the i.MX93 vendor backend from
     # comparative views. `controls=True` includes them in inventory tables.
@@ -373,9 +373,9 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(br, mo, view):
+def _(NMS, br, mo, view):
     # Verify the shared CPU reference against each board's CPU-only runs.
-    _div = br.cpu_reference_divergence(view(archs=None, nms=br.DEFAULT_NMS))
+    _div = br.cpu_reference_divergence(view(archs=None, nms=NMS))
 
     if _div.empty:
         _verdict = mo.callout(
@@ -621,7 +621,7 @@ def _(deployability, mo, show_table):
         "deployability",
         mo,
         caption="Export correctness on each target relative to the same file on "
-        "the CPU reference. Full-frame input with deployed post-processing.",
+        "the CPU reference. Full-frame input with per-class NMS.",
     )
     return
 
@@ -661,14 +661,14 @@ def _(mo):
     transfer, but their accuracy is invalid. `Before` and `After` provide the
     corresponding correctness verdicts.
 
-    Scope: i.MX8M Plus, 320×320, default export. The i.MX93 uses a different
+    Scope: i.MX8M Plus, 320×320, per-class NMS. The i.MX93 uses a different
     backend, and the unpatched tree was measured only at 320×320.
     """)
     return
 
 
 @app.cell(hide_code=True)
-def _(br, mo, show_table, skipped, view):
+def _(NMS, br, mo, show_table, skipped, view):
     # Keep the CPU reference for verdicts. `paired` latency includes collapsed
     # runs because their execution time remains valid.
     show_table(
@@ -687,7 +687,7 @@ def _(br, mo, show_table, skipped, view):
             ),
             skipped,
             eval_tiling="untiled",
-            nms=br.DEFAULT_NMS,
+            nms=NMS,
             latency_scope="paired",
             show_board_column=False,
         ),
@@ -770,16 +770,15 @@ def _(mo):
     board with its delegate disabled and XNNPACK enabled. Values are median latency
     with p95, plus `dAP`.
 
-    Scope: default export at the reference configuration. Board CPU trees do not
-    yet include per-class NMS runs.
+    Scope: per-class NMS at the reference configuration.
     """)
     return
 
 
 @app.cell(hide_code=True)
-def _(br, mo, show_table, view):
+def _(NMS, br, mo, show_table, view):
     _table = br.device_latency_table(
-        view(nms=br.DEFAULT_NMS, ref=True, deployable=True), nms=br.DEFAULT_NMS
+        view(nms=NMS, ref=True, deployable=True), nms=NMS
     ).drop(columns=["Input"])
     _table["Board"] = _table["Board"].replace(
         {"frdm-imx8mp": "i.MX8MP", "frdm-imx93": "i.MX93"}
@@ -803,16 +802,17 @@ def _(br, mo, show_table, view):
         _table,
         "device_latency",
         mo,
-        caption="Median latency and throughput for correct exports at the "
-        "reference input of $320\\times320$, comparing each board's CPU and NPU.",
+        caption="Median latency and throughput for correct per-class-NMS exports "
+        "at the reference input of $320\\times320$, comparing each board's CPU "
+        "and NPU.",
     )
     return
 
 
 @app.cell(hide_code=True)
-def _(br, mo, show_fig, view):
+def _(NMS, br, mo, show_fig, view):
     show_fig(
-        br.plot_device_latency(view(nms=br.DEFAULT_NMS, ref=True, deployable=True)),
+        br.plot_device_latency(view(nms=NMS, ref=True, deployable=True), nms=NMS),
         "device_latency",
         mo,
     )
@@ -835,10 +835,10 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(br, mo, show_fig, view):
+def _(NMS, br, mo, show_fig, view):
     show_fig(
         br.plot_accuracy_latency(
-            view(nms=br.DEFAULT_NMS, ref=True, deployable=True), nms=br.DEFAULT_NMS
+            view(nms=NMS, ref=True, deployable=True), nms=NMS
         ),
         "accuracy_latency_tradeoff",
         mo,
@@ -1083,13 +1083,19 @@ def _(NMS, br, mo, power_judged, show_fig):
         br.plot_resource_summary(
             power_judged[
                 (power_judged["nms"] == NMS)
-                & (~power_judged["device"].str.contains("_unpatched|_no-concat"))
+                & (~power_judged["device"].str.contains("_unpatched|_no-concat|_vendor-stack"))
                 & (power_judged["size"].astype(str) == br.REFERENCE_CONFIG["size"])
             ]
         ),
         "resource_summary",
         mo,
     )
+    return
+
+
+@app.cell
+def _(power_judged):
+    power_judged
     return
 
 
@@ -1347,28 +1353,47 @@ def _(BENCHMARK_ROOT, br):
 
 @app.cell(hide_code=True)
 def _(br, mo, show_fig, sweeps, view):
-    # One representative run: the CPU reference at the reference configuration.
-    _sel = view(platform=br.CPU_REFERENCE_PLATFORM, ref=True)
-    _keys = (
-        []
-        if _sel.empty
-        else [k for k in sweeps if k in set(zip(_sel["platform"], _sel["run"]))]
+    # Both baselines at the reference configuration, in the INT8 QAT per-tensor
+    # variant they deploy in. One figure per architecture and class.
+    _sel = view(
+        platform=br.CPU_REFERENCE_PLATFORM,
+        ref=True,
+        precision="int8",
+        quant="qat",
+        granularity="per-tensor",
     )
 
-    _sweep = sweeps[_keys[0]] if _keys else None
+    _panels = []
 
-    mo.vstack(
-        [
-            show_fig(
-                br.plot_pr_f1_vs_confidence(_sweep, class_name=_cls),
-                f"pr_f1_vs_confidence_{_cls}",
-                mo,
+    for _arch in br.PRIMARY_ARCHS:
+        _match = _sel[_sel["arch"] == _arch]
+
+        if _match.empty:
+            _panels.append(mo.md(f"_No INT8 QAT per-tensor run for `{_arch}`._"))
+            continue
+
+        _row = _match.iloc[0]
+        _sweep = sweeps.get((_row["platform"], _row["run"]))
+
+        if _sweep is None:
+            _panels.append(mo.md(f"_No score sweep for `{_row['run']}`._"))
+            continue
+
+        for _cls in _sweep.per_class:
+            _panels.append(
+                show_fig(
+                    br.plot_pr_f1_vs_confidence(
+                        _sweep,
+                        class_name=_cls,
+                        title=f"{_row['arch_label']} | INT8 QAT per-tensor",
+                    ),
+                    f"pr_f1_vs_confidence_{_arch}_{_cls}",
+                    mo,
+                )
             )
-            for _cls in _sweep.per_class
-        ]
-        if _sweep is not None
-        else [show_fig(None, "pr_f1_vs_confidence", mo)]
-    )
+
+    mo.vstack(_panels)
+
     return
 
 

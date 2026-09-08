@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -59,11 +59,14 @@ EVAL_TILING_LABELS = {
     "untiled": "Full-frame input",
 }
 
-#: Default export uses class-agnostic fast NMS.
-DEFAULT_NMS = "fastnms"
+#: Class-agnostic NMS emitted by ``ave convert`` unless explicitly overridden.
+FAST_NMS = "fastnms"
 
-#: Per-class NMS export; also used as the checkpoint-matched control.
+#: Per-class NMS export; also used as the checkpoint-matched report default.
 REGULAR_NMS = "regnms"
+
+#: Reports default to checkpoint-matched, per-class NMS.
+DEFAULT_NMS = REGULAR_NMS
 
 NMS_LABELS = {
     "fastnms": "Fast NMS (default export)",
@@ -1185,19 +1188,82 @@ def plot_per_class_ap(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
     return fig
 
 
+#: Run-label components in display order: (column, tick formatter, caption
+#: formatter). Ticks stay terse; captions spell the value out.
+_LABEL_COMPONENTS: tuple[
+    tuple[str, Callable[[object], str], Callable[[object], str]], ...
+] = (
+    ("platform", str, lambda v: platform_label(str(v))),
+    (
+        "arch_label",
+        lambda v: str(v).replace("SSD MobileNetV2", "MNv2"),
+        str,
+    ),
+    ("classes", lambda v: str(v).upper(), lambda v: CLASS_LABELS.get(str(v), str(v))),
+    ("dataset", str, str),
+    (
+        "eval_tiling",
+        lambda v: f"eval:{v}",
+        lambda v: EVAL_TILING_LABELS.get(str(v), str(v)),
+    ),
+    (
+        "precision",
+        lambda v: str(v).upper(),
+        lambda v: PRECISION_LABELS.get(str(v), str(v).upper()),
+    ),
+)
+
+
+def _label_components(df: pd.DataFrame) -> tuple[pd.Series, str]:
+    """Split run configuration into varying tick labels and a pinned caption.
+
+    A frame pinned to one platform, dataset or evaluation regime repeats those
+    tokens on every bar, so only the varying components identify a run. The
+    constant ones are returned as a caption instead, keeping the figure
+    self-describing. Falls back to precision when nothing varies.
+    """
+    varying: list[pd.Series] = []
+    pinned: list[str] = []
+
+    for column, tick_fmt, caption_fmt in _LABEL_COMPONENTS:
+        if column not in df.columns:
+            continue
+        values = df[column].dropna()
+        if values.empty:
+            continue
+        if values.nunique() > 1:
+            varying.append(df[column].map(tick_fmt))
+        else:
+            pinned.append(caption_fmt(values.iloc[0]))
+
+    if not varying:
+        column, tick_fmt, _ = _LABEL_COMPONENTS[-1]
+        varying = [df[column].map(tick_fmt)]
+
+    labels = varying[0]
+    for part in varying[1:]:
+        labels = labels + " | " + part
+
+    return labels, " \u00b7 ".join(pinned)
+
+
+def _captioned(title: str, caption: str) -> str:
+    """Append the pinned-configuration caption to a figure title."""
+    return f"{title}\n{caption}" if caption else title
+
+
 def plot_ap_by_area(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
     """Plot COCO AP by object area."""
     if df.empty:
         return None
 
     df = select_nms(df, nms).copy()
-    df["label"] = (
-        df["platform"] + " | " + df["config"] + " | " + df["precision"].str.upper()
-    )
+    df["label"], caption = _label_components(df)
     labels = sorted(df["label"].unique())
     areas = ["APS", "APM", "APL"]
 
-    fig, ax = plt.subplots(figsize=(max(8, 1.1 * len(labels)), 4.2))
+    title = _captioned("AP by object area", caption)
+    fig, ax = plt.subplots(figsize=(max(8, 1.1 * len(labels)), 5.4))
     values = {a: [df[df["label"] == lbl][a].mean() for lbl in labels] for a in areas}
     _grouped_bars(
         ax,
@@ -1207,10 +1273,24 @@ def plot_ap_by_area(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
         PALETTE,
         ylabel="AP",
         percent=True,
-        title="AP by object area",
+        title=title,
         rotation=25,
     )
-    ax.legend(title="object size", labels=["small", "medium", "large"])
+
+    # Dense groups rotate their value labels upright, so the default margin is
+    # not enough headroom. Reserve extra room and lift the legend out of the
+    # axes entirely, then re-pad the title to clear it.
+    ax.set_ylim(top=ax.get_ylim()[1] * 1.12)
+    handles, _ = ax.get_legend_handles_labels()
+    ax.legend(
+        handles,
+        ["small", "medium", "large"],
+        title="object size",
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.0),
+        ncol=len(areas),
+    )
+    ax.set_title(title, pad=34)
     fig.tight_layout()
     return fig
 
@@ -1224,9 +1304,7 @@ def plot_latency(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
     if df.empty:
         return None
 
-    df["label"] = (
-        df["platform"] + " | " + df["config"] + " | " + df["precision"].str.upper()
-    )
+    df["label"], caption = _label_components(df)
     df = df.sort_values("mean_latency_ms")
     colors = [PRECISION_COLORS.get(p, "#999999") for p in df["precision"]]
 
@@ -1260,7 +1338,7 @@ def plot_latency(df: pd.DataFrame, *, nms: str | None = DEFAULT_NMS):
             textcoords="offset points",
         )
     ax.set_xlabel("mean latency (ms), min/max whiskers")
-    ax.set_title("Inference latency per run")
+    ax.set_title(_captioned("Inference latency per run", caption))
     _prepare_axis(ax)
     ax.grid(axis="y", visible=False)
     fig.tight_layout()
@@ -2529,7 +2607,7 @@ NMS_PAIR_KEYS = (
 def nms_substitution_table(
     df: pd.DataFrame,
     *,
-    deployed: str = DEFAULT_NMS,
+    deployed: str = FAST_NMS,
     control: str = REGULAR_NMS,
 ) -> pd.DataFrame:
     """Compare matched fast-NMS and regular-NMS exports.
@@ -2607,7 +2685,11 @@ def nms_pair_coverage(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def nms_substitution_summary(
-    df: pd.DataFrame, *, drop_constant_keys: bool = True, **kwargs
+    df: pd.DataFrame,
+    *,
+    drop_constant_keys: bool = True,
+    percent: bool = True,
+    **kwargs,
 ) -> pd.DataFrame:
     """Summarize NMS metric deltas by architecture, class regime and input regime.
 
@@ -2630,10 +2712,13 @@ def nms_substitution_summary(
         ]
         keys = varying or keys
     metrics = [c for c in ("dAP", "dCrop AP", "dWeed AP", "dAR100") if c in pairs]
+    if percent:
+        pairs = pairs.copy()
+        pairs[metrics] *= 100.0
 
     summary = pairs.groupby(keys, dropna=False)[metrics].agg(["mean", "min", "max"])
     summary.insert(0, ("pairs", ""), pairs.groupby(keys, dropna=False).size())
-    return (summary.round(4) + 0.0).reset_index()
+    return (summary.round(2 if percent else 4) + 0.0).reset_index()
 
 
 def nms_latency_tradeoff_table(
@@ -2789,6 +2874,7 @@ def resolution_ladder_table(
     classes: str | None = "mc",
     dataset: str | None = "phenobench",
     latency_platforms: Iterable[str] | None = None,
+    percent: bool = True,
 ) -> pd.DataFrame:
     """Build accuracy and device-latency rows across input resolutions.
 
@@ -2827,6 +2913,11 @@ def resolution_ladder_table(
 
     out = sel[[c for c, _ in cols]].copy()
     out.columns = [n for _, n in cols]
+    accuracy_columns = [
+        c for c in ("mAP", "mAP50", "APS", "Crop AP", "Weed AP") if c in out
+    ]
+    if percent:
+        out[accuracy_columns] *= 100.0
 
     if latency_platforms:
         # Join target latency from the unscoped frame; accuracy rows are reference-platform rows.
@@ -2871,11 +2962,7 @@ def resolution_ladder_table(
         )
         .round(
             {
-                "mAP": 4,
-                "mAP50": 4,
-                "APS": 4,
-                "Crop AP": 4,
-                "Weed AP": 4,
+                **{c: 2 if percent else 4 for c in accuracy_columns},
                 "x86 (ms)": 2,
             }
         )
@@ -2914,9 +3001,7 @@ def degradation_ladder_table(
     if not keys:
         return pd.DataFrame()
 
-    def _rung(
-        platform, scheme=None, quantization=None, nms=DEFAULT_NMS, *, strict=False
-    ):
+    def _rung(platform, scheme=None, quantization=None, nms=FAST_NMS, *, strict=False):
         """Return one rung's metric per configuration.
 
         ``strict`` requires an explicit matching NMS token.
@@ -2942,7 +3027,7 @@ def degradation_ladder_table(
     int8_scheme = scheme_name("int8", quant, "per-tensor")
 
     control_label = f"TFLite fp32 ({REGULAR_NMS})"
-    deployed_label = f"TFLite fp32 ({DEFAULT_NMS})"
+    deployed_label = f"TFLite fp32 ({FAST_NMS})"
     npu_label = f"int8 NPU ({npu_platform})"
 
     table = pd.DataFrame(
@@ -3258,6 +3343,7 @@ def device_latency_table(
     metric: str = "AP",
     deployable_only: bool = True,
     nms: str | None = DEFAULT_NMS,
+    percent: bool = True,
 ) -> pd.DataFrame:
     """Compare CPU and NPU latency on the same board for reference configurations.
 
@@ -3274,6 +3360,8 @@ def device_latency_table(
     if sel.empty:
         return pd.DataFrame()
 
+    scale = 100.0 if percent else 1.0
+    digits = 2 if percent else 4
     rows = []
     for npu_platform, cpu_platform in discover_board_pairs(sel):
         npu = sel[(sel["platform"] == npu_platform) & (sel["backend"] == "delegate")]
@@ -3314,17 +3402,22 @@ def device_latency_table(
                     "AP CPU": (
                         None
                         if reference is None or pd.isna(reference[metric])
-                        else round(float(reference[metric]), 4)
+                        else round(scale * float(reference[metric]), digits)
                     ),
                     "AP NPU": (
-                        None if pd.isna(r[metric]) else round(float(r[metric]), 4)
+                        None
+                        if pd.isna(r[metric])
+                        else round(scale * float(r[metric]), digits)
                     ),
                     "dAP": (
                         None
                         if reference is None
                         or pd.isna(r[metric])
                         or pd.isna(reference[metric])
-                        else round(float(r[metric]) - float(reference[metric]), 4)
+                        else round(
+                            scale * (float(r[metric]) - float(reference[metric])),
+                            digits,
+                        )
                     ),
                 }
             )
@@ -3481,7 +3574,7 @@ def story_ablation_table(
     if base.empty:
         return pd.DataFrame()
 
-    def _ap(frame, platform, scheme=None, nms=DEFAULT_NMS, quant=None):
+    def _ap(frame, platform, scheme=None, nms=FAST_NMS, quant=None):
         rows = frame[frame["platform"] == platform]
         if scheme is not None:
             rows = rows[rows["scheme"] == scheme]
@@ -4888,7 +4981,9 @@ def save_latex_table(
                 )
             if panel_index == 0:
                 panel_suffix = (
-                    f" Panel: {group_label}." if drop_split_by and group is not None else ""
+                    f" Panel: {group_label}."
+                    if drop_split_by and group is not None
+                    else ""
                 )
                 heading = (
                     f"\\caption{{{_ascii(caption)}{panel_suffix}}}\n"
