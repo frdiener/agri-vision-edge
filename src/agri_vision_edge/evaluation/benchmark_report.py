@@ -5055,15 +5055,65 @@ def _ascii(value):
     return value.encode("ascii", "replace").decode("ascii")
 
 
+def _resolve_group_columns(df: pd.DataFrame, spec, kind: str) -> list[str]:
+    """Validate a group/split column specification against ``df``."""
+    columns = [spec] if isinstance(spec, str) else list(spec)
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"{kind} column not found: {', '.join(missing)}")
+    return columns
+
+
+def _group_label(values) -> str:
+    """Label a group by its values alone.
+
+    The column names are not repeated: they are already the reason the rows are
+    grouped, and prefixing them reads as ``Panel: Platform: i.MX8MP``.
+    """
+    values = values if isinstance(values, tuple) else (values,)
+    return ", ".join(_ascii(str(value)).replace("_", " ") for value in values)
+
+
+def _grouped_tabular(latex: str, group_sizes: list[tuple[str, int]]) -> str:
+    """Insert a spanning label row before each group of a rendered tabular.
+
+    Keeps one ``tabular`` so the table stays a single float, while a rule and an
+    italic label row keep the groups readable as separate blocks.
+    """
+    lines = latex.splitlines()
+    try:
+        first = lines.index("\\midrule") + 1
+        last = lines.index("\\bottomrule")
+    except ValueError:  # a non-booktabs rendering; leave it alone
+        return latex
+
+    columns = latex.split("{", 2)[2].split("}", 1)[0]
+    span = len(columns.replace("|", ""))
+
+    out, cursor = lines[:first], first
+    for index, (label, size) in enumerate(group_sizes):
+        if index:
+            out.append("\\midrule")
+        out.append(f"\\multicolumn{{{span}}}{{l}}{{\\itshape {label}}} \\\\")
+        out.extend(lines[cursor : cursor + size])
+        cursor += size
+    out.extend(lines[last:])
+
+    return "\n".join(out) + "\n"
+
+
 def save_latex_table(
     df: pd.DataFrame,
     path: str | Path,
     *,
     caption: str = "",
+    short_caption: str | None = None,
     label: str | None = None,
     split_by: str | tuple[str, ...] | None = None,
+    group_by: str | tuple[str, ...] | None = None,
     drop_split_by: bool = False,
     clear_between_panels: bool = True,
+    placement: str | None = None,
     **to_latex_kwargs,
 ) -> None:
     """Write a DataFrame as an ASCII-safe booktabs LaTeX table.
@@ -5072,6 +5122,14 @@ def save_latex_table(
     table panel per group. With ``drop_split_by``, the invariant group identifiers
     move into each panel caption instead of being repeated in every row. Disable
     ``clear_between_panels`` when several short panels should share a page.
+
+    ``group_by`` is the single-float alternative to ``split_by``: the groups
+    stay in one tabular, separated by a rule and a spanning label row, and the
+    grouping columns are dropped from the body.
+
+    ``short_caption`` becomes the List of Tables entry, which otherwise repeats
+    the full caption. ``placement`` overrides the float specifier, which is
+    ``H`` for split tables so their panels stay together and ``htbp`` otherwise.
     """
     if df.empty:
         return
@@ -5090,15 +5148,24 @@ def save_latex_table(
     if len(obj_cols):
         df[obj_cols] = df[obj_cols].apply(lambda c: c.map(_ascii))
 
+    if split_by is not None and group_by is not None:
+        raise ValueError("pass either split_by or group_by, not both")
+
+    group_sizes: list[tuple[str, int]] = []
+    if group_by is not None:
+        group_columns = _resolve_group_columns(df, group_by, "group")
+        key = group_columns[0] if len(group_columns) == 1 else group_columns
+        blocks = list(df.groupby(key, sort=False, dropna=False))
+        group_sizes = [(_group_label(value), len(block)) for value, block in blocks]
+        # Concatenate so body rows follow the order the labels are emitted in.
+        df = pd.concat([block for _, block in blocks]).drop(columns=group_columns)
+
     if split_by is not None:
         if not caption:
             raise ValueError("split_by requires a caption")
-        split_columns = [split_by] if isinstance(split_by, str) else list(split_by)
-        missing = [column for column in split_columns if column not in df.columns]
-        if missing:
-            raise ValueError(f"split column not found: {', '.join(missing)}")
-        group_key = split_columns[0] if len(split_columns) == 1 else split_columns
-        groups = list(df.groupby(group_key, sort=False, dropna=False))
+        split_columns = _resolve_group_columns(df, split_by, "split")
+        key = split_columns[0] if len(split_columns) == 1 else split_columns
+        groups = list(df.groupby(key, sort=False, dropna=False))
     else:
         split_columns = []
         groups = [(None, df)]
@@ -5114,30 +5181,32 @@ def save_latex_table(
     for group, group_df in groups:
         if drop_split_by:
             group_df = group_df.drop(columns=split_columns)
-        table_bodies.append((group, _ascii(group_df.to_latex(**kwargs))))
+        body = _ascii(group_df.to_latex(**kwargs))
+        if group_sizes:
+            body = _grouped_tabular(body, group_sizes)
+        table_bodies.append((group, body))
 
     if caption:
         label = label or path.stem
         # Scale only tables wider than the text block.
         panels = []
-        placement = "H" if split_by is not None else "htbp"
+        placement = placement or ("H" if split_by is not None else "htbp")
         for panel_index, (group, table_body) in enumerate(table_bodies):
             if group is None:
                 group_label = ""
             else:
-                values = group if isinstance(group, tuple) else (group,)
-                group_label = "; ".join(
-                    f"{column}: {_ascii(str(value)).replace('_', ' ')}"
-                    for column, value in zip(split_columns, values, strict=True)
-                )
+                group_label = _group_label(group)
             if panel_index == 0:
                 panel_suffix = (
                     f" Panel: {group_label}."
                     if drop_split_by and group is not None
                     else ""
                 )
+                short = (
+                    f"[{_ascii(short_caption)}]" if short_caption else ""
+                )
                 heading = (
-                    f"\\caption{{{_ascii(caption)}{panel_suffix}}}\n"
+                    f"\\caption{short}{{{_ascii(caption)}{panel_suffix}}}\n"
                     f"\\label{{tab:{label}}}\n"
                 )
             else:
