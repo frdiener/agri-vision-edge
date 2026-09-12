@@ -553,6 +553,17 @@ PRECISION_COLORS = {"fp32": "#4C72B0", "int8": "#DD8452", "fp16": "#55A868"}
 CLASSES_COLORS = {"sc": "#8172B3", "mc": "#C44E52"}
 PALETTE = ("#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3", "#937860")
 
+# `\textwidth` of the thesis document class, 418.26 pt. A figure authored at
+# this width is included at `\linewidth` without rescaling, so its labels
+# print at the point sizes set in `_PUBLICATION_RCPARAMS`.
+THESIS_TEXT_WIDTH_IN = 418.26 / 72.27
+
+# Width for a float that overflows symmetrically into the a4 margins, which
+# `\makebox[\linewidth][c]` in the thesis centres on the text block. The page
+# is 597.51 pt with a 59.75 pt inner and 119.50 pt outer margin, so 34.75 pt
+# per side still leaves 25 pt clear of the binding edge.
+THESIS_WIDE_WIDTH_IN = (418.26 + 2 * 34.75) / 72.27
+
 _PUBLICATION_RCPARAMS = {
     "figure.dpi": 130,
     "savefig.dpi": 300,
@@ -4118,10 +4129,17 @@ def plot_resource_summary(
     *,
     metrics: Iterable[tuple[str, str, bool]] = RESOURCE_METRICS,
     verified_only: bool = True,
+    figure_width: float = THESIS_WIDE_WIDTH_IN,
+    panel_height: float = 1.55,
 ):
     """Plot resource metrics by export scheme, device and architecture.
 
     ``verified_only`` applies only to metrics joined to the external power trace.
+
+    Forty bars per panel plus the legend gutter do not fit the thesis text width
+    legibly, so ``figure_width`` defaults to the margin-overflowing width. The
+    figure is then included without rescaling and its value labels print at the
+    point size set in `_PUBLICATION_RCPARAMS`.
     """
     if power_df.empty:
         return None
@@ -4159,14 +4177,20 @@ def plot_resource_summary(
         return None
 
     labels = [scheme_label(s) for s in schemes]
+    # Wrap each entry onto two lines. An outside legend is as wide as its
+    # longest label, and on one line these take a third of the figure away from
+    # the bars, which crowds the value labels into each other.
     series_labels = [
-        f"{platform_label(device)} · {_short(pd.Series([arch])).iloc[0]}"
+        f"{platform_label(device)}\n{_short(pd.Series([arch])).iloc[0]}"
         for device, arch in series
     ]
     colors = [PALETTE[i % len(PALETTE)] for i in range(len(series))]
 
     fig, axes = plt.subplots(
-        len(usable), 1, figsize=(9, 2.9 * len(usable)), sharex=True
+        len(usable),
+        1,
+        figsize=(figure_width, panel_height * len(usable)),
+        sharex=True,
     )
     axes = np.atleast_1d(axes)
 
@@ -4203,7 +4227,7 @@ def plot_resource_summary(
 
     fig.suptitle("Steady-state cost per export scheme")
     fig.tight_layout()
-    _legend_outside(fig, axes[0], title="device · detector")
+    _legend_outside(fig, axes[0], title="device · detector", labelspacing=0.9)
     return fig
 
 
