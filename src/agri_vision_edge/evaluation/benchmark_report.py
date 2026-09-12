@@ -3473,6 +3473,187 @@ def device_latency_table(
     return pd.DataFrame(rows)
 
 
+#: Weight-granularity groups reported by `deployment_summary_table`, in row order.
+DEPLOYMENT_GRANULARITIES = ("float", "per-tensor", "per-channel")
+
+
+def deployment_summary_table(
+    df: pd.DataFrame,
+    skipped: Iterable[str] = (),
+    *,
+    power_df: pd.DataFrame | None = None,
+    metric: str = "AP",
+    nms: str | None = DEFAULT_NMS,
+    reference: str = CPU_REFERENCE_PLATFORM,
+    percent: bool = True,
+) -> pd.DataFrame:
+    """Summarize what each board can run, one row per board, detector and granularity.
+
+    Accuracy is read from ``reference`` so a row's AP is a property of the export
+    rather than of the board it ran on. Latency and speedup come from
+    `device_latency_table`, correctness verdicts from `deployability_matrix`, and
+    energy from ``power_df``, which may be raw or already passed through
+    `annotate_resource_runs`.
+
+    Within a granularity the export method scoring highest on the reference is
+    the one reported, so ``Export`` is a result rather than a fixed label.
+    ``Outcome`` folds the correctness verdict together with whether acceleration
+    was worth anything, which are independent properties.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    # Failed deployments are the point of the table, so they are kept.
+    latency = device_latency_table(
+        df, metric=metric, deployable_only=False, nms=nms, percent=percent
+    )
+    if latency.empty:
+        return pd.DataFrame()
+
+    boards = list(dict.fromkeys(latency["Board"]))
+    scope = reference_config_slice(df)
+    sel = add_scheme(select_nms(scope, nms))
+    if "arch" in sel.columns:
+        sel = sel[sel["arch"].isin(PRIMARY_ARCHS)]
+    if sel.empty:
+        return pd.DataFrame()
+
+    scale = 100.0 if percent else 1.0
+    digits = 2 if percent else 4
+
+    host = sel[sel["platform"] == reference].drop_duplicates(["arch_label", "scheme"])
+    host_ap = host.set_index(["arch_label", "scheme"])[metric] * scale
+
+    # `granularity` is absent for float exports; the parser leaves it unset.
+    granularity_of = (
+        sel[["scheme", "granularity"]]
+        .drop_duplicates("scheme")
+        .set_index("scheme")["granularity"]
+        .fillna("float")
+        .to_dict()
+    )
+
+    # Best-scoring method per architecture and granularity, on the reference.
+    best: dict[tuple[str, str], tuple[str, float]] = {}
+    for (arch, scheme), ap in host_ap.items():
+        if pd.isna(ap):
+            continue
+        key = (arch, granularity_of.get(scheme, "float"))
+        if key not in best or ap > best[key][1]:
+            best[key] = (scheme, float(ap))
+
+    verdicts = deployability_matrix(
+        scope,
+        skipped,
+        reference=reference,
+        nms=nms,
+        platforms=boards,
+        drop_constant_keys=False,
+    )
+    verdict_of = {}
+    if not verdicts.empty:
+        for _, row in verdicts.iterrows():
+            for board in boards:
+                if board in verdicts.columns:
+                    verdict_of[(board, row["arch_label"], row["scheme"])] = row[board]
+
+    energy_of = {}
+    if power_df is not None and not power_df.empty:
+        power = power_df if "scheme" in power_df.columns else annotate_resource_runs(power_df)
+        if "state" in power.columns:
+            # Unaligned traces yield plausible and wrong watts.
+            power = power[power["state"] == "verified"]
+        if "nms" in power.columns and nms is not None:
+            power = power[power["nms"] == nms]
+        if "size" in power.columns and "size" in sel.columns:
+            power = power[power["size"].astype(str).isin(set(sel["size"].astype(str)))]
+        if not power.empty:
+            energy_of = (
+                power.drop_duplicates(["device", "arch_label", "scheme"])
+                .set_index(["device", "arch_label", "scheme"])["net mJ/inf"]
+                .to_dict()
+            )
+
+    latency_of = latency.drop_duplicates(["Board", "Architecture", "Scheme"]).set_index(
+        ["Board", "Architecture", "Scheme"]
+    )
+
+    rows = []
+    for board in boards:
+        for arch in sorted({a for a, _ in best}):
+            float_ap = best.get((arch, "float"), (None, None))[1]
+
+            for gran in DEPLOYMENT_GRANULARITIES:
+                if (arch, gran) not in best:
+                    continue
+                scheme, ap = best[(arch, gran)]
+                timing = (
+                    latency_of.loc[(board, arch, scheme)]
+                    if (board, arch, scheme) in latency_of.index
+                    else None
+                )
+                speedup = None if timing is None else timing["Speedup"]
+                verdict = verdict_of.get((board, arch, scheme))
+
+                rows.append(
+                    {
+                        "Platform": platform_label(board).removesuffix(" NPU"),
+                        "Detector": _short(pd.Series([arch])).iloc[0],
+                        "Weights": gran,
+                        "Export": quant_label_of_scheme(scheme),
+                        "AP": round(ap, digits),
+                        "dAP": (
+                            None
+                            if gran == "float" or float_ap is None
+                            else round(ap - float_ap, digits)
+                        ),
+                        "NPU (ms)": None if timing is None else timing["NPU (ms)"],
+                        "CPU (ms)": None if timing is None else timing["CPU (ms)"],
+                        "Speedup": speedup,
+                        # Match the one decimal the latency columns carry.
+                        "mJ/inf": _round_or_none(energy_of.get((board, arch, scheme)), 1),
+                        "Outcome": _deployment_outcome(verdict, speedup),
+                    }
+                )
+
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return table
+
+    # Name the row a deployment would choose: the fastest-accelerated block wins
+    # on accuracy, which is the recommendation the table is meant to derive.
+    accelerated = table["Outcome"] == "accelerated"
+    for _, block in table[accelerated].groupby(["Platform", "Detector"], sort=False):
+        table.loc[block["AP"].idxmax(), "Outcome"] = "recommended"
+
+    return table.reset_index(drop=True)
+
+
+def _round_or_none(value, digits: int):
+    """Round a value that may be missing, keeping ``None`` for the LaTeX dash."""
+    return None if value is None or pd.isna(value) else round(float(value), digits)
+
+
+def _deployment_outcome(verdict, speedup) -> str:
+    """Fold a correctness verdict and an acceleration result into one label."""
+    if verdict is not None and not pd.isna(verdict) and verdict != "ok":
+        return str(verdict)
+    if speedup is None or pd.isna(speedup):
+        return "not measured"
+    if speedup < 0.95:
+        return "slower than CPU"
+    if speedup < 1.05:
+        return "not delegated"
+    return "accelerated"
+
+
+def quant_label_of_scheme(scheme: str) -> str:
+    """Return the export method of a scheme token: ``FP32``, ``PTQ`` or ``QAT``."""
+    if scheme.startswith("fp32"):
+        return "FP32"
+    return "QAT" if "_qat" in scheme else "PTQ"
+
+
 def plot_device_latency(df: pd.DataFrame, **kwargs):
     """Plot CPU and NPU median latency by board, architecture and scheme."""
     table = device_latency_table(df, **kwargs)
