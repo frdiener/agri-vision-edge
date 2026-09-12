@@ -1368,6 +1368,58 @@ def _(br, mo, show_table, view):
     return
 
 
+@app.cell
+def _(mo):
+    mo.md("""
+    ### 5.5 &middot; Deployment summary
+
+    One row per board, detector and weight granularity, at the reference
+    configuration. It carries the sections above into a single decision: accuracy
+    comes from the host reference, so `AP` is a property of the export and is equal
+    across boards; latency and energy come from the board named, against that same
+    board with its delegate disabled.
+
+    Within a granularity the export method scoring highest on the reference is the
+    one shown, so `Export` is a result &mdash; per-channel selects PTQ, per-tensor
+    selects QAT.
+
+    `Outcome` folds the correctness verdict of &sect;4 together with whether
+    acceleration was worth anything, which are independent properties. The
+    per-channel rows on the i.MX8M Plus are the most accurate exports in their block
+    and the only ones slower than not using the accelerator.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(NMS, br, mo, power_judged, show_table, skipped, view):
+    # Correctness needs both NMS variants in scope; the table fixes NMS itself.
+    deployment_summary = br.deployment_summary_table(
+        view(nms="both", classes="mc", dataset="phenobench"),
+        skipped,
+        power_df=power_judged,
+        nms=NMS,
+    )
+
+    show_table(
+        deployment_summary,
+        "deployment_summary",
+        mo,
+        short_caption="Deployment outcome by platform, detector and weight granularity",
+        caption="Deployment outcome for every weight granularity at the reference "
+        "configuration. AP comes from the host reference and is a property of the "
+        "export; latency and energy come from the board shown, against that same "
+        "board with its delegate disabled. Within each granularity the "
+        "higher-scoring export method is reported, and \\texttt{Outcome} combines the "
+        "correctness verdict of \\cref{tab:deployability} with whether acceleration "
+        "was worth anything. A dash marks an export with no benchmark row on that "
+        "board.",
+        # One float, with the boards kept apart by a rule and a label row.
+        group_by="Platform",
+    )
+    return
+
+
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
