@@ -400,7 +400,6 @@ def _(NMS, br, mo, view):
         )
 
     mo.vstack([_verdict, mo.ui.table(_div, selection=None)])
-
     return
 
 
@@ -760,6 +759,95 @@ def _(br, delegation, dg, mo, show_table):
         )
 
     mo.md("_Exported `continuity_imx8mp` and `continuity_imx93`._")
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ### 4.4 &middot; Vendor BSP delegate
+
+    `<board>_vendor-stack` runs the same export files through NXP's shipped
+    `libethosu_delegate.so` (i.MX93) or `libvx_delegate.so` (i.MX8MP) instead of
+    the mainline mesa/Teflon stack benchmarked above. Same board, same silicon,
+    different driver stack, so the pair separates a stack limitation from a
+    hardware one.
+
+    Both vendor trees are partial — the i.MX8MP one covers FPNLite on the tiled
+    training set only — so comparisons are inner-joined on the configurations each
+    pair actually shares rather than pinned to the reference configuration.
+
+    The i.MX93 tree is held out of comparative views by `CONTROL_TREES`; this
+    section opts back in with `controls=True`.
+    """)
+    return
+
+
+@app.cell
+def _(NMS, br, mo, skipped, view):
+    # Pair each board's mainline tree with its vendor-stack counterpart.
+    stack_pairs = br.discover_stack_pairs(view(controls=True, nms=NMS))
+    stack_platforms = [p for pair in stack_pairs for p in pair]
+
+    vendor_deployability = br.deployability_matrix(
+        view(controls=True, nms="both", classes="mc"),
+        skipped,
+        eval_tiling="untiled",
+        platforms=stack_platforms,
+        nms=NMS,
+    )
+
+    mo.ui.table(
+        br.deployability_summary(vendor_deployability),
+        label="Deployability by delegate stack",
+        selection=None,
+    )
+    return (vendor_deployability,)
+
+
+@app.cell
+def _(mo, show_table, vendor_deployability):
+    show_table(
+        vendor_deployability,
+        "vendor_stack_deployability",
+        mo,
+        caption="Export correctness under the mainline mesa/Teflon delegate and "
+        "NXP's vendor BSP delegate, each against the CPU reference. A dash marks "
+        "a configuration that stack did not run.",
+    )
+    return
+
+
+@app.cell
+def _(NMS, br, mo, show_fig, view):
+    # Reference input scale, full-frame evaluation: the scope both boards share.
+    show_fig(
+        br.plot_vendor_stack_latency(
+            view(dataset='phenobench',
+                 controls=True, nms=NMS, classes="mc", eval_tiling="untiled", size="320"),
+            nms=NMS,
+        ),
+        "vendor_stack_latency",
+        mo,
+    )
+    return
+
+
+@app.cell
+def _(NMS, view):
+    view(archs='primary', controls=True, nms=NMS, classes="mc", eval_tiling="untiled", size="320")
+    return
+
+
+@app.cell
+def _(NMS, br, mo, show_table, view):
+    show_table(
+        br.vendor_stack_latency_table(view(controls=True, nms=NMS, classes="mc"), nms=NMS),
+        "vendor_stack_latency",
+        mo,
+        caption="Median latency under each delegate stack on every configuration "
+        "the two ran in common, with the vendor-stack speedup.",
+    )
     return
 
 
