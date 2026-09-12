@@ -1535,7 +1535,6 @@ def _(br, mo, show_fig, sweeps, view):
             )
 
     mo.vstack(_panels)
-
     return
 
 
@@ -1924,9 +1923,10 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(BENCHMARK_ROOT, NMS):
-    # Match the 418.3 pt thesis text width to preserve label size.
-    THESIS_TEXT_WIDTH_IN = 5.79
+def _(BENCHMARK_ROOT, NMS, br):
+    # Author figures at the thesis text width so LaTeX does not rescale
+    # them and their labels keep their nominal point size.
+    THESIS_TEXT_WIDTH_IN = br.THESIS_TEXT_WIDTH_IN
 
 
     def gallery_prediction(platform, arch, scheme, size="320"):
