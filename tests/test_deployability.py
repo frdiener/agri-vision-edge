@@ -19,6 +19,7 @@ import pytest
 from agri_vision_edge.evaluation.benchmark_report import (
     CPU_REFERENCE_PLATFORM,
     DEFAULT_NMS,
+    FAST_NMS,
     deployability_matrix,
     deployability_summary,
 )
@@ -112,10 +113,10 @@ def test_a_never_run_cell_is_blank():
 
 def test_the_skip_list_respects_the_nms_scope():
     df = pd.DataFrame([_run(CPU_REFERENCE_PLATFORM, 0.39, precision="fp32")])
-    skipped = [f"{NPU}/untiled_ssd-mn2_mc_phenobench_320_fp32_ptq_regnms (failed)"]
+    skipped = [f"{NPU}/untiled_ssd-mn2_mc_phenobench_320_fp32_ptq_{FAST_NMS} (failed)"]
 
-    # The control is not the deployable, so it must not fill the deployable's
-    # cell.
+    # A converter-default run is outside the report-default NMS scope, so it
+    # must not fill the per-class cell.
     assert deployability_matrix(df, skipped).get(NPU) is None
 
 

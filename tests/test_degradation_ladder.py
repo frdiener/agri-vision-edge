@@ -19,7 +19,7 @@ import pytest
 
 from agri_vision_edge.evaluation.benchmark_report import (
     CPU_REFERENCE_PLATFORM,
-    DEFAULT_NMS,
+    FAST_NMS,
     REFERENCE_PLATFORM,
     REGULAR_NMS,
     degradation_ladder_table,
@@ -28,7 +28,7 @@ from agri_vision_edge.evaluation.benchmark_report import (
 NPU = "frdm-imx93"
 
 CONTROL_COL = f"TFLite fp32 ({REGULAR_NMS})"
-DEPLOYED_COL = f"TFLite fp32 ({DEFAULT_NMS})"
+DEPLOYED_COL = f"TFLite fp32 ({FAST_NMS})"
 NPU_COL = f"int8 NPU ({NPU})"
 
 
@@ -58,16 +58,16 @@ def _chain(
 ):
     """The full deployed chain, one row per rung."""
     rows = [
-        _run(CPU_REFERENCE_PLATFORM, "fp32", "ptq", None, fp32, nms=DEFAULT_NMS),
+        _run(CPU_REFERENCE_PLATFORM, "fp32", "ptq", None, fp32, nms=FAST_NMS),
         _run(
             CPU_REFERENCE_PLATFORM,
             "int8",
             "ptq",
             "per-tensor",
             int8_cpu,
-            nms=DEFAULT_NMS,
+            nms=FAST_NMS,
         ),
-        _run(NPU, "int8", "ptq", "per-tensor", int8_npu, nms=DEFAULT_NMS),
+        _run(NPU, "int8", "ptq", "per-tensor", int8_npu, nms=FAST_NMS),
     ]
     if fp32_control is not None:
         rows.append(
@@ -188,9 +188,9 @@ def test_qat_path_selects_the_qat_int8_exports():
                         "qat",
                         "per-tensor",
                         0.38,
-                        nms=DEFAULT_NMS,
+                        nms=FAST_NMS,
                     ),
-                    _run(NPU, "int8", "qat", "per-tensor", 0.381, nms=DEFAULT_NMS),
+                    _run(NPU, "int8", "qat", "per-tensor", 0.381, nms=FAST_NMS),
                     _run(REFERENCE_PLATFORM, "fp32", "qat", None, 0.41),
                 ]
             ),

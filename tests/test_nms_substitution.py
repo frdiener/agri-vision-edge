@@ -16,9 +16,11 @@ import pytest
 
 from agri_vision_edge.evaluation.benchmark_report import (
     DEFAULT_NMS,
+    FAST_NMS,
     REGULAR_NMS,
     latency_table,
     nms_latency_tradeoff_table,
+    nms_substitution_summary,
     nms_substitution_table,
     sanity_checks,
     scheme_comparison_table,
@@ -67,7 +69,7 @@ def _pair(**kwargs):
     control = kwargs.pop("control")
     return pd.DataFrame(
         [
-            _run(DEFAULT_NMS, **fast, **kwargs),
+            _run(FAST_NMS, **fast, **kwargs),
             _run(REGULAR_NMS, **control, **kwargs),
         ]
     )
@@ -79,7 +81,9 @@ def _pair(**kwargs):
 def test_select_nms_keeps_one_variant():
     df = _pair(fast={"ap": 0.38}, control={"ap": 0.39})
 
-    assert list(select_nms(df, DEFAULT_NMS)["AP"]) == [0.38]
+    assert DEFAULT_NMS == REGULAR_NMS
+    assert list(select_nms(df, FAST_NMS)["AP"]) == [0.38]
+    assert list(select_nms(df)["AP"]) == [0.39]
     assert list(select_nms(df, REGULAR_NMS)["AP"]) == [0.39]
 
 
@@ -89,7 +93,7 @@ def test_select_nms_keeps_runs_that_have_no_variant():
     # comparison the filter exists to make possible.
     df = pd.DataFrame([_run(None, ap=0.40), _run(REGULAR_NMS, ap=0.39)])
 
-    assert list(select_nms(df, DEFAULT_NMS)["AP"]) == [0.40]
+    assert list(select_nms(df, DEFAULT_NMS)["AP"]) == [0.40, 0.39]
 
 
 def test_select_nms_tolerates_frames_without_the_column():
@@ -107,13 +111,13 @@ def test_scheme_comparison_reports_one_row_per_scheme():
     table = scheme_comparison_table(_pair(fast={"ap": 0.38}, control={"ap": 0.39}))
 
     assert len(table) == 1
-    assert table["mAP"].iloc[0] == pytest.approx(0.38)
+    assert table["mAP"].iloc[0] == pytest.approx(0.39)
 
 
 def test_latency_is_not_pooled_across_the_two_graphs():
     df = pd.DataFrame(
         [
-            _run(DEFAULT_NMS, ap=0.38, latency=18.0),
+            _run(FAST_NMS, ap=0.38, latency=18.0),
             _run(REGULAR_NMS, ap=0.39, latency=20.0),
         ]
     )
@@ -142,8 +146,20 @@ def test_the_pair_is_reported_as_one_row_of_differences():
     assert row["dWeed AP"] == pytest.approx(0.0)
 
 
+def test_the_summary_reports_accuracy_deltas_in_percentage_points():
+    df = _pair(
+        fast={"ap": 0.38, "crop": 0.55, "weed": 0.21},
+        control={"ap": 0.39, "crop": 0.57, "weed": 0.21},
+    )
+
+    row = nms_substitution_summary(df).iloc[0]
+
+    assert row[("dAP", "mean")] == pytest.approx(-1.0)
+    assert row[("dCrop AP", "mean")] == pytest.approx(-2.0)
+
+
 def test_unpaired_runs_are_not_reported():
-    df = pd.DataFrame([_run(DEFAULT_NMS, ap=0.38)])
+    df = pd.DataFrame([_run(FAST_NMS, ap=0.38)])
 
     assert nms_substitution_table(df).empty
 
@@ -178,13 +194,13 @@ def test_the_latency_saving_is_net_of_the_single_class_drift():
         [
             pd.DataFrame(
                 [
-                    _run(DEFAULT_NMS, ap=0.38, latency=19.0),
+                    _run(FAST_NMS, ap=0.38, latency=19.0),
                     _run(REGULAR_NMS, ap=0.39, latency=20.0),
                 ]
             ),
             pd.DataFrame(
                 [
-                    _run(DEFAULT_NMS, ap=0.23, classes="sc", latency=20.2),
+                    _run(FAST_NMS, ap=0.23, classes="sc", latency=20.2),
                     _run(REGULAR_NMS, ap=0.23, classes="sc", latency=20.0),
                 ]
             ),
@@ -202,7 +218,7 @@ def test_the_latency_saving_is_net_of_the_single_class_drift():
 def test_no_tradeoff_row_without_the_control():
     df = pd.DataFrame(
         [
-            _run(DEFAULT_NMS, ap=0.38, latency=19.0),
+            _run(FAST_NMS, ap=0.38, latency=19.0),
             _run(REGULAR_NMS, ap=0.39, latency=20.0),
         ]
     )

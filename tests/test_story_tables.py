@@ -14,6 +14,7 @@ import pytest
 from agri_vision_edge.evaluation.benchmark_report import (
     CPU_REFERENCE_PLATFORM,
     DEFAULT_NMS,
+    FAST_NMS,
     REFERENCE_PLATFORM,
     REGULAR_NMS,
     baseline_table,
@@ -21,6 +22,7 @@ from agri_vision_edge.evaluation.benchmark_report import (
     discover_board_pairs,
     preparation_ladder_table,
     qat_reclaim_table,
+    resolution_ladder_table,
     story_ablation_table,
 )
 
@@ -35,7 +37,7 @@ def _row(
     precision="fp32",
     quant="ptq",
     granularity=None,
-    nms=DEFAULT_NMS,
+    nms=FAST_NMS,
     arch="ssd-mn2",
     arch_label="SSD MobileNetV2",
     classes="mc",
@@ -196,7 +198,9 @@ def test_the_float_rung_prices_conversion_at_the_requested_nms():
 def test_int8_rows_are_quoted_against_the_deployed_float_not_each_other():
     # They are alternative exports of the same model, not a chain; quoting
     # per-tensor against per-channel would invent a cost that nobody pays.
-    table = preparation_ladder_table(pd.DataFrame(_chain())).set_index("Stage")
+    table = preparation_ladder_table(
+        pd.DataFrame(_chain()), nms=FAST_NMS
+    ).set_index("Stage")
 
     assert table.loc["INT8 PTQ, per-channel", "MNv2 d"] == pytest.approx(-0.44)
     assert table.loc["INT8 PTQ, per-tensor", "MNv2 d"] == pytest.approx(-1.21)
@@ -204,7 +208,9 @@ def test_int8_rows_are_quoted_against_the_deployed_float_not_each_other():
 
 
 def test_the_ptq_only_table_stops_before_qat():
-    table = preparation_ladder_table(pd.DataFrame(_chain()), include_qat=False)
+    table = preparation_ladder_table(
+        pd.DataFrame(_chain()), include_qat=False, nms=FAST_NMS
+    )
 
     assert not any("QAT" in stage for stage in table["Stage"])
     assert len(table) == 4
@@ -240,7 +246,7 @@ def test_the_ladder_is_not_confused_by_other_input_resolutions():
     other = [dict(row, size="1024", AP=(row["AP"] or 0) + 0.09) for row in _chain()]
     df = pd.DataFrame(_chain() + other)
 
-    table = preparation_ladder_table(df).set_index("Stage")
+    table = preparation_ladder_table(df, nms=FAST_NMS).set_index("Stage")
 
     assert table.loc["Float SavedModel (reference)", "MNv2 AP"] == pytest.approx(39.66)
     assert table.loc[
@@ -251,7 +257,7 @@ def test_the_ladder_is_not_confused_by_other_input_resolutions():
 def test_the_ladder_stays_at_the_reference_configuration():
     df = pd.DataFrame(_chain() + _chain(classes="sc", eval_tiling="tiled"))
 
-    table = preparation_ladder_table(df).set_index("Stage")
+    table = preparation_ladder_table(df, nms=FAST_NMS).set_index("Stage")
 
     assert table.loc["Float SavedModel (reference)", "MNv2 AP"] == pytest.approx(39.66)
 
@@ -260,7 +266,9 @@ def test_the_ladder_stays_at_the_reference_configuration():
 
 
 def test_qat_reclaim_expresses_the_repair_as_a_share_of_the_deficit():
-    table = qat_reclaim_table(pd.DataFrame(_chain())).set_index("Granularity")
+    table = qat_reclaim_table(
+        pd.DataFrame(_chain()), nms=FAST_NMS
+    ).set_index("Granularity")
 
     per_tensor = table.loc["per-tensor"]
     assert per_tensor["PTQ cost"] == pytest.approx(-1.21)
@@ -276,7 +284,9 @@ def test_no_reclaim_percentage_where_there_was_no_deficit():
         if row["granularity"] == "per-channel" and row["quant"] == "ptq":
             row["AP"] = 0.3889  # -0.01 against the float model
 
-    table = qat_reclaim_table(pd.DataFrame(rows)).set_index("Granularity")
+    table = qat_reclaim_table(
+        pd.DataFrame(rows), nms=FAST_NMS
+    ).set_index("Granularity")
 
     assert pd.isna(table.loc["per-channel", "Reclaimed %"])
 
@@ -315,11 +325,16 @@ def test_speedup_compares_the_same_board_with_the_delegate_off():
         ]
     )
 
-    row = device_latency_table(df).iloc[0]
+    row = device_latency_table(df, nms=FAST_NMS).iloc[0]
 
     assert row["Speedup"] == pytest.approx(3.6, abs=0.05)
     assert row["NPU FPS"] == pytest.approx(33.6, abs=0.1)
-    assert row["dAP"] == pytest.approx(0.001)
+    assert row["AP CPU"] == pytest.approx(37.7)
+    assert row["AP NPU"] == pytest.approx(37.8)
+    assert row["dAP"] == pytest.approx(0.1)
+
+    raw = device_latency_table(df, nms=FAST_NMS, percent=False).iloc[0]
+    assert raw["dAP"] == pytest.approx(0.001)
 
 
 def test_a_broken_delegated_run_never_reaches_the_latency_table():
@@ -342,8 +357,21 @@ def test_a_broken_delegated_run_never_reaches_the_latency_table():
         ]
     )
 
-    assert device_latency_table(df).empty
-    assert not device_latency_table(df, deployable_only=False).empty
+    assert device_latency_table(df, nms=FAST_NMS).empty
+    assert not device_latency_table(
+        df, deployable_only=False, nms=FAST_NMS
+    ).empty
+
+
+def test_resolution_ladder_reports_accuracy_in_percentage_points():
+    low = _row(CPU_REFERENCE_PLATFORM, ap=0.40, nms=DEFAULT_NMS)
+    high = dict(_row(CPU_REFERENCE_PLATFORM, ap=0.50, nms=DEFAULT_NMS), size="512")
+
+    table = resolution_ladder_table(pd.DataFrame([low, high]))
+
+    assert list(table["mAP"]) == pytest.approx([40.0, 50.0])
+    raw = resolution_ladder_table(pd.DataFrame([low, high]), percent=False)
+    assert list(raw["mAP"]) == pytest.approx([0.4, 0.5])
 
 
 # ------------------------------------------------------------ step 6
