@@ -5,7 +5,6 @@ from dataclasses import asdict, dataclass
 
 @dataclass
 class CocoMetrics:
-
     #
     # Average precision
     #

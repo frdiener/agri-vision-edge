@@ -105,7 +105,9 @@ def export_scoring_saved_model(
 
     checkpoint = tf.train.latest_checkpoint(str(stage_dir / "checkpoint"))
     if not checkpoint:
-        raise FileNotFoundError(f"No checkpoint to export in {stage_dir / 'checkpoint'}")
+        raise FileNotFoundError(
+            f"No checkpoint to export in {stage_dir / 'checkpoint'}"
+        )
 
     ckpt = tf.train.Checkpoint(model=detection_model)
     status = ckpt.restore(checkpoint).expect_partial()

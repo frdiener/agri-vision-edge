@@ -44,9 +44,7 @@ class TrainerState:
     # the path the previous one wrote).
     best_checkpoint_path: str | None = None
 
-    metrics_history: list[dict] = field(
-        default_factory=list
-    )
+    metrics_history: list[dict] = field(default_factory=list)
 
     # Persistence
 
@@ -55,10 +53,7 @@ class TrainerState:
     _NEG_INF_KEYS = ("best_metric", "es_ref", "plateau_ref")
 
     def to_mapping(self) -> dict:
-        data = {
-            f.name: getattr(self, f.name)
-            for f in fields(self)
-        }
+        data = {f.name: getattr(self, f.name) for f in fields(self)}
         for key in self._NEG_INF_KEYS:
             value = data[key]
             data[key] = None if value == -np.inf else float(value)
@@ -74,9 +69,7 @@ class TrainerState:
         return cls(**{k: v for k, v in data.items() if k in known})
 
     def save(self, path) -> None:
-        Path(path).write_text(
-            json.dumps(self.to_mapping(), indent=2)
-        )
+        Path(path).write_text(json.dumps(self.to_mapping(), indent=2))
 
     @classmethod
     def load(cls, path, train_dir=None, history_path=None) -> TrainerState:
@@ -92,9 +85,7 @@ class TrainerState:
             # TF checkpoints are a prefix, not a file; `.index` is the one
             # component guaranteed to exist under it.
             state.best_checkpoint_path = (
-                str(rebased)
-                if rebased.with_suffix(".index").exists()
-                else None
+                str(rebased) if rebased.with_suffix(".index").exists() else None
             )
 
         if history_path is not None and Path(history_path).is_file():

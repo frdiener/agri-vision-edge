@@ -23,7 +23,6 @@ def capture_git_metadata(
     }
 
 
-
 def is_git_repository(
     repo_dir: str | Path,
 ) -> bool:
@@ -96,7 +95,6 @@ def get_git_remote_origin(
 
     except Exception:
         return None
-
 
 
 def run_git_command(

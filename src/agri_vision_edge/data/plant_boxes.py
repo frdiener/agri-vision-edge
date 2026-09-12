@@ -33,13 +33,9 @@ def plant_boxes_from_masks(
     boxes: list[dict] = []
 
     for raw_label in (1, 2, 3, 4):
-
-        instance_ids = np.unique(
-            plant_instances[semantics == raw_label]
-        )
+        instance_ids = np.unique(plant_instances[semantics == raw_label])
 
         for instance_id in instance_ids:
-
             if instance_id == 0:
                 continue
 

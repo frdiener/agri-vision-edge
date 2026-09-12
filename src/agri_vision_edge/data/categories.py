@@ -19,13 +19,7 @@ def build_category_map(
     Build category_id -> category_name map.
     """
 
-    return {
-
-        category["id"]:
-            category["name"]
-
-        for category in categories
-    }
+    return {category["id"]: category["name"] for category in categories}
 
 
 def build_class_names(
@@ -35,10 +29,4 @@ def build_class_names(
     Build TFRecord-compatible class name map.
     """
 
-    return {
-
-        category["id"]:
-            category["name"].encode("utf-8")
-
-        for category in categories
-    }
+    return {category["id"]: category["name"].encode("utf-8") for category in categories}

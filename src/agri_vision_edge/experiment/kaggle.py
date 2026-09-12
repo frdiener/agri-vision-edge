@@ -34,10 +34,7 @@ EXCLUDED_ENV_KEYS: set[str] = {
 def is_kaggle_environment() -> bool:
     """Return whether Kaggle runtime indicators are present."""
 
-    return (
-        "KAGGLE_KERNEL_RUN_TYPE" in os.environ
-        or "KAGGLE_URL_BASE" in os.environ
-    )
+    return "KAGGLE_KERNEL_RUN_TYPE" in os.environ or "KAGGLE_URL_BASE" in os.environ
 
 
 def capture_kaggle_metadata() -> dict[str, Any] | None:
@@ -49,7 +46,6 @@ def capture_kaggle_metadata() -> dict[str, Any] | None:
     metadata: dict[str, Any] = {}
 
     for key in KAGGLE_ENV_KEYS:
-
         if key in EXCLUDED_ENV_KEYS:
             continue
 

@@ -35,13 +35,19 @@ EXPORTS = {
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifacts", type=Path, default=REPO_ROOT / "artifacts" / "tf")
-    parser.add_argument("--bundle", type=Path, default=REPO_ROOT / "datasets" / "test-bundle")
+    parser.add_argument(
+        "--artifacts", type=Path, default=REPO_ROOT / "artifacts" / "tf"
+    )
+    parser.add_argument(
+        "--bundle", type=Path, default=REPO_ROOT / "datasets" / "test-bundle"
+    )
     parser.add_argument("--results", type=Path, default=REPO_ROOT / "benchmark_results")
     parser.add_argument("--stages", nargs="+", default=list(STAGE_TOKENS))
     parser.add_argument("--variant", nargs="+", default=None)
     parser.add_argument("--exports", nargs="+", default=list(EXPORTS))
-    parser.add_argument("--eval-tiling", default="untiled", choices=["untiled", "tiled"])
+    parser.add_argument(
+        "--eval-tiling", default="untiled", choices=["untiled", "tiled"]
+    )
     parser.add_argument("--override", action="store_true")
     args = parser.parse_args(argv)
 

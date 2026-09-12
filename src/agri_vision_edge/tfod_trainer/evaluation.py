@@ -32,8 +32,7 @@ def create_eval_dataset(
 
     dataset = inputs.eval_input(
         eval_config=configs["eval_config"],
-        eval_input_config=
-            configs["eval_input_configs"][0],
+        eval_input_config=configs["eval_input_configs"][0],
         model_config=configs["model"],
         model=detection_model,
     )
@@ -41,9 +40,7 @@ def create_eval_dataset(
     if cache:
         dataset = dataset.cache()
 
-    dataset = dataset.prefetch(
-        tf.data.AUTOTUNE
-    )
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
     return dataset
 
@@ -77,25 +74,17 @@ def _eval_step(
     Compiled evaluation step.
     """
 
-    losses_dict, prediction_dict = (
-        compute_losses_and_predictions_dicts(
-            detection_model,
-            features,
-            labels_unstacked,
-            training_step=None,
-            add_regularization_loss=
-                add_regularization_loss,
-        )
+    losses_dict, prediction_dict = compute_losses_and_predictions_dicts(
+        detection_model,
+        features,
+        labels_unstacked,
+        training_step=None,
+        add_regularization_loss=add_regularization_loss,
     )
 
-    prediction_dict = (
-        detection_model.postprocess(
-            prediction_dict,
-            features[
-                fields.InputDataFields
-                .true_image_shape
-            ],
-        )
+    prediction_dict = detection_model.postprocess(
+        prediction_dict,
+        features[fields.InputDataFields.true_image_shape],
     )
 
     return (
@@ -134,22 +123,16 @@ def evaluate(
     losses = collections.defaultdict(list)
 
     for features, labels in eval_dataset:
-
-        labels_unstacked = (
-            model_lib.unstack_batch(
-                labels,
-                unpad_groundtruth_tensors=
-                    runtime.unpad_groundtruth_tensors,
-            )
+        labels_unstacked = model_lib.unstack_batch(
+            labels,
+            unpad_groundtruth_tensors=runtime.unpad_groundtruth_tensors,
         )
 
-        losses_dict, prediction_dict = (
-            _eval_step(
-                detection_model,
-                features,
-                labels_unstacked,
-                runtime.add_regularization_loss,
-            )
+        losses_dict, prediction_dict = _eval_step(
+            detection_model,
+            features,
+            labels_unstacked,
+            runtime.add_regularization_loss,
         )
 
         eval_dict, _ = prepare_eval_dict(
@@ -168,14 +151,10 @@ def evaluate(
         if not runtime.eval_ignore_partials:
             crowd_key = fields.InputDataFields.groundtruth_is_crowd
             if crowd_key in eval_dict:
-                eval_dict[crowd_key] = tf.zeros_like(
-                    eval_dict[crowd_key]
-                )
+                eval_dict[crowd_key] = tf.zeros_like(eval_dict[crowd_key])
 
         for evaluator in runtime.evaluators:
-            evaluator.add_eval_dict(
-                eval_dict
-            )
+            evaluator.add_eval_dict(eval_dict)
 
         for k, v in losses_dict.items():
             losses[k].append(v)
@@ -183,14 +162,10 @@ def evaluate(
     metrics = {}
 
     for evaluator in runtime.evaluators:
-        metrics.update(
-            evaluator.evaluate()
-        )
+        metrics.update(evaluator.evaluate())
 
     for name, values in losses.items():
-        metrics[name] = (
-            tf.reduce_mean(values)
-        )
+        metrics[name] = tf.reduce_mean(values)
 
     # Restore training mode for the subsequent train steps (eager_train_step
     # would set it too, but keep train/eval state symmetric).

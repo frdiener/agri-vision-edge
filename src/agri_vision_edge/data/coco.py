@@ -107,7 +107,6 @@ def export_coco_annotations(
         indices,
         start=1,
     ):
-
         sample = dataset[dataset_index]
 
         image = np.array(sample["image"])
@@ -116,36 +115,24 @@ def export_coco_annotations(
 
         image_name = sample["image_name"]
 
-        images.append({
-
-            "id":
-                int(image_id),
-
-            "file_name":
-                str(image_name),
-
-            "width":
-                int(w),
-
-            "height":
-                int(h),
-        })
+        images.append(
+            {
+                "id": int(image_id),
+                "file_name": str(image_name),
+                "width": int(w),
+                "height": int(h),
+            }
+        )
 
         for bbox in sample["plant_bboxes"]:
-
-            source_label = int(
-                bbox["label"]
-            )
+            source_label = int(bbox["label"])
 
             #
             # Skip labels not exported by this
             # dataset definition
             #
 
-            if (
-                source_label
-                not in dataset_definition.label_mapping
-            ):
+            if source_label not in dataset_definition.label_mapping:
                 continue
 
             is_partial = bool(bbox.get("is_partial", False))
@@ -159,46 +146,21 @@ def export_coco_annotations(
             if is_partial and not include_partials:
                 continue
 
-            target_label = (
-                dataset_definition.label_mapping[
-                    source_label
-                ]
-            )
+            target_label = dataset_definition.label_mapping[source_label]
 
-            xyxy = phenobench_bbox_to_xyxy(
-                bbox
-            )
+            xyxy = phenobench_bbox_to_xyxy(bbox)
 
-            coco_bbox = xyxy_to_coco(
-                xyxy
-            )
+            coco_bbox = xyxy_to_coco(xyxy)
 
-            area = (
-                coco_bbox[2]
-                * coco_bbox[3]
-            )
+            area = coco_bbox[2] * coco_bbox[3]
 
             annotation = {
-
-                "id":
-                    int(annotation_id),
-
-                "image_id":
-                    int(image_id),
-
-                "category_id":
-                    int(target_label),
-
-                "bbox": [
-                    float(v)
-                    for v in coco_bbox
-                ],
-
-                "area":
-                    float(area),
-
-                "iscrowd":
-                    0,
+                "id": int(annotation_id),
+                "image_id": int(image_id),
+                "category_id": int(target_label),
+                "bbox": [float(v) for v in coco_bbox],
+                "area": float(area),
+                "iscrowd": 0,
             }
 
             if is_partial:
@@ -216,37 +178,22 @@ def export_coco_annotations(
             annotation_id += 1
 
     coco = {
-
-        "images":
-            images,
-
-        "annotations":
-            annotations,
-
-        "categories":
-            dataset_definition.categories,
+        "images": images,
+        "annotations": annotations,
+        "categories": dataset_definition.categories,
     }
 
     with open(target, "w") as f:
-
         json.dump(
             coco,
             f,
             indent=2,
         )
 
-    print(
-        f"Wrote COCO annotations: {target}"
-    )
+    print(f"Wrote COCO annotations: {target}")
 
     return {
-
-        "images":
-            len(images),
-
-        "annotations":
-            len(annotations),
-
-        "categories":
-            len(dataset_definition.categories),
+        "images": len(images),
+        "annotations": len(annotations),
+        "categories": len(dataset_definition.categories),
     }

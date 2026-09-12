@@ -219,16 +219,12 @@ def annotate_class_metrics(
 
     plant_scores = per_class[: len(UPSTREAM_CLASS_NAMES)]
 
-    ap_per_class = dict(
-        zip(UPSTREAM_CLASS_NAMES, plant_scores, strict=False)
-    )
+    ap_per_class = dict(zip(UPSTREAM_CLASS_NAMES, plant_scores, strict=False))
 
-    partial_scores = per_class[len(UPSTREAM_CLASS_NAMES):]
+    partial_scores = per_class[len(UPSTREAM_CLASS_NAMES) :]
 
     comparable = [
-        ap_per_class[name]
-        for name in predicted_classes
-        if name in ap_per_class
+        ap_per_class[name] for name in predicted_classes if name in ap_per_class
     ]
 
     results["ap_per_class"] = ap_per_class
@@ -270,10 +266,7 @@ def _detect_image_size(image_index: dict[int, dict]) -> tuple[int, int]:
     evaluated faithfully in a single pass.
     """
 
-    sizes = {
-        (int(info["width"]), int(info["height"]))
-        for info in image_index.values()
-    }
+    sizes = {(int(info["width"]), int(info["height"])) for info in image_index.values()}
 
     if len(sizes) != 1:
         raise ValueError(
@@ -402,9 +395,7 @@ def _stage(
             info,
             label_map,
         )
-        (pred_dir / "plant_bboxes" / f"{stem}.txt").write_text(
-            "\n".join(lines)
-        )
+        (pred_dir / "plant_bboxes" / f"{stem}.txt").write_text("\n".join(lines))
 
     return staged_root, pred_dir, export_dir
 

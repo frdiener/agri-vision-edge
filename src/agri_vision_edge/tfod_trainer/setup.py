@@ -154,9 +154,7 @@ def extract_lr_params(optimizer_config):
     return (0.0, 0.0, 0)
 
 
-class _VariableLearningRate(
-    tf.keras.optimizers.schedules.LearningRateSchedule
-):
+class _VariableLearningRate(tf.keras.optimizers.schedules.LearningRateSchedule):
     """Expose a mutable variable as a step-independent Keras learning-rate schedule."""
 
     def __init__(self, var):
@@ -391,8 +389,7 @@ def restore_weights(
         runtime.optimizer.shadow_copy(detection_model)
 
     resume_from = (
-        runtime.last_manager.latest_checkpoint
-        or runtime.manager.latest_checkpoint
+        runtime.last_manager.latest_checkpoint or runtime.manager.latest_checkpoint
     )
     if resume_from:
         # Build the variables before restoring. `ckpt.restore` is object-based

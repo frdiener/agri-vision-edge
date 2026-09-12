@@ -84,9 +84,9 @@ def partial_prediction_mask(
 
     n_pred = pred_boxes_xywh.shape[0]
 
-    partial_gt_boxes_xywh = np.asarray(
-        partial_gt_boxes_xywh, dtype=np.float64
-    ).reshape(-1, 4)
+    partial_gt_boxes_xywh = np.asarray(partial_gt_boxes_xywh, dtype=np.float64).reshape(
+        -1, 4
+    )
 
     if n_pred == 0 or partial_gt_boxes_xywh.shape[0] == 0:
         return np.zeros((n_pred,), dtype=bool)
@@ -163,18 +163,16 @@ def filter_predictions_against_partials(
 
     partials_by_image: dict[object, list[list[float]]] = {}
     for annotation in partial_annotations:
-        partials_by_image.setdefault(
-            annotation["image_id"], []
-        ).append(annotation["bbox"])
+        partials_by_image.setdefault(annotation["image_id"], []).append(
+            annotation["bbox"]
+        )
 
     kept: list[dict] = []
 
     # Group predictions per image so the mask is computed once per image.
     preds_by_image: dict[object, list[dict]] = {}
     for prediction in predictions:
-        preds_by_image.setdefault(
-            prediction["image_id"], []
-        ).append(prediction)
+        preds_by_image.setdefault(prediction["image_id"], []).append(prediction)
 
     for image_id, image_preds in preds_by_image.items():
         image_partials = partials_by_image.get(image_id)

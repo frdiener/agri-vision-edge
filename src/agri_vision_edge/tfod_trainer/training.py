@@ -50,10 +50,8 @@ def make_train_step(runtime, detection_model):
             runtime.unpad_groundtruth_tensors,
             runtime.optimizer,
             training_step=runtime.global_step,
-            add_regularization_loss=
-                runtime.add_regularization_loss,
-            clip_gradients_value=
-                runtime.clip_gradients_value,
+            add_regularization_loss=runtime.add_regularization_loss,
+            clip_gradients_value=runtime.clip_gradients_value,
             num_replicas=1,
         )
 
@@ -69,12 +67,9 @@ def create_train_dataset(
     configs,
 ):
     return inputs.train_input(
-        train_config=
-            configs["train_config"],
-        train_input_config=
-            configs["train_input_config"],
-        model_config=
-            configs["model"],
+        train_config=configs["train_config"],
+        train_input_config=configs["train_input_config"],
+        model_config=configs["model"],
         model=detection_model,
     ).repeat()
 
@@ -319,8 +314,7 @@ def assert_finite_model(detection_model, step):
     bad = [
         v.name
         for v in detection_model.variables
-        if v.dtype.is_floating
-        and not bool(tf.reduce_all(tf.math.is_finite(v)))
+        if v.dtype.is_floating and not bool(tf.reduce_all(tf.math.is_finite(v)))
     ]
     if bad:
         raise FloatingPointError(
@@ -423,14 +417,11 @@ def train(
     # eval below, skip this purely-informational (unscored) eval to avoid
     # evaluating the same initial weights twice.
     if graph_modified and not trainer_cfg.control.initial_eval_checkpoint:
-        print(
-            "\nEvaluating initial modified "
-            "configuration..."
-        )
+        print("\nEvaluating initial modified configuration...")
         eval_input = inputs.eval_input(
-            eval_config=runtime.configs['eval_config'],
-            eval_input_config=runtime.configs['eval_input_config'],
-            model_config=runtime.configs['model'],
+            eval_config=runtime.configs["eval_config"],
+            eval_input_config=runtime.configs["eval_input_config"],
+            model_config=runtime.configs["model"],
             model=detection_model,
         )
         eager_eval_loop(
@@ -452,9 +443,7 @@ def train(
     if trainer_cfg.control.initial_eval_checkpoint and not resumed:
         current_step = int(runtime.global_step.numpy())
 
-        print(
-            "\nEvaluating initial weights to seed the best-metric baseline..."
-        )
+        print("\nEvaluating initial weights to seed the best-metric baseline...")
 
         metrics = run_evaluation(detection_model, runtime)
 
@@ -470,9 +459,7 @@ def train(
                 state.metrics_history,
             )
 
-        metric_value = float(
-            metrics[trainer_cfg.control.metric_name]
-        )
+        metric_value = float(metrics[trainer_cfg.control.metric_name])
 
         save_best_checkpoint(
             runtime,
@@ -496,18 +483,14 @@ def train(
 
     control = trainer_cfg.control
 
-    num_steps = int(
-        runtime.configs["train_config"].num_steps
-    )
+    num_steps = int(runtime.configs["train_config"].num_steps)
 
     # Resolve the evaluation cadence and training horizon. With a known
     # steps_per_epoch we run on an epoch cadence (eval every `eval_every_epochs`
     # epochs) and honour the optional `max_epochs` cap; otherwise we fall back to
     # the legacy step cadence (`log_every`).
     if steps_per_epoch and steps_per_epoch > 0:
-        eval_interval = max(
-            1, round(control.eval_every_epochs * steps_per_epoch)
-        )
+        eval_interval = max(1, round(control.eval_every_epochs * steps_per_epoch))
         # `max_epochs`, when set, OVERRIDES the pipeline's num_steps entirely:
         # the horizon becomes exactly that many epochs, so num_steps can stay at
         # its large default and be ignored. Without it, num_steps is the horizon.
@@ -556,7 +539,6 @@ def train(
         int(runtime.global_step.numpy()),
         train_steps,
     ):
-
         start = time.time()
 
         losses = train_step_fn(
@@ -565,9 +547,7 @@ def train(
 
         duration = time.time() - start
 
-        current_step = int(
-            runtime.global_step.numpy()
-        )
+        current_step = int(runtime.global_step.numpy())
 
         # Warmup ramp for the plateau schedule (no-op otherwise). Runs every
         # step so the LR variable tracks the ramp before plateau reductions.
@@ -582,21 +562,13 @@ def train(
         # appears, before it is evaluated, checkpointed or exported.
         assert_finite_model(detection_model, current_step)
 
-        train_metrics = (
-            metrics_to_float(losses)
+        train_metrics = metrics_to_float(losses)
+
+        train_metrics["learning_rate"] = float(
+            current_learning_rate(runtime.learning_rate)
         )
 
-        train_metrics[
-            "learning_rate"
-        ] = float(
-            current_learning_rate(
-                runtime.learning_rate
-            )
-        )
-
-        train_metrics[
-            "steps_per_sec"
-        ] = 1.0 / duration
+        train_metrics["steps_per_sec"] = 1.0 / duration
 
         # Learning rate at scientific precision so plateau reductions down to
         # `lr_plateau_min_lr` (e.g. 1e-6) stay legible; other scalars at 4dp.
@@ -609,9 +581,7 @@ def train(
         # and cooldown counters when enabled.
         best_tag = trainer_cfg.control.metric_name.split("/")[-1]
         best_str = (
-            "n/a"
-            if state.best_metric == float("-inf")
-            else f"{state.best_metric:.4f}"
+            "n/a" if state.best_metric == float("-inf") else f"{state.best_metric:.4f}"
         )
         # Display "off" when zero disables early stopping.
         es_patience = trainer_cfg.control.early_stopping_patience
@@ -635,10 +605,7 @@ def train(
         step_label = f"Step {current_step}"
         if steps_per_epoch and steps_per_epoch > 0:
             step_label += f" (epoch {current_step / steps_per_epoch:.2f})"
-        print(
-            step_label + ": "
-            + " | ".join(metric_parts + sched_parts)
-        )
+        print(step_label + ": " + " | ".join(metric_parts + sched_parts))
 
         # Evaluate (swapping EMA weights in/out when enabled, matching
         # object_detection.model_lib_v2.train_loop).
@@ -661,11 +628,7 @@ def train(
                 state.metrics_history,
             )
 
-        metric_value = float(
-            metrics[
-                trainer_cfg.control.metric_name
-            ]
-        )
+        metric_value = float(metrics[trainer_cfg.control.metric_name])
 
         # 1) Checkpoint every strict improvement, including gains below the
         #    stopping-rule noise threshold.
@@ -684,10 +647,7 @@ def train(
 
         # 2) Early-stopping counter, delta-gated against its own reference so
         #    sub-noise improvements don't keep the run alive indefinitely.
-        if (
-            metric_value
-            > state.es_ref + trainer_cfg.control.early_stopping_min_delta
-        ):
+        if metric_value > state.es_ref + trainer_cfg.control.early_stopping_min_delta:
             state.es_ref = metric_value
             state.patience_counter = 0
         else:
@@ -757,8 +717,7 @@ def train(
         if (
             not stop_reason
             and trainer_cfg.control.early_stopping_patience
-            and state.patience_counter
-            >= trainer_cfg.control.early_stopping_patience
+            and state.patience_counter >= trainer_cfg.control.early_stopping_patience
         ):
             stop_reason = (
                 f"Stopping at step {current_step}: early-stopping patience "

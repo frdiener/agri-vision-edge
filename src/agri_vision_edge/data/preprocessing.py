@@ -67,13 +67,14 @@ def resize_image_and_boxes(
     boxes_resized = []
 
     for xmin, ymin, xmax, ymax in boxes:
-
-        boxes_resized.append([
-            xmin * scale_x,
-            ymin * scale_y,
-            xmax * scale_x,
-            ymax * scale_y,
-        ])
+        boxes_resized.append(
+            [
+                xmin * scale_x,
+                ymin * scale_y,
+                xmax * scale_x,
+                ymax * scale_y,
+            ]
+        )
 
     return image_resized, boxes_resized
 
@@ -101,13 +102,14 @@ def normalize_boxes(
     normalized = []
 
     for xmin, ymin, xmax, ymax in boxes:
-
-        normalized.append([
-            xmin / image_size,
-            ymin / image_size,
-            xmax / image_size,
-            ymax / image_size,
-        ])
+        normalized.append(
+            [
+                xmin / image_size,
+                ymin / image_size,
+                xmax / image_size,
+                ymax / image_size,
+            ]
+        )
 
     return normalized
 

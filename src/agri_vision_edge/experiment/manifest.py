@@ -20,9 +20,7 @@ DEFAULT_STRUCTURE = {
 
 
 def utc_now_iso() -> str:
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -32,16 +30,12 @@ class ExperimentManifest:
     name: str
     task: str | None = None
 
-    experiment_id: str = field(
-        default_factory=lambda: str(uuid.uuid4())
-    )
+    experiment_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     parent_experiment_id: str | None = None
 
     data: dict[str, Any] = field(
-        default_factory=lambda: copy.deepcopy(
-            DEFAULT_STRUCTURE
-        )
+        default_factory=lambda: copy.deepcopy(DEFAULT_STRUCTURE)
     )
 
     # Initialization
@@ -115,9 +109,7 @@ class ExperimentManifest:
         """Add a stage snapshot, refusing duplicate names."""
 
         if stage_name in self.data["stages"]:
-            raise ValueError(
-                f"Stage already exists: {stage_name}"
-            )
+            raise ValueError(f"Stage already exists: {stage_name}")
 
         self.data["stages"][stage_name] = {
             "created_at_utc": utc_now_iso(),
@@ -139,9 +131,7 @@ class ExperimentManifest:
         notes: dict[str, Any] | None = None,
     ) -> None:
         if stage_name not in self.data["stages"]:
-            raise ValueError(
-                f"Unknown stage: {stage_name}"
-            )
+            raise ValueError(f"Unknown stage: {stage_name}")
 
         stage = self.data["stages"][stage_name]
 
@@ -193,10 +183,7 @@ class ExperimentManifest:
         if description:
             artifact["description"] = description
 
-        self.data["artifacts"].setdefault(
-            "files",
-            []
-        ).append(artifact)
+        self.data["artifacts"].setdefault("files", []).append(artifact)
 
     # Merge support
 
@@ -206,33 +193,17 @@ class ExperimentManifest:
     ) -> None:
         """Merge another manifest, refusing duplicate stage names."""
 
-        for stage_name, stage_data in other.data[
-            "stages"
-        ].items():
-
+        for stage_name, stage_data in other.data["stages"].items():
             if stage_name in self.data["stages"]:
-                raise ValueError(
-                    f"Duplicate stage during merge: "
-                    f"{stage_name}"
-                )
+                raise ValueError(f"Duplicate stage during merge: {stage_name}")
 
-            self.data["stages"][
-                stage_name
-            ] = stage_data
+            self.data["stages"][stage_name] = stage_data
 
-        self.data["artifacts"].setdefault(
-            "files",
-            []
-        ).extend(
-            other.data["artifacts"].get(
-                "files",
-                []
-            )
+        self.data["artifacts"].setdefault("files", []).extend(
+            other.data["artifacts"].get("files", [])
         )
 
-        self.data["results"].update(
-            other.data["results"]
-        )
+        self.data["results"].update(other.data["results"])
 
     # Serialization
 
@@ -281,9 +252,7 @@ class ExperimentManifest:
                 "experiment_id",
                 str(uuid.uuid4()),
             ),
-            parent_experiment_id=metadata.get(
-                "parent_experiment_id"
-            ),
+            parent_experiment_id=metadata.get("parent_experiment_id"),
         )
 
         manifest.data = data
@@ -298,7 +267,4 @@ class ExperimentManifest:
     ) -> None:
 
         if section not in DEFAULT_STRUCTURE:
-            raise ValueError(
-                f"Unknown manifest section: "
-                f"{section}"
-            )
+            raise ValueError(f"Unknown manifest section: {section}")

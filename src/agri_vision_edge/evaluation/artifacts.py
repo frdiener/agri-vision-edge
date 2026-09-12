@@ -23,9 +23,7 @@ def save_benchmark_artifacts(
     delegate,
 ):
 
-    output_dir = Path(
-        output_dir
-    )
+    output_dir = Path(output_dir)
 
     output_dir.mkdir(
         parents=True,
@@ -34,15 +32,12 @@ def save_benchmark_artifacts(
 
     save_json(
         benchmark_result.predictions,
-        output_dir /
-        "predictions.json",
+        output_dir / "predictions.json",
     )
 
     # Record prediction integrity because pycocotools can treat non-finite boxes
     # as matches at every IoU threshold and report inflated AP.
-    integrity = prediction_integrity(
-        benchmark_result.predictions
-    )
+    integrity = prediction_integrity(benchmark_result.predictions)
 
     if integrity.corrupt:
         print(
@@ -55,12 +50,8 @@ def save_benchmark_artifacts(
     from agri_vision_edge.evaluation.benchmark import latency_summary
 
     save_json(
-        latency_summary(
-            benchmark_result
-            .latencies_ms
-        ),
-        output_dir /
-        "latency.json",
+        latency_summary(benchmark_result.latencies_ms),
+        output_dir / "latency.json",
     )
 
     # Record the effective delegate so silent CPU fallbacks remain distinguishable
@@ -69,41 +60,23 @@ def save_benchmark_artifacts(
 
     save_json(
         {
-            "model":
-                model_name,
-
+            "model": model_name,
             # Kept under the original key for backwards compatibility with
             # already-collected results.
-            "delegate":
-                delegate,
-
-            "delegate_requested":
-                delegate,
-
-            "delegate_active":
-                active_delegate,
-
-            "backend":
-                "delegate" if active_delegate else "cpu",
-
+            "delegate": delegate,
+            "delegate_requested": delegate,
+            "delegate_active": active_delegate,
+            "backend": "delegate" if active_delegate else "cpu",
             # Which stage of the pipeline produced these predictions. The
             # SavedModel reference runs on the host and its latency is not
             # comparable to a device figure, so the report needs to tell the
             # rungs apart by more than the results directory name.
-            "format":
-                getattr(runtime, "runtime_format", "tflite"),
-
-            "predictions_integrity":
-                integrity.to_dict(),
-
-            "input_details":
-                runtime.input_details,
-
-            "output_details":
-                runtime.output_details,
+            "format": getattr(runtime, "runtime_format", "tflite"),
+            "predictions_integrity": integrity.to_dict(),
+            "input_details": runtime.input_details,
+            "output_details": runtime.output_details,
         },
-        output_dir /
-        "runtime.json",
+        output_dir / "runtime.json",
     )
 
 
@@ -123,10 +96,8 @@ def save_failure_artifact(
     save_json(
         {
             "status": "failed",
-            "exception":
-                type(exception).__name__,
-            "message":
-                str(exception),
+            "exception": type(exception).__name__,
+            "message": str(exception),
         },
         output_dir / "error.json",
     )

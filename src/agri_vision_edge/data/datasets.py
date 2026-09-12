@@ -12,9 +12,11 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class DatasetDefinition:
     """COCO categories and their upstream label mapping."""
+
     name: str
     categories: list[dict]
     label_mapping: dict[int, int]
+
 
 #
 # Full multiclass detection

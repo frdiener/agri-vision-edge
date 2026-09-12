@@ -130,9 +130,7 @@ class ScoreSweep:
 
         with np.errstate(divide="ignore", invalid="ignore"):
             precision = np.where(predicted > 0, tp / predicted, np.nan)
-            recall = (
-                np.full(tp.shape, np.nan) if n_gt == 0 else tp / float(n_gt)
-            )
+            recall = np.full(tp.shape, np.nan) if n_gt == 0 else tp / float(n_gt)
 
             denominator = precision + recall
             f1 = np.where(
@@ -176,10 +174,7 @@ class ScoreSweep:
         # would discard the point that keeps every detection.
         if np.isfinite(self.min_score):
             floor_index = max(
-                int(
-                    np.searchsorted(self.score_grid, self.min_score, side="right")
-                )
-                - 1,
+                int(np.searchsorted(self.score_grid, self.min_score, side="right")) - 1,
                 0,
             )
             f1[:floor_index] = np.nan
@@ -253,9 +248,7 @@ class ScoreSweep:
         grid = data["score_grid"]
 
         return cls(
-            score_grid=np.linspace(
-                grid["start"], grid["stop"], grid["num"]
-            ),
+            score_grid=np.linspace(grid["start"], grid["stop"], grid["num"]),
             iou_thresholds=tuple(data["iou_thresholds"]),
             per_class={
                 name: ClassSweep(
@@ -378,8 +371,7 @@ def compute_score_sweep(
     n_images = len(evaluator.params.imgIds)
 
     id_to_name = {
-        category["id"]: category["name"]
-        for category in coco_gt.loadCats(category_ids)
+        category["id"]: category["name"] for category in coco_gt.loadCats(category_ids)
     }
 
     per_class: dict[str, ClassSweep] = {}
@@ -566,4 +558,3 @@ __all__ = [
     "save_score_sweep",
     "score_sweep_frame",
 ]
-

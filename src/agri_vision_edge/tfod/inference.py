@@ -19,6 +19,7 @@ PathLike = str | Path
 
 # Loading utilities
 
+
 def load_saved_model(model_dir: PathLike):
     """Load a TFOD SavedModel detection function."""
     return tf.saved_model.load(str(model_dir))
@@ -34,6 +35,7 @@ def load_label_map(label_map_path: PathLike) -> dict:
 
 # Preprocessing
 
+
 def preprocess_image(
     image: np.ndarray,
     image_size: int | None = 320,
@@ -47,6 +49,7 @@ def preprocess_image(
 
 # Inference
 
+
 def run_inference(
     detect_fn,
     image: np.ndarray,
@@ -58,6 +61,7 @@ def run_inference(
 
 
 # Postprocessing
+
 
 def apply_nms(
     detections: dict[str, tf.Tensor],
@@ -87,6 +91,7 @@ def apply_nms(
 
 # Visualization
 
+
 def visualize_detections(
     image: np.ndarray,
     detections: dict[str, tf.Tensor],
@@ -113,6 +118,7 @@ def visualize_detections(
 
 
 # High-level API
+
 
 def detect_image(
     detect_fn,

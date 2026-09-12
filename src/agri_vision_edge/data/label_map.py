@@ -29,32 +29,25 @@ def write_label_map(
             Canonical dataset definition.
     """
 
-    category_map = build_category_map(
-        dataset_definition.categories
-    )
+    category_map = build_category_map(dataset_definition.categories)
 
     target = Path(target)
 
     lines = []
 
     for class_id in sorted(category_map):
+        class_name = category_map[class_id]
 
-        class_name = (
-            category_map[class_id]
+        lines.extend(
+            [
+                "item {",
+                f"  id: {class_id}",
+                f'  name: "{class_name}"',
+                "}",
+                "",
+            ]
         )
 
-        lines.extend([
-            "item {",
-            f"  id: {class_id}",
-            f'  name: "{class_name}"',
-            "}",
-            "",
-        ])
+    target.write_text("\n".join(lines))
 
-    target.write_text(
-        "\n".join(lines)
-    )
-
-    print(
-        f"Wrote label map: {target}"
-    )
+    print(f"Wrote label map: {target}")

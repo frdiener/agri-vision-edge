@@ -23,34 +23,21 @@ def detections_to_coco(
     results = []
 
     for det in detections:
+        ymin, xmin, ymax, xmax = det.bbox
 
-        ymin, xmin, ymax, xmax = (
-            det.bbox
+        results.append(
+            {
+                "image_id": image_id,
+                "category_id": det.category_id,
+                "bbox": [
+                    xmin * image_width,
+                    ymin * image_height,
+                    (xmax - xmin) * image_width,
+                    (ymax - ymin) * image_height,
+                ],
+                "score": det.score,
+            }
         )
-
-        results.append({
-
-            "image_id":
-                image_id,
-
-            "category_id":
-                det.category_id,
-
-            "bbox": [
-
-                xmin * image_width,
-                ymin * image_height,
-
-                (xmax - xmin)
-                * image_width,
-
-                (ymax - ymin)
-                * image_height,
-            ],
-
-            "score":
-                det.score,
-        })
 
     return results
 
@@ -61,7 +48,6 @@ def save_json(
 ):
 
     with open(path, "w") as f:
-
         json.dump(
             obj,
             f,

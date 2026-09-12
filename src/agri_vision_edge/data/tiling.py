@@ -45,9 +45,7 @@ def compute_tiles(
         raise ValueError("cols must be >= 1")
 
     if not (0.0 <= overlap < 1.0):
-        raise ValueError(
-            "overlap must be in [0, 1)"
-        )
+        raise ValueError("overlap must be in [0, 1)")
 
     # Uniform tile size + stride so all tiles are the SAME size and together
     # cover the frame exactly, overlapping by `overlap`. Solving
@@ -66,7 +64,6 @@ def compute_tiles(
 
     for r in range(rows):
         for c in range(cols):
-
             x0 = int(round(c * stride_w))
             y0 = int(round(r * stride_h))
 
@@ -92,8 +89,8 @@ def crop_array(
     tile: Tile,
 ):
     return array[
-        tile.y0:tile.y1,
-        tile.x0:tile.x1,
+        tile.y0 : tile.y1,
+        tile.x0 : tile.x1,
     ]
 
 
@@ -104,19 +101,11 @@ def compute_instance_areas(
     areas = {}
 
     for label in (1, 2):
-        ids = np.unique(
-            plant_instances[
-                (semantics == label)
-                & (plant_instances > 0)
-            ]
-        )
+        ids = np.unique(plant_instances[(semantics == label) & (plant_instances > 0)])
 
         for instance_id in ids:
             areas[(label, int(instance_id))] = int(
-                (
-                    (plant_instances == instance_id)
-                    & (semantics == label)
-                ).sum()
+                ((plant_instances == instance_id) & (semantics == label)).sum()
             )
 
     return areas
@@ -155,7 +144,8 @@ def generate_plant_bboxes(
     instance_areas: dict[
         tuple[int, int],
         int,
-    ] | None = None,
+    ]
+    | None = None,
     partial_threshold: float | None = None,
     plant_visibility: np.ndarray | None = None,
 ):
@@ -169,29 +159,18 @@ def generate_plant_bboxes(
     boxes = []
 
     for label in (1, 2):
-
         instance_ids = np.unique(
-            plant_instances[
-                (semantics == label)
-                & (plant_instances > 0)
-            ]
+            plant_instances[(semantics == label) & (plant_instances > 0)]
         )
 
         for instance_id in instance_ids:
+            mask = (plant_instances == instance_id) & (semantics == label)
 
-            mask = (
-                (plant_instances == instance_id)
-                & (semantics == label)
-            )
-
-            visible_pixels = int(
-                mask.sum()
-            )
+            visible_pixels = int(mask.sum())
 
             visible_fraction = None
 
             if instance_areas is not None:
-
                 original_pixels = instance_areas.get(
                     (
                         int(label),
@@ -199,14 +178,8 @@ def generate_plant_bboxes(
                     )
                 )
 
-                if (
-                    original_pixels is not None
-                    and original_pixels > 0
-                ):
-                    visible_fraction = (
-                        visible_pixels
-                        / original_pixels
-                    )
+                if original_pixels is not None and original_pixels > 0:
+                    visible_fraction = visible_pixels / original_pixels
 
             ys, xs = np.where(mask)
 
@@ -238,11 +211,7 @@ def generate_plant_bboxes(
             }
 
             if visible_fraction is not None:
-                bbox[
-                    "visible_fraction"
-                ] = float(
-                    visible_fraction
-                )
+                bbox["visible_fraction"] = float(visible_fraction)
 
             # Upstream visibility: the per-instance visibility value read from
             # the cropped plant_visibility mask, normalized to [0, 1]. This is
@@ -252,8 +221,7 @@ def generate_plant_bboxes(
 
             if plant_visibility is not None:
                 upstream_visibility = (
-                    float(plant_visibility[mask].max())
-                    / _VISIBILITY_SCALE
+                    float(plant_visibility[mask].max()) / _VISIBILITY_SCALE
                 )
 
             # Effective visibility (do-not-care criterion): the fraction of the
@@ -271,13 +239,8 @@ def generate_plant_bboxes(
             if effective_visibility is not None:
                 bbox["visibility"] = float(effective_visibility)
 
-            if (
-                partial_threshold is not None
-                and effective_visibility is not None
-            ):
-                bbox["is_partial"] = bool(
-                    effective_visibility <= partial_threshold
-                )
+            if partial_threshold is not None and effective_visibility is not None:
+                bbox["is_partial"] = bool(effective_visibility <= partial_threshold)
 
             boxes.append(bbox)
 
@@ -291,13 +254,9 @@ def decode_tile_index(
     index: int,
     tiles_per_image: int,
 ):
-    image_index = (
-        index // tiles_per_image
-    )
+    image_index = index // tiles_per_image
 
-    tile_index = (
-        index % tiles_per_image
-    )
+    tile_index = index % tiles_per_image
 
     return (
         image_index,
@@ -314,15 +273,11 @@ def tile_sample(
     partial_threshold: float | None = None,
 ):
 
-    image = np.asarray(
-        sample["image"]
-    )
+    image = np.asarray(sample["image"])
 
     semantics = sample["semantics"]
 
-    plant_instances = sample[
-        "plant_instances"
-    ]
+    plant_instances = sample["plant_instances"]
 
     image_tile = crop_array(
         image,
@@ -343,9 +298,7 @@ def tile_sample(
     # visibility is read against the same tile coordinate frame.
     visibility = sample.get("plant_visibility")
     visibility_tile = (
-        crop_array(np.asarray(visibility), tile)
-        if visibility is not None
-        else None
+        crop_array(np.asarray(visibility), tile) if visibility is not None else None
     )
 
     instance_areas = compute_instance_areas(
@@ -363,19 +316,13 @@ def tile_sample(
 
     result = dict(sample)
 
-    result["image"] = Image.fromarray(
-        image_tile
-    )
+    result["image"] = Image.fromarray(image_tile)
 
     result["semantics"] = semantics_tile
 
-    result["plant_instances"] = (
-        instances_tile
-    )
+    result["plant_instances"] = instances_tile
 
-    result["plant_bboxes"] = (
-        plant_bboxes
-    )
+    result["plant_bboxes"] = plant_bboxes
 
     result["tile"] = tile
 
@@ -421,15 +368,11 @@ class TiledPhenoBench:
         # (do-not-care). See generate_plant_bboxes.
         self.partial_threshold = partial_threshold
 
-        self.tiles_per_image = (
-            rows * cols
-        )
+        self.tiles_per_image = rows * cols
 
         first = dataset[0]
 
-        image = np.asarray(
-            first["image"]
-        )
+        image = np.asarray(first["image"])
 
         h, w = image.shape[:2]
 
@@ -443,29 +386,20 @@ class TiledPhenoBench:
 
     def __len__(self):
 
-        return (
-            len(self.dataset)
-            * self.tiles_per_image
-        )
+        return len(self.dataset) * self.tiles_per_image
 
     def __getitem__(
         self,
         index,
     ):
-        image_index, tile_index = (
-            decode_tile_index(
-                index,
-                self.tiles_per_image,
-            )
+        image_index, tile_index = decode_tile_index(
+            index,
+            self.tiles_per_image,
         )
 
-        sample = self.dataset[
-            image_index
-        ]
+        sample = self.dataset[image_index]
 
-        tile = self.tiles[
-            tile_index
-        ]
+        tile = self.tiles[tile_index]
 
         tiled = tile_sample(
             sample,
@@ -475,9 +409,7 @@ class TiledPhenoBench:
 
         image_path = Path(sample["image_name"])
 
-        tiled["image_name"] = (
-            f"{image_path.stem}_tile{tile_index}{image_path.suffix}"
-        )
+        tiled["image_name"] = f"{image_path.stem}_tile{tile_index}{image_path.suffix}"
 
         return tiled
 
@@ -485,11 +417,9 @@ class TiledPhenoBench:
         self,
         index,
     ):
-        image_index, tile_index = (
-            decode_tile_index(
-                index,
-                self.tiles_per_image,
-            )
+        image_index, tile_index = decode_tile_index(
+            index,
+            self.tiles_per_image,
         )
 
         return {
@@ -538,26 +468,18 @@ class ConcatDataset:
         *datasets,
     ):
         if not datasets:
-            raise ValueError(
-                "At least one dataset "
-                "must be provided."
-            )
+            raise ValueError("At least one dataset must be provided.")
 
-        self.datasets = list(
-            datasets
-        )
+        self.datasets = list(datasets)
 
         self.cumulative_sizes = []
 
         total = 0
 
         for dataset in self.datasets:
-
             total += len(dataset)
 
-            self.cumulative_sizes.append(
-                total
-            )
+            self.cumulative_sizes.append(total)
 
     def __len__(self):
 
@@ -570,33 +492,17 @@ class ConcatDataset:
         if index < 0:
             index += len(self)
 
-        if (
-            index < 0
-            or index >= len(self)
-        ):
+        if index < 0 or index >= len(self):
             raise IndexError(index)
 
         dataset_idx = 0
 
-        while (
-            index
-            >= self.cumulative_sizes[
-                dataset_idx
-            ]
-        ):
+        while index >= self.cumulative_sizes[dataset_idx]:
             dataset_idx += 1
 
-        previous = (
-            0
-            if dataset_idx == 0
-            else self.cumulative_sizes[
-                dataset_idx - 1
-            ]
-        )
+        previous = 0 if dataset_idx == 0 else self.cumulative_sizes[dataset_idx - 1]
 
-        sample_idx = (
-            index - previous
-        )
+        sample_idx = index - previous
 
         return (
             dataset_idx,
@@ -607,15 +513,9 @@ class ConcatDataset:
         self,
         index,
     ):
-        dataset_idx, sample_idx = (
-            self._locate(index)
-        )
+        dataset_idx, sample_idx = self._locate(index)
 
-        return self.datasets[
-            dataset_idx
-        ][
-            sample_idx
-        ]
+        return self.datasets[dataset_idx][sample_idx]
 
     def dataset_info(
         self,
@@ -625,19 +525,10 @@ class ConcatDataset:
         Debug helper.
         """
 
-        dataset_idx, sample_idx = (
-            self._locate(index)
-        )
+        dataset_idx, sample_idx = self._locate(index)
 
         return {
-            "dataset_index":
-                dataset_idx,
-            "sample_index":
-                sample_idx,
-            "dataset_type":
-                type(
-                    self.datasets[
-                        dataset_idx
-                    ]
-                ).__name__,
+            "dataset_index": dataset_idx,
+            "sample_index": sample_idx,
+            "dataset_type": type(self.datasets[dataset_idx]).__name__,
         }

@@ -15,7 +15,8 @@ from .config import TrainerConfig, TrainingControlConfig
 # early stopping, on the nested ``FineTuneConfig``). ``from_mapping`` folds them
 # into ``control`` so historical manifests / head-less dicts keep loading.
 _LEGACY_CONTROL_KEYS = frozenset(
-    f.name for f in TrainingControlConfig.__dataclass_fields__.values()  # type: ignore[attr-defined]
+    f.name
+    for f in TrainingControlConfig.__dataclass_fields__.values()  # type: ignore[attr-defined]
 )
 
 
@@ -272,9 +273,7 @@ def apply_config_overrides(cfg: FinetuneRunConfig) -> int | None:
                 f"steps_per_epoch={steps_per_epoch})."
             )
         if control.warmup_epochs is not None:
-            cfg.finetune.warmup_steps = round(
-                control.warmup_epochs * steps_per_epoch
-            )
+            cfg.finetune.warmup_steps = round(control.warmup_epochs * steps_per_epoch)
             print(
                 f"Setting warmup steps to {cfg.finetune.warmup_steps} "
                 f"(warmup_epochs={control.warmup_epochs} * "
@@ -283,15 +282,10 @@ def apply_config_overrides(cfg: FinetuneRunConfig) -> int | None:
 
     if control.lr_plateau_base_lr is not None:
         cfg.finetune.learning_rate_base = control.lr_plateau_base_lr
-        print(
-            f"Setting learning_rate_base to {cfg.finetune.learning_rate_base}."
-        )
+        print(f"Setting learning_rate_base to {cfg.finetune.learning_rate_base}.")
     if control.lr_plateau_warmup_lr is not None:
         cfg.finetune.warmup_learning_rate = control.lr_plateau_warmup_lr
-        print(
-            "Setting warmup_learning_rate to "
-            f"{cfg.finetune.warmup_learning_rate}."
-        )
+        print(f"Setting warmup_learning_rate to {cfg.finetune.warmup_learning_rate}.")
 
     return steps_per_epoch
 

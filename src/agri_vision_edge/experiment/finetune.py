@@ -213,9 +213,7 @@ class FineTuneConfig:
     # Data augmentation
     #
 
-    augmentation: AugmentationConfig = field(
-        default_factory=AugmentationConfig
-    )
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
 
     #
     # NMS

@@ -34,7 +34,6 @@ def representative_dataset(
     count = 0
 
     for i in indices:
-
         if count >= num_samples:
             break
 
@@ -45,16 +44,7 @@ def representative_dataset(
             dtype=np.uint8,
         )
 
-        boxes = [
-
-            phenobench_bbox_to_xyxy(
-                bbox
-            )
-
-            for bbox in sample[
-                "plant_bboxes"
-            ]
-        ]
+        boxes = [phenobench_bbox_to_xyxy(bbox) for bbox in sample["plant_bboxes"]]
 
         #
         # Skip empty samples
@@ -63,19 +53,13 @@ def representative_dataset(
         if not boxes:
             continue
 
-        image_resized, _ = (
-            resize_image_and_boxes(
-                image,
-                boxes,
-                size=size,
-            )
+        image_resized, _ = resize_image_and_boxes(
+            image,
+            boxes,
+            size=size,
         )
 
-        image_resized = (
-            image_resized.astype(
-                np.float32
-            )
-        )
+        image_resized = image_resized.astype(np.float32)
 
         yield [
             np.expand_dims(
@@ -85,6 +69,7 @@ def representative_dataset(
         ]
 
         count += 1
+
 
 def normalized_representative_dataset(
     dataset,

@@ -22,11 +22,7 @@ def metrics_to_float(metrics):
     """
 
     return {
-        k: (
-            float(v.numpy())
-            if hasattr(v, "numpy")
-            else float(v)
-        )
+        k: (float(v.numpy()) if hasattr(v, "numpy") else float(v))
         for k, v in metrics.items()
     }
 
@@ -36,10 +32,7 @@ def pretty_print_metrics(
     metrics: dict,
     time_taken: float,
 ):
-    print(
-        f"Step {step} "
-        f"({time_taken:.3f}s/step)"
-    )
+    print(f"Step {step} ({time_taken:.3f}s/step)")
 
     print(
         pprint.pformat(

@@ -128,9 +128,7 @@ def list_session_output(
             )
 
     if not files:
-        raise SyncError(
-            f"{slug}: session published no output files (has it been run?)"
-        )
+        raise SyncError(f"{slug}: session published no output files (has it been run?)")
 
     return files, log
 
@@ -153,9 +151,7 @@ def select_files(
     by_name = {entry.file_name: entry for entry in files}
 
     graphs = [
-        name
-        for name in by_name
-        if name.endswith(".onnx") and "/outputs/" in f"/{name}"
+        name for name in by_name if name.endswith(".onnx") and "/outputs/" in f"/{name}"
     ]
 
     if len(graphs) != 1:
@@ -188,9 +184,7 @@ def select_files(
         if len(matches) == 1:
             selected[destination] = by_name[matches[0]]
         elif destination in required:
-            raise SyncError(
-                f"expected exactly one {needle!r}, found {len(matches)}"
-            )
+            raise SyncError(f"expected exactly one {needle!r}, found {len(matches)}")
 
     # TensorBoard event files: however many the run wrote, flattened one level.
     for name, entry in by_name.items():
@@ -209,9 +203,7 @@ def onnx_destination_name(config: str) -> str:
 # Log-derived manifest data
 
 _BEST_AP = re.compile(r"best AP is\s+([\d.]+)")
-_AP_ALL = re.compile(
-    r"IoU=0\.50:0\.95 \| area=\s*all \| maxDets=100 \] = ([-\d.]+)"
-)
+_AP_ALL = re.compile(r"IoU=0\.50:0\.95 \| area=\s*all \| maxDets=100 \] = ([-\d.]+)")
 _LOGGED_COMMIT = re.compile(r"YOLOX:.*?@\s*([0-9a-f]{7,40})")
 
 #: The notebook prints these banners before each of its three post-training

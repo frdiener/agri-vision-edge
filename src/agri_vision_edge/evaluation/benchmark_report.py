@@ -3559,7 +3559,11 @@ def deployment_summary_table(
 
     energy_of = {}
     if power_df is not None and not power_df.empty:
-        power = power_df if "scheme" in power_df.columns else annotate_resource_runs(power_df)
+        power = (
+            power_df
+            if "scheme" in power_df.columns
+            else annotate_resource_runs(power_df)
+        )
         if "state" in power.columns:
             # Unaligned traces yield plausible and wrong watts.
             power = power[power["state"] == "verified"]
@@ -3611,7 +3615,9 @@ def deployment_summary_table(
                         "CPU (ms)": None if timing is None else timing["CPU (ms)"],
                         "Speedup": speedup,
                         # Match the one decimal the latency columns carry.
-                        "mJ/inf": _round_or_none(energy_of.get((board, arch, scheme)), 1),
+                        "mJ/inf": _round_or_none(
+                            energy_of.get((board, arch, scheme)), 1
+                        ),
                         "Outcome": _deployment_outcome(verdict, speedup),
                     }
                 )
@@ -5383,9 +5389,7 @@ def save_latex_table(
                     if drop_split_by and group is not None
                     else ""
                 )
-                short = (
-                    f"[{_ascii(short_caption)}]" if short_caption else ""
-                )
+                short = f"[{_ascii(short_caption)}]" if short_caption else ""
                 heading = (
                     f"\\caption{short}{{{_ascii(caption)}{panel_suffix}}}\n"
                     f"\\label{{tab:{label}}}\n"

@@ -12,8 +12,7 @@ def capture_environment() -> dict[str, Any]:
     environment = {
         "python": capture_python_environment(),
         "system": capture_system_environment(),
-        "cuda_visible_devices":
-            os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
 
     tensorflow_info = capture_tensorflow_environment()
@@ -24,16 +23,13 @@ def capture_environment() -> dict[str, Any]:
     return environment
 
 
-
 def capture_python_environment() -> dict[str, Any]:
 
     return {
         "version": platform.python_version(),
-        "implementation":
-            platform.python_implementation(),
+        "implementation": platform.python_implementation(),
         "executable": sys.executable,
     }
-
 
 
 def capture_system_environment() -> dict[str, Any]:
@@ -45,7 +41,6 @@ def capture_system_environment() -> dict[str, Any]:
         "processor": platform.processor(),
         "hostname": platform.node(),
     }
-
 
 
 def capture_tensorflow_environment() -> dict[str, Any] | None:
@@ -74,7 +69,6 @@ def capture_tensorflow_environment() -> dict[str, Any] | None:
 
     return {
         "version": tf.__version__,
-        "protobuf_version":
-            google.protobuf.__version__,
+        "protobuf_version": google.protobuf.__version__,
         "gpu_devices": gpus,
     }

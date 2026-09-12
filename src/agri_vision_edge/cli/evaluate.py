@@ -66,9 +66,7 @@ def _run_faithful(args):
     input_path = Path(args.input)
 
     if not input_path.is_file():
-        raise SystemExit(
-            "--faithful expects a predictions.json file, not a directory"
-        )
+        raise SystemExit("--faithful expects a predictions.json file, not a directory")
 
     # Imported lazily so the lightweight path never pulls the torch stack.
     from agri_vision_edge.evaluation.faithful import evaluate_faithful

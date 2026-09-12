@@ -19,7 +19,6 @@ IMAGE_EXTENSIONS = {
 
 @dataclass(slots=True)
 class ImageRecord:
-
     image_id: int
 
     file_name: str
@@ -41,24 +40,14 @@ def load_coco_images(
     missing = []
 
     for image in coco["images"]:
-
-        path = (
-            images_dir /
-            image["file_name"]
-        )
+        path = images_dir / image["file_name"]
 
         if not path.exists():
-
-            missing.append(
-                image["file_name"]
-            )
+            missing.append(image["file_name"])
 
             continue
 
-        if (
-            path.suffix.lower()
-            not in IMAGE_EXTENSIONS
-        ):
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
 
         records.append(
@@ -70,16 +59,9 @@ def load_coco_images(
         )
 
     if not records:
-
-        raise RuntimeError(
-            "No benchmark images found."
-        )
+        raise RuntimeError("No benchmark images found.")
 
     if missing:
-
-        print(
-            f"[warning] missing "
-            f"{len(missing)} image(s)"
-        )
+        print(f"[warning] missing {len(missing)} image(s)")
 
     return records

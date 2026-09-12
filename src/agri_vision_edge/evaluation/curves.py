@@ -34,18 +34,18 @@ def load_history_scalars(
             if tag == "step":
                 continue
 
-            rows.append({
-                "step": step,
-                "tag": tag,
-                "value": value,
-            })
+            rows.append(
+                {
+                    "step": step,
+                    "tag": tag,
+                    "value": value,
+                }
+            )
 
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        df = df.sort_values(
-            ["tag", "step"]
-        ).reset_index(drop=True)
+        df = df.sort_values(["tag", "step"]).reset_index(drop=True)
 
     return df
 
@@ -137,9 +137,7 @@ def plot_metric_curves(
     optionally writes the figure at ``dpi``.
     """
     if "tag" not in df.columns:
-        raise ValueError(
-            "Input dataframe does not contain a 'tag' column."
-        )
+        raise ValueError("Input dataframe does not contain a 'tag' column.")
 
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -171,8 +169,7 @@ def plot_metric_curves(
 
     if not plotted:
         raise ValueError(
-            f"No matching tags found. Available tags:\n"
-            f"{available_tags(df)}"
+            f"No matching tags found. Available tags:\n{available_tags(df)}"
         )
 
     ax.set_title(title)
