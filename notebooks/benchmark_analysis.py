@@ -1261,12 +1261,13 @@ def _(br, mo, pd, power_judged, show_table):
         _power_table.reset_index(drop=True),
         "power_summary",
         mo,
+        short_caption="Steady-state performance, power and energy per export scheme",
         caption="Selected steady-state performance, power, energy, and resource "
         "metrics across input resolutions. Board/build is invariant within each "
         "panel and stated in its caption; the second panel is the i.MX8M Plus "
         "under the delegate build that preceded the operator-support work of "
-        "Section 5.5, so its verdicts describe that build and not the deployed "
-        "one. The reference is "
+        "\\cref{sec:deployment-challenges}, so its verdicts describe that build "
+        "and not the deployed one. The reference is "
         "$320\\times320$; C and T denote per-channel and per-tensor weights, and "
         "net energy is per inference. Only "
         "\\texttt{ok} verdicts are valid operating points; other rows retain real "
@@ -1569,10 +1570,14 @@ def _(br, mo, show_table, sweeps, view):
         ),
         "operating_points",
         mo,
+        short_caption="Weed-class operating point by export scheme",
         caption=(
             "Weed-class F1-optimal confidence threshold and the precision/recall "
-            "it yields, at IoU 0.50 and 0.75."
+            "it yields, at IoU 0.50 and 0.75, for every export scheme at the "
+            "reference configuration on the CPU reference."
         ),
+        # One float, with the detectors kept apart by a rule and a label row.
+        group_by="Detector",
     )
     return
 

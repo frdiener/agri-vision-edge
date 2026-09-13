@@ -5081,6 +5081,28 @@ def _sweep_label(runs: pd.DataFrame | None, platform: str, run: str) -> str:
     return f"{platform} | {run}"
 
 
+def _sweep_identity(
+    runs: pd.DataFrame | None, platform: str, run: str
+) -> tuple[str, str]:
+    """Split a sweep's identity into detector and export-scheme labels.
+
+    Falls back to the run slug as the detector when no parsed metadata is
+    available, so a table built without ``runs`` still identifies its rows.
+    """
+    if runs is not None and not runs.empty and "run" in runs.columns:
+        match = runs[(runs["platform"] == platform) & (runs["run"] == run)]
+
+        if not match.empty:
+            row = add_scheme(match).iloc[0]
+
+            return (
+                _short(pd.Series([row["arch_label"]])).iloc[0],
+                scheme_label(row["scheme"]),
+            )
+
+    return run, ""
+
+
 def plot_f1_vs_confidence(
     sweeps: dict[tuple[str, str], ScoreSweep],
     runs: pd.DataFrame | None = None,
@@ -5178,6 +5200,11 @@ def operating_point_table(
 
     ``runs`` labels and restricts the rows, as in
     :func:`plot_f1_vs_confidence`; without it every sweep is listed.
+
+    Identity is carried by ``Platform``, ``Detector`` and ``Export`` rather than
+    the run slug, which is too wide to typeset beside eight metric columns. The
+    ``Platform`` column is dropped when every row shares one platform, since the
+    caller then fixes it in the caption.
     """
     selected = dict(sweeps)
 
@@ -5191,10 +5218,12 @@ def operating_point_table(
         sweep = selected[key]
         platform, run = key
 
+        detector, export = _sweep_identity(runs, platform, run)
+
         row = {
-            "Platform": platform,
-            "Run": run,
-            "Label": _sweep_label(runs, platform, run),
+            "Platform": platform_label(platform),
+            "Detector": detector,
+            "Export": export,
         }
 
         for iou in iou_thresholds:
@@ -5204,14 +5233,22 @@ def operating_point_table(
             best = sweep.best_f1(iou, class_name)
             tag = f"@{iou:.2f}"
 
+            # Three decimals throughout: the score grid does not resolve more,
+            # and a fourth only widens the table.
             row[f"conf{tag}"] = round(best["score"], 3)
-            row[f"F1{tag}"] = round(best["f1"], 4)
-            row[f"P{tag}"] = round(best["precision"], 4)
-            row[f"R{tag}"] = round(best["recall"], 4)
+            row[f"F1{tag}"] = round(best["f1"], 3)
+            row[f"P{tag}"] = round(best["precision"], 3)
+            row[f"R{tag}"] = round(best["recall"], 3)
 
         rows.append(row)
 
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+
+    # One platform needs no column; the caption names it instead.
+    if "Platform" in frame.columns and frame["Platform"].nunique() <= 1:
+        frame = frame.drop(columns="Platform")
+
+    return frame
 
 
 def save_figure(
