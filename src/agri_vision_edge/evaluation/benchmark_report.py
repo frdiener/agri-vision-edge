@@ -2778,6 +2778,13 @@ def nms_latency_tradeoff_table(
 
     ``saving = mean(dLatency | mc) - mean(dLatency | sc)``. Reports standard error,
     sigma and a 95% confidence interval per platform and architecture.
+
+    The single-class arm is the drift control, so both arms are restricted to the
+    input sizes the control actually covers. Without that restriction the estimate
+    subtracts a control measured at one resolution from a treatment pooled over
+    several, and any configuration whose post-processing cost explodes -- such as
+    the degenerate 1024 FPNLite runs, where every anchor carries an identical
+    score and per-class suppression has to break the ties -- dominates the mean.
     """
     if precision is not None and "precision" in df.columns:
         df = df[df["precision"] == precision]
@@ -2795,6 +2802,10 @@ def nms_latency_tradeoff_table(
     rows = []
     for key, group in pairs.groupby(keys):
         key = key if isinstance(key, tuple) else (key,)
+        # Restrict the treatment arm to the input sizes the drift control covers.
+        if "size" in group.columns:
+            controlled = set(group[group["classes"] == "sc"]["size"])
+            group = group[group["size"].isin(controlled)]
         mc = group[group["classes"] == "mc"]["dLatency (ms)"]
         sc = group[group["classes"] == "sc"]["dLatency (ms)"]
         if mc.empty or sc.empty:
