@@ -17,7 +17,7 @@
           packages = with pkgs; [
             protobuf_25
             yaml-language-server
-            nodejs  # marimo copilot
+            nodejs  # marimo
             netron
             microcom
 
