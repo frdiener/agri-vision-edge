@@ -555,14 +555,19 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(br, mo, show_table, view):
+    _table = (
+        br.nms_substitution_summary(view(nms="both", ref={"size": None}))
+        .drop(columns="dAR100", level=0)
+        .rename(columns={"arch_label": "Architecture", "size": "Input"}, level=0)
+    )
+
     show_table(
-        br.nms_substitution_summary(
-            view(nms="both", ref={"size": None}),
-        ),
+        _table,
         "nms_substitution_summary",
         mo,
         caption="Accuracy difference between fast and per-class NMS by architecture "
-        "and input resolution at the reference configuration.",
+        "and input resolution, pooled over the multi-class full-frame runs at "
+        "each rung.",
     )
     return
 
@@ -1599,29 +1604,54 @@ def _(mo):
     reported saving subtracts this control from the multi-class difference.
 
     INT8 only. Including FP32 adds substantial timing variance to a millisecond-scale
-    effect.
+    effect. Restricted to the two boards with the delegate active and disabled: the
+    unpatched build belongs to §6.6 and the x86 host is not a deployment target.
 
     | column | meaning |
     |---|---|
-    | `mc pairs` / `sc pairs` | matched fast/regular NMS pairs |
     | `dLatency mc` | mean fast minus regular latency; negative means fast is quicker |
-    | `sc drift` | corresponding single-class difference |
+    | `sc drift` | corresponding single-class difference, which is drift by construction |
     | `NMS saving` | `dLatency mc` minus `sc drift` |
-    | `SE` | standard error of that difference, both arms combined |
-    | `sigma` | \|saving\| / SE |
     | `95% CI` | interval for the saving |
     | `resolved` | whether the interval excludes zero |
-    | `sc \|drift\| worst` | largest single-pair drift |
 
     An interval spanning zero does not distinguish the effect from drift.
+
+    `nms_latency_tradeoff_table` also returns the pair counts, the standard error,
+    sigma and the worst single-pair drift. They are dropped from the printed table:
+    the counts are constant at 16 per arm, and SE and sigma are the interval in
+    another form. Read them here when the interval looks surprising -- the worst
+    single-pair drift reaches several milliseconds against a sub-millisecond mean,
+    which is why the control is needed at all.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(br, mo, show_table, view):
+    # The unpatched build answers a different question (§6.6) and the x86 host is
+    # not a deployment target, so both are left out; what remains is the two
+    # boards, each with its delegate active and disabled.
+    _boards = ("frdm-imx8mp", "frdm-imx8mp_cpu", "frdm-imx93", "frdm-imx93_cpu")
+
+    # SE and sigma are the interval in another form and the pair counts are
+    # constant, so the printed table keeps only the difference-in-differences,
+    # its inputs, and the interval the conclusion rests on. The full set stays
+    # available from `nms_latency_tradeoff_table` for interactive use.
+    _tradeoff = br.nms_latency_tradeoff_table(view(nms="both", platform=_boards))[
+        [
+            "Platform",
+            "Architecture",
+            "dLatency mc (ms)",
+            "sc drift (ms)",
+            "NMS saving (ms)",
+            "95% CI (ms)",
+            "resolved",
+        ]
+    ].assign(resolved=lambda frame: frame["resolved"].map({True: "yes", False: "no"}))
+
     show_table(
-        br.nms_latency_tradeoff_table(view(nms="both")),
+        _tradeoff,
         "nms_latency_tradeoff",
         mo,
         caption="Fast-NMS latency difference by platform and architecture, adjusted "
@@ -1650,17 +1680,27 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(NMS, br, mo, show_table, view):
+def _(NMS, SCHEME_LABELS, br, mo, show_table, view):
+    _table = br.resolution_ladder_table(
+        view(),
+        nms=NMS,
+        latency_platforms=("frdm-imx8mp", "frdm-imx93"),
+    ).drop(
+        columns=[
+            "APS",
+            "x86 (ms)",
+            "i.MX8MP NPU FPS",
+            "i.MX93 NPU FPS",
+        ]
+    )
+    _table["Scheme"] = _table["Scheme"].replace(SCHEME_LABELS)
     show_table(
-        br.resolution_ladder_table(
-            view(),
-            nms=NMS,
-            latency_platforms=("frdm-imx8mp", "frdm-imx93"),
-        ),
+        _table,
         "resolution_ladder",
         mo,
         caption="Detection quality and median latency by input resolution and "
-        "export scheme, measured on the CPU reference and each accelerator.",
+        "export scheme. Accuracy is measured on the CPU reference, latency on "
+        "each accelerator; throughput follows from the latter and is omitted.",
     )
     return
 
