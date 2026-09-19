@@ -2835,9 +2835,16 @@ def nms_latency_tradeoff_table(
 
         half_width = 1.96 * standard_error
 
+        # Report the board/backend label the rest of the tables use rather than
+        # the raw results-tree name.
+        labelled = tuple(
+            platform_label(value) if column == "platform" else value
+            for column, value in zip(keys, key, strict=False)
+        )
+
         rows.append(
             {
-                **dict(zip(("Platform", "Architecture"), key, strict=False)),
+                **dict(zip(("Platform", "Architecture"), labelled, strict=False)),
                 "mc pairs": int(len(mc)),
                 "sc pairs": int(len(sc)),
                 "dLatency mc (ms)": round(float(mc.mean()), 3),
@@ -3977,7 +3984,7 @@ def story_ablation_table(
             rows.append(
                 {
                     "Variant": label,
-                    "Architecture": _arch_short(arch),
+                    "Architecture": arch,
                     "Float AP": None if saved is None else round(saved, 2),
                     "Conversion": _sub(control, saved),
                     "NMS swap": _sub(swapped, control),
@@ -5113,10 +5120,7 @@ def _sweep_identity(
         if not match.empty:
             row = add_scheme(match).iloc[0]
 
-            return (
-                _short(pd.Series([row["arch_label"]])).iloc[0],
-                scheme_label(row["scheme"]),
-            )
+            return (row["arch_label"], scheme_label(row["scheme"]))
 
     return run, ""
 
