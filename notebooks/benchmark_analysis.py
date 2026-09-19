@@ -1348,8 +1348,13 @@ def _(mo):
     # 6 · Ablations
 
     The overview varies one axis at a time, plus the matched tiled configuration.
-    `Float AP` is absolute; `Conversion`, `NMS swap`, and `PTQ` are changes from the
-    preceding rung; `QAT reclaim` is QAT minus PTQ with per-tensor weights.
+    `Float AP` is absolute; `Conversion` and `PTQ` are successive changes ending at
+    `Deployed AP`; `NMS swap` is the class-agnostic substitution cost and sits off
+    that chain; `QAT reclaim` is QAT minus PTQ with per-tensor weights.
+
+    The INT8 rungs follow the report default, per-class NMS, so they agree with
+    §4 and §5. Pass `deployed_nms=br.FAST_NMS` to read the chain down the
+    class-agnostic branch instead.
 
     `NPU (ms)` is per inference. A tiled inference covers one ninth of a frame, so
     do not compare its latency with full-frame inference.
@@ -1360,7 +1365,7 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(br, mo, show_table, view):
     show_table(
-        br.story_ablation_table(view(nms="both")),
+        br.story_ablation_table(view(nms="both"), deployed_nms=br.REGULAR_NMS),
         "story_ablation",
         mo,
         caption="Deployment-stage effects of single-axis deviations from the "

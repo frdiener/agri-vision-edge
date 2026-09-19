@@ -3913,11 +3913,13 @@ def story_ablation_table(
     reference: str = REFERENCE_PLATFORM,
     metric: str = "AP",
     percent: bool = True,
+    deployed_nms: str = FAST_NMS,
 ) -> pd.DataFrame:
     """Compare single-class and tiling deviations across the deployment stages.
 
     Requires both NMS variants for conversion and NMS-swap columns. Missing rungs
-    remain empty.
+    remain empty. ``Deployed AP`` and ``NPU (ms)`` describe the same export, the
+    per-tensor post-training one under ``deployed_nms``.
     """
     if df.empty or metric not in df.columns:
         return pd.DataFrame()
@@ -3929,7 +3931,9 @@ def story_ablation_table(
     if base.empty:
         return pd.DataFrame()
 
-    def _ap(frame, platform, scheme=None, nms=FAST_NMS, quant=None):
+    deployed_scheme = scheme_name("int8", "ptq", "per-tensor")
+
+    def _select(frame, platform, scheme=None, nms=deployed_nms, quant=None):
         rows = frame[frame["platform"] == platform]
         if scheme is not None:
             rows = rows[rows["scheme"] == scheme]
@@ -3937,8 +3941,19 @@ def story_ablation_table(
             rows = rows[rows["quant"] == quant]
         if nms is not None and "nms" in rows.columns:
             rows = rows[rows["nms"].isna() | (rows["nms"] == nms)]
+        return rows
+
+    def _ap(frame, platform, scheme=None, nms=deployed_nms, quant=None):
+        rows = _select(frame, platform, scheme, nms, quant)
         rows = rows.dropna(subset=[metric])
         return None if rows.empty else scale * float(rows[metric].iloc[0])
+
+    def _latency(frame):
+        rows = _select(frame, npu_platform, deployed_scheme)
+        rows = rows.dropna(subset=["median_latency_ms"])
+        return (
+            None if rows.empty else round(float(rows["median_latency_ms"].iloc[0]), 1)
+        )
 
     def _sub(a, b):
         return None if a is None or b is None else round(a - b, 2)
@@ -3954,14 +3969,10 @@ def story_ablation_table(
 
             saved = _ap(frame, reference, nms=None, quant="ptq")
             control = _ap(frame, cpu_platform, scheme_name("fp32", "ptq"), REGULAR_NMS)
-            deployed = _ap(frame, cpu_platform, scheme_name("fp32", "ptq"))
-            ptq = _ap(frame, cpu_platform, scheme_name("int8", "ptq", "per-tensor"))
+            swapped = _ap(frame, cpu_platform, scheme_name("fp32", "ptq"), FAST_NMS)
+            converted = swapped if deployed_nms == FAST_NMS else control
+            ptq = _ap(frame, cpu_platform, deployed_scheme)
             qat = _ap(frame, cpu_platform, scheme_name("int8", "qat", "per-tensor"))
-
-            npu_rows = frame[
-                (frame["platform"] == npu_platform)
-                & (frame["scheme"] == scheme_name("int8", "ptq", "per-tensor"))
-            ].dropna(subset=["median_latency_ms"])
 
             rows.append(
                 {
@@ -3969,15 +3980,11 @@ def story_ablation_table(
                     "Architecture": _arch_short(arch),
                     "Float AP": None if saved is None else round(saved, 2),
                     "Conversion": _sub(control, saved),
-                    "NMS swap": _sub(deployed, control),
-                    "PTQ": _sub(ptq, deployed),
+                    "NMS swap": _sub(swapped, control),
+                    "PTQ": _sub(ptq, converted),
                     "QAT reclaim": _sub(qat, ptq),
                     "Deployed AP": None if ptq is None else round(ptq, 2),
-                    "NPU (ms)": (
-                        None
-                        if npu_rows.empty
-                        else round(float(npu_rows["median_latency_ms"].iloc[0]), 1)
-                    ),
+                    "NPU (ms)": _latency(frame),
                 }
             )
 
