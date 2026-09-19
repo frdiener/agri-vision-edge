@@ -2491,11 +2491,19 @@ def deployability_matrix(
     ).fillna("-")
 
     order = {name: i for i, name in enumerate(SCHEME_ORDER)}
+
+    def _sort_key(s: pd.Series) -> pd.Series:
+        if s.name == "scheme":
+            return s.map(order).fillna(len(order))
+        if s.name == "size":
+            return pd.to_numeric(s, errors="coerce")
+        return s
+
     table = (
         matrix.reset_index()
         .sort_values(
             ["arch_label", "classes", "dataset", "size", "scheme"],
-            key=lambda s: s.map(order).fillna(len(order)) if s.name == "scheme" else s,
+            key=_sort_key,
         )
         .reset_index(drop=True)
     )
@@ -2765,6 +2773,9 @@ def nms_substitution_summary(
     if percent:
         pairs = pairs.copy()
         pairs[metrics] *= 100.0
+
+    if "size" in keys:
+        pairs = pairs.assign(size=pd.to_numeric(pairs["size"], errors="coerce"))
 
     summary = pairs.groupby(keys, dropna=False)[metrics].agg(["mean", "min", "max"])
     summary.insert(0, ("pairs", ""), pairs.groupby(keys, dropna=False).size())
