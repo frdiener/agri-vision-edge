@@ -601,9 +601,9 @@ def _(CONTROL_TREES, NMS, br, runs, skipped, view):
     deploy_boards = [
         p
         for p in sorted(runs["platform"].unique())
-        if p.startswith("frdm")
-        and not p.endswith(("_cpu", "_unpatched"))
-        and p not in CONTROL_TREES
+        # Every CPU, unpatched, vendor and diagnostic tree qualifies the board
+        # name with an underscore; the deployed builds are the bare names.
+        if p.startswith("frdm") and "_" not in p and p not in CONTROL_TREES
     ]
     deployability = br.deployability_matrix(
         view(nms="both", classes="mc", dataset="phenobench"),
