@@ -1324,7 +1324,9 @@ def _(NMS, SCHEME_LABELS, br, mo, power_judged, show_table):
         group_by=("Board", "Architecture"),
         short_caption="Full-call and graph-only latency on each board",
         caption="Full-call and graph-only latency on each board at the reference "
-        "configuration. CPU-side time is preprocess plus postprocess.",
+        "configuration. \\texttt{CPU-side} is preprocess plus postprocess of the "
+        "delegated run, so its whole-call time is the NPU invoke time plus that "
+        "overhead; the CPU run carries its own, slightly different overhead.",
     )
     return
 
