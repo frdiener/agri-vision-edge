@@ -5416,9 +5416,10 @@ def save_latex_table(
     move into each panel caption instead of being repeated in every row. Disable
     ``clear_between_panels`` when several short panels should share a page.
 
-    ``group_by`` is the single-float alternative to ``split_by``: the groups
-    stay in one tabular, separated by a rule and a spanning label row, and the
-    grouping columns are dropped from the body.
+    ``group_by`` keeps its groups in one tabular, separated by a rule and a
+    spanning label row, with the grouping columns dropped from the body. It
+    combines with ``split_by``, which then decides the panels and ``group_by``
+    the blocks within each.
 
     ``short_caption`` becomes the List of Tables entry, which otherwise repeats
     the full caption. ``placement`` overrides the float specifier, which is
@@ -5441,17 +5442,9 @@ def save_latex_table(
     if len(obj_cols):
         df[obj_cols] = df[obj_cols].apply(lambda c: c.map(_ascii))
 
-    if split_by is not None and group_by is not None:
-        raise ValueError("pass either split_by or group_by, not both")
-
-    group_sizes: list[tuple[str, int]] = []
-    if group_by is not None:
-        group_columns = _resolve_group_columns(df, group_by, "group")
-        key = group_columns[0] if len(group_columns) == 1 else group_columns
-        blocks = list(df.groupby(key, sort=False, dropna=False))
-        group_sizes = [(_group_label(value), len(block)) for value, block in blocks]
-        # Concatenate so body rows follow the order the labels are emitted in.
-        df = pd.concat([block for _, block in blocks]).drop(columns=group_columns)
+    group_columns = (
+        _resolve_group_columns(df, group_by, "group") if group_by is not None else []
+    )
 
     if split_by is not None:
         if not caption:
@@ -5478,6 +5471,15 @@ def save_latex_table(
     for group, group_df in groups:
         if drop_split_by:
             group_df = group_df.drop(columns=split_columns)
+        group_sizes: list[tuple[str, int]] = []
+        if group_columns:
+            key = group_columns[0] if len(group_columns) == 1 else group_columns
+            blocks = list(group_df.groupby(key, sort=False, dropna=False))
+            # Concatenate so body rows follow the order the labels are emitted in.
+            group_sizes = [(_group_label(value), len(block)) for value, block in blocks]
+            group_df = pd.concat([block for _, block in blocks]).drop(
+                columns=group_columns
+            )
         body = _ascii(group_df.to_latex(**kwargs))
         if group_sizes:
             body = _grouped_tabular(body, group_sizes)
