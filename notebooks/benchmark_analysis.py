@@ -565,6 +565,10 @@ def _(br, mo, show_table, view):
         _table,
         "nms_substitution_summary",
         mo,
+        group_by="Architecture",
+        # Size is unpinned here (ref={"size": None}), so the rows span the whole
+        # resolution ladder and the caption must not claim a single reference
+        # configuration.
         caption="Accuracy difference between fast and per-class NMS by architecture "
         "and input resolution, pooled over the multi-class full-frame runs at "
         "each rung.",
@@ -631,11 +635,22 @@ def _(br, deployability, mo):
 
 
 @app.cell(hide_code=True)
-def _(deployability, mo, show_table):
+def _(SCHEME_LABELS, deployability, mo, show_table):
+    _table = deployability.rename(
+        columns={
+            "arch_label": "Architecture",
+            "size": "Input",
+            "scheme": "Scheme",
+            "frdm-imx8mp": "i.MX8MP",
+            "frdm-imx93": "i.MX93",
+        }
+    )
+    _table["Scheme"] = _table["Scheme"].replace(SCHEME_LABELS)
     show_table(
-        deployability,
+        _table,
         "deployability",
         mo,
+        group_by="Architecture",
         caption="Export correctness on each target relative to the same file on "
         "the CPU reference. Full-frame input with per-class NMS.",
     )
@@ -756,6 +771,7 @@ def _(SCHEME_LABELS, br, delegation, dg, mo, show_table):
             _table,
             f"continuity_{_plat.replace('frdm-', '').replace('-', '')}",
             mo,
+            group_by="Architecture",
             caption=_caption,
         )
 
@@ -885,6 +901,7 @@ def _(NMS, SCHEME_LABELS, br, mo, show_table, view):
         _table,
         "device_latency",
         mo,
+        group_by="Board",
         caption="Median latency and throughput for correct per-class-NMS exports "
         "at the reference input of $320\\times320$, comparing each board's CPU "
         "and NPU.",
@@ -1255,6 +1272,7 @@ def _(SCHEME_LABELS, br, mo, pd, power_judged, show_table):
         "measurements remain in the archived \\texttt{power\\_summary.json} files.",
         split_by="Board/build",
         drop_split_by=True,
+        group_by="Arch.",
     )
     return
 
@@ -1303,6 +1321,8 @@ def _(NMS, SCHEME_LABELS, br, mo, power_judged, show_table):
         _table,
         "accelerator_latency",
         mo,
+        group_by=("Board", "Architecture"),
+        short_caption="Full-call and graph-only latency on each board",
         caption="Full-call and graph-only latency on each board at the reference "
         "configuration. CPU-side time is preprocess plus postprocess.",
     )
@@ -1335,8 +1355,19 @@ def _(br, mo, show_table, view):
         br.story_ablation_table(view(nms="both"), deployed_nms=br.REGULAR_NMS),
         "story_ablation",
         mo,
-        caption="Deployment-stage effects of single-axis deviations from the "
-        "reference configuration.",
+        group_by="Architecture",
+        short_caption="Deployment-stage effects of single-axis deviations",
+        caption=(
+            "Deployment-stage effects of single-axis deviations from the "
+            "reference configuration. The INT8 rungs use per-tensor weights "
+            "and per-class suppression, as everywhere else, so "
+            "\\texttt{Float AP}, \\texttt{Conversion} and \\texttt{PTQ} form "
+            "one chain ending at \\texttt{Deployed AP}. \\texttt{NMS swap} is "
+            "the separately measured cost of the class-agnostic pass and does "
+            "not enter that chain. \\texttt{Deployed AP} and \\texttt{NPU (ms)} "
+            "describe the same post-training export, the latter timed on the "
+            "i.MX93 NPU."
+        ),
     )
     return
 
@@ -1539,7 +1570,9 @@ def _(br, mo, show_table, sweeps, view):
                 ref={"precision": None, "quant": None, "granularity": None},
             ),
             class_name="weed",
-        ),
+        )
+        .sort_values("Detector", kind="stable")
+        .reset_index(drop=True),
         "operating_points",
         mo,
         short_caption="Weed-class operating point by export scheme",
@@ -1654,8 +1687,23 @@ def _(br, mo, show_table, view):
         _tradeoff,
         "nms_latency_tradeoff",
         mo,
-        caption="Fast-NMS latency difference by platform and architecture, adjusted "
-        "for drift using matched single-class runs.",
+        group_by="Architecture",
+        short_caption="Fast-NMS latency saving by board and architecture",
+        caption=(
+            "Fast-NMS latency saving by board and architecture, estimated as a "
+            "difference of differences. \\texttt{dLatency mc} is the mean "
+            "multi-class fast-minus-per-class latency, and \\texttt{sc drift} "
+            "the same difference for the single-class models, where the two "
+            "algorithms coincide so that any difference is run-to-run drift; "
+            "the saving is the former minus the latter, and a negative value "
+            "means the class-agnostic pass is the faster of the two. Each arm "
+            "pools 16 matched pairs at $320\\times320$, the only rung for which "
+            "a single-class drift control was benchmarked, and \\texttt{resolved} "
+            "records whether the 95\\% interval excludes zero."
+        ),
+        # The interval is printed to two decimals, so the columns feeding it
+        # should not be printed to a different precision.
+        float_format="%.2f",
     )
     return
 
@@ -1698,6 +1746,8 @@ def _(NMS, SCHEME_LABELS, br, mo, show_table, view):
         _table,
         "resolution_ladder",
         mo,
+        group_by="Architecture",
+        short_caption="Detection quality and median latency by input resolution",
         caption="Detection quality and median latency by input resolution and "
         "export scheme. Accuracy is measured on the CPU reference, latency on "
         "each accelerator; throughput follows from the latter and is omitted.",
