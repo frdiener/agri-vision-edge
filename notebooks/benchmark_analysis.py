@@ -130,6 +130,16 @@ def _(BENCHMARK_ROOT, br):
     # comparative views. `controls=True` includes them in inventory tables.
     CONTROL_TREES = ("tf-savedmodel-nms0", "frdm-imx93_vendor-stack")
 
+    # Compact export-scheme names for printed tables; `br.ARCH_SHORT` does the
+    # same for architectures.
+    SCHEME_LABELS = {
+        "fp32_ptq": "FP32 PTQ",
+        "int8_ptq_per-channel": "INT8 PTQ/C",
+        "int8_ptq_per-tensor": "INT8 PTQ/T",
+        "int8_qat_per-channel": "INT8 QAT/C",
+        "int8_qat_per-tensor": "INT8 QAT/T",
+    }
+
 
     def view(
         *,
@@ -171,7 +181,7 @@ def _(BENCHMARK_ROOT, br):
             out = br.reference_config_slice(out, **(ref if isinstance(ref, dict) else {}))
         return out
 
-    return CONTROL_TREES, NMS, runs, skipped, view
+    return CONTROL_TREES, NMS, SCHEME_LABELS, runs, skipped, view
 
 
 @app.cell(hide_code=True)
@@ -709,7 +719,7 @@ def _(BENCHMARK_ROOT, dg):
 
 
 @app.cell(hide_code=True)
-def _(br, delegation, dg, mo, show_table):
+def _(SCHEME_LABELS, br, delegation, dg, mo, show_table):
     # Continuity is constant by architecture and scheme; remove repeated parses
     # across class, NMS, and tiling variants. Exclude auxiliary architectures.
     _primary = [br.ARCH_LABELS[a] for a in br.PRIMARY_ARCHS]
@@ -736,21 +746,7 @@ def _(br, delegation, dg, mo, show_table):
             _table = _table.drop_duplicates(["Architecture", "Scheme"])
             # Drop the unstable positional index from parsed logs.
             _table = _table.reset_index(drop=True)
-            _table["Scheme"] = _table["Scheme"].replace(
-                {
-                    "fp32_ptq": "FP32 PTQ",
-                    "int8_ptq_per-channel": "INT8 PTQ/C",
-                    "int8_ptq_per-tensor": "INT8 PTQ/T",
-                    "int8_qat_per-channel": "INT8 QAT/C",
-                    "int8_qat_per-tensor": "INT8 QAT/T",
-                }
-            )
-            _table["Architecture"] = _table["Architecture"].replace(
-                {
-                    "SSD MobileNetV2": "MNv2",
-                    "SSD MobileNetV2 FPNLite": "FPNLite",
-                }
-            )
+            _table["Scheme"] = _table["Scheme"].replace(SCHEME_LABELS)
         show_table(
             _table,
             f"continuity_{_plat.replace('frdm-', '').replace('-', '')}",
@@ -866,7 +862,7 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(NMS, br, mo, show_table, view):
+def _(NMS, SCHEME_LABELS, br, mo, show_table, view):
     _table = br.device_latency_table(
         view(nms=NMS, ref=True, deployable=True), nms=NMS
     ).drop(columns=["Input"])
@@ -879,15 +875,7 @@ def _(NMS, br, mo, show_table, view):
             "SSD MobileNetV2 FPNLite": "FPNLite",
         }
     )
-    _table["Scheme"] = _table["Scheme"].replace(
-        {
-            "fp32_ptq": "FP32 PTQ",
-            "int8_ptq_per-channel": "INT8 PTQ/C",
-            "int8_ptq_per-tensor": "INT8 PTQ/T",
-            "int8_qat_per-channel": "INT8 QAT/C",
-            "int8_qat_per-tensor": "INT8 QAT/T",
-        }
-    )
+    _table["Scheme"] = _table["Scheme"].replace(SCHEME_LABELS)
     show_table(
         _table,
         "device_latency",
@@ -1190,7 +1178,7 @@ def _(power_judged):
 
 
 @app.cell
-def _(br, mo, pd, power_judged, show_table):
+def _(SCHEME_LABELS, br, mo, pd, power_judged, show_table):
     _power_table = power_judged[
         (power_judged["aligned"] == True)  # noqa: E712
         & (power_judged["nms"] == "regnms")
@@ -1209,21 +1197,8 @@ def _(br, mo, pd, power_judged, show_table):
             "frdm-imx93": "i.MX93",
         }
     )
-    _power_table["arch"] = _power_table["arch"].replace(br.ARCH_LABELS).replace(
-        {
-            "SSD MobileNetV2": "MNv2",
-            "SSD MobileNetV2 FPNLite": "FPNLite",
-        }
-    )
-    _power_table["scheme"] = _power_table["scheme"].replace(
-        {
-            "fp32_ptq": "FP32 PTQ",
-            "int8_ptq_per-channel": "INT8 PTQ/C",
-            "int8_ptq_per-tensor": "INT8 PTQ/T",
-            "int8_qat_per-channel": "INT8 QAT/C",
-            "int8_qat_per-tensor": "INT8 QAT/T",
-        }
-    )
+    _power_table["arch"] = _power_table["arch"].replace(br.ARCH_LABELS)
+    _power_table["scheme"] = _power_table["scheme"].replace(SCHEME_LABELS)
     # Run names carry the input size as a string, so order it numerically.
     _power_table = _power_table.assign(
         _px=pd.to_numeric(_power_table["size"], errors="coerce")
@@ -1300,27 +1275,14 @@ def _(mo):
 
 
 @app.cell
-def _(NMS, br, mo, power_judged, show_table):
+def _(NMS, SCHEME_LABELS, br, mo, power_judged, show_table):
     _table = br.accelerator_latency_table(
         power_judged, nms=NMS, size=br.REFERENCE_CONFIG["size"]
     )
     _table["Board"] = _table["Board"].replace(
         {"frdm-imx8mp": "i.MX8MP", "frdm-imx93": "i.MX93"}
     )
-    _table["Architecture"] = _table["Architecture"].replace(
-        {
-            "SSD MobileNetV2": "MNv2",
-            "SSD MobileNetV2 FPNLite": "FPNLite",
-        }
-    )
-    _table["Scheme"] = _table["Scheme"].replace(
-        {
-            "int8_ptq_per-channel": "INT8 PTQ/C",
-            "int8_ptq_per-tensor": "INT8 PTQ/T",
-            "int8_qat_per-channel": "INT8 QAT/C",
-            "int8_qat_per-tensor": "INT8 QAT/T",
-        }
-    )
+    _table["Scheme"] = _table["Scheme"].replace(SCHEME_LABELS)
     _table = _table.rename(
         columns={
             "CPU invoke (ms)": "CPU inv. (ms)",
