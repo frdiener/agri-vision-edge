@@ -5348,6 +5348,53 @@ def _grouped_tabular(latex: str, group_sizes: list[tuple[str, int]]) -> str:
     return "\n".join(out) + "\n"
 
 
+def _significant_digits(float_format) -> int | None:
+    """Return the precision of a ``%.Ng`` format string, if it is one."""
+    if not isinstance(float_format, str):
+        return None
+    match = re.fullmatch(r"%\.(\d+)g", float_format)
+    return int(match.group(1)) if match else None
+
+
+def _decimal_formatter(width: int, digits: int, na_rep: str) -> Callable:
+    """Format a float to ``width`` decimals, capped at ``digits`` significant ones."""
+
+    def _format(value) -> str:
+        if pd.isna(value):
+            return na_rep
+        if value and np.isfinite(value):
+            available = max(0, digits - 1 - int(np.floor(np.log10(abs(value)))))
+        else:
+            available = width
+        return f"{value:.{min(width, available)}f}"
+
+    return _format
+
+
+def _decimal_formatters(df: pd.DataFrame, float_format, na_rep: str) -> dict:
+    """Give every float column one decimal width, so trailing zeros survive."""
+    digits = _significant_digits(float_format)
+    if digits is None:
+        return {}
+
+    formatters = {}
+    for column in df.columns:
+        values = df[column]
+        if not pd.api.types.is_float_dtype(values):
+            continue
+        values = values.dropna()
+        values = values[np.isfinite(values)]
+        if values.empty:
+            continue
+        rendered = [float_format % value for value in values]
+        if any("e" in text.lower() for text in rendered):
+            continue
+        width = max(len(text.partition(".")[2]) for text in rendered)
+        if width:
+            formatters[column] = _decimal_formatter(width, digits, na_rep)
+    return formatters
+
+
 def save_latex_table(
     df: pd.DataFrame,
     path: str | Path,
@@ -5423,6 +5470,10 @@ def save_latex_table(
         "float_format": "%.4g",
     }
     kwargs.update(to_latex_kwargs)
+    kwargs.setdefault(
+        "formatters",
+        _decimal_formatters(df, kwargs.get("float_format"), kwargs.get("na_rep", "--")),
+    )
     table_bodies = []
     for group, group_df in groups:
         if drop_split_by:
