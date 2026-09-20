@@ -3041,7 +3041,7 @@ def resolution_ladder_table(
         )
         .round(
             {
-                **{c: 2 if percent else 4 for c in accuracy_columns},
+                **dict.fromkeys(accuracy_columns, 2 if percent else 4),
                 "x86 (ms)": 2,
             }
         )
