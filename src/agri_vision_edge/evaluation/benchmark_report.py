@@ -3306,7 +3306,7 @@ def preparation_ladder_table(
             else:
                 base = values.get(deployed_float_stage, {}).get(arch)
 
-            row[f"{short} d"] = (
+            row[f"{short} dAP"] = (
                 None if value is None or base is None else round(value - base, 2)
             )
 
@@ -5312,6 +5312,11 @@ def _ascii(value):
     return value.encode("ascii", "replace").decode("ascii")
 
 
+def _latex_metric_notation(value: str) -> str:
+    """Render internal delta-AP labels using mathematical notation."""
+    return value.replace("dAP", r"$\Delta$AP")
+
+
 def _resolve_group_columns(df: pd.DataFrame, spec, kind: str) -> list[str]:
     """Validate a group/split column specification against ``df``."""
     columns = [spec] if isinstance(spec, str) else list(spec)
@@ -5491,7 +5496,7 @@ def save_latex_table(
             group_df = pd.concat([block for _, block in blocks]).drop(
                 columns=group_columns
             )
-        body = _ascii(group_df.to_latex(**kwargs))
+        body = _latex_metric_notation(_ascii(group_df.to_latex(**kwargs)))
         if group_sizes:
             body = _grouped_tabular(body, group_sizes)
         table_bodies.append((group, body))
@@ -5512,9 +5517,14 @@ def save_latex_table(
                     if drop_split_by and group is not None
                     else ""
                 )
-                short = f"[{_ascii(short_caption)}]" if short_caption else ""
+                short = (
+                    f"[{_latex_metric_notation(_ascii(short_caption))}]"
+                    if short_caption
+                    else ""
+                )
                 heading = (
-                    f"\\caption{short}{{{_ascii(caption)}{panel_suffix}}}\n"
+                    f"\\caption{short}"
+                    f"{{{_latex_metric_notation(_ascii(caption))}{panel_suffix}}}\n"
                     f"\\label{{tab:{label}}}\n"
                 )
             else:

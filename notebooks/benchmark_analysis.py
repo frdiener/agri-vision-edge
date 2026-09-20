@@ -364,9 +364,9 @@ def _(br, mo, show_table, view):
         "baseline",
         mo,
         caption="Fine-tuned float accuracy across input resolutions using official "
-        "PhenoBench metrics. Published results use the withheld test set; this "
-        "work uses an internal split of the validation set, so the values are not "
-        "directly comparable.",
+        "PhenoBench metrics. AP values are points on the 0--100 scale. Published "
+        "results use the withheld test set; this work uses an internal split of "
+        "the validation set, so the values are not directly comparable.",
     )
     return
 
@@ -439,7 +439,10 @@ def _(NMS, br, mo, show_table, view):
         "preparation_ladder_ptq",
         mo,
         caption="Accuracy after conversion and PTQ at the reference configuration. "
-        "All rungs use per-class NMS; INT8 changes are relative to float TFLite.",
+        "All rungs use per-class NMS. AP and $\\Delta$AP use points on the "
+        "0--100 scale; INT8 $\\Delta$AP is relative to float TFLite, and negative "
+        "values denote losses, "
+        "not negative accuracy.",
     )
     return
 
@@ -532,7 +535,11 @@ def _(NMS, br, mo, show_table, view):
         "preparation_ladder",
         mo,
         caption="Accuracy after conversion, PTQ, and QAT at both weight "
-        "granularities. Reference configuration with per-class NMS.",
+        "granularities for the reference configuration with per-class NMS. AP and "
+        "$\\Delta$AP use points on the 0--100 scale. $\\Delta$AP is relative to "
+        "SavedModel in the "
+        "float-TFLite row and to float TFLite in the INT8 rows; negative values "
+        "denote losses, not negative accuracy.",
     )
     return
 
@@ -875,7 +882,7 @@ def _(mo):
 
     Only exports judged correct in §4 are included. CPU results come from the same
     board with its delegate disabled and XNNPACK enabled. Values are median latency
-    with p95, plus `dAP`.
+    with p95, plus $\\Delta$AP.
 
     Scope: per-class NMS at the reference configuration.
     """)

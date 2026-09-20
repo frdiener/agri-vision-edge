@@ -189,9 +189,11 @@ def test_the_float_rung_prices_conversion_at_the_requested_nms():
     regular = preparation_ladder_table(rows, nms="regnms").set_index("Stage")
     fast = preparation_ladder_table(rows, nms="fastnms").set_index("Stage")
 
-    assert regular.loc["Float TFLite, Per-class NMS", "MNv2 d"] == pytest.approx(-0.26)
+    assert regular.loc["Float TFLite, Per-class NMS", "MNv2 dAP"] == pytest.approx(
+        -0.26
+    )
     assert fast.loc[
-        "Float TFLite, Fast NMS (default export)", "MNv2 d"
+        "Float TFLite, Fast NMS (default export)", "MNv2 dAP"
     ] == pytest.approx(-0.76)
 
 
@@ -202,9 +204,9 @@ def test_int8_rows_are_quoted_against_the_deployed_float_not_each_other():
         pd.DataFrame(_chain()), nms=FAST_NMS
     ).set_index("Stage")
 
-    assert table.loc["INT8 PTQ, per-channel", "MNv2 d"] == pytest.approx(-0.44)
-    assert table.loc["INT8 PTQ, per-tensor", "MNv2 d"] == pytest.approx(-1.21)
-    assert table.loc["INT8 QAT, per-tensor", "MNv2 d"] == pytest.approx(-0.15)
+    assert table.loc["INT8 PTQ, per-channel", "MNv2 dAP"] == pytest.approx(-0.44)
+    assert table.loc["INT8 PTQ, per-tensor", "MNv2 dAP"] == pytest.approx(-1.21)
+    assert table.loc["INT8 QAT, per-tensor", "MNv2 dAP"] == pytest.approx(-0.15)
 
 
 def test_the_ptq_only_table_stops_before_qat():
@@ -250,7 +252,7 @@ def test_the_ladder_is_not_confused_by_other_input_resolutions():
 
     assert table.loc["Float SavedModel (reference)", "MNv2 AP"] == pytest.approx(39.66)
     assert table.loc[
-        "Float TFLite, Fast NMS (default export)", "MNv2 d"
+        "Float TFLite, Fast NMS (default export)", "MNv2 dAP"
     ] == pytest.approx(-0.76)
 
 
