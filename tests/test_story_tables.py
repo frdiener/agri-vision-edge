@@ -18,6 +18,7 @@ from agri_vision_edge.evaluation.benchmark_report import (
     REFERENCE_PLATFORM,
     REGULAR_NMS,
     baseline_table,
+    deployment_summary_table,
     device_latency_table,
     discover_board_pairs,
     preparation_ladder_table,
@@ -341,6 +342,19 @@ def test_speedup_compares_the_same_board_with_the_delegate_off():
     assert raw["dAP"] == pytest.approx(0.001)
 
 
+def test_deployment_summary_keeps_full_architecture_names():
+    rows = [
+        _row(CPU_REFERENCE_PLATFORM, ap=0.40),
+        _row(CPU, ap=0.40, latency=100.0),
+        _row(NPU, ap=0.40, latency=25.0),
+    ]
+
+    table = deployment_summary_table(pd.DataFrame(rows), nms=FAST_NMS)
+
+    assert set(table["Architecture"]) == {"SSD MobileNetV2"}
+    assert "Detector" not in table
+
+
 def test_a_broken_delegated_run_never_reaches_the_latency_table():
     # It is fast precisely because it is not computing anything; unfiltered,
     # it sorts to the top of a latency ranking.
@@ -401,6 +415,42 @@ def test_tiling_cross_latex_uses_delta_notation(tmp_path):
     assert r"$\Delta$AP" in header
     assert r"$\Delta$Crop AP" in header
     assert r"$\Delta$Weed AP" in header
+
+
+def test_latex_table_can_nest_group_blocks_in_a_shaded_strip(tmp_path):
+    table = pd.DataFrame(
+        {
+            "Platform": ["i.MX8MP", "i.MX8MP", "i.MX93", "i.MX93"],
+            "Architecture": [
+                "SSD MobileNetV2",
+                "SSD MobileNetV2 FPNLite",
+                "SSD MobileNetV2",
+                "SSD MobileNetV2 FPNLite",
+            ],
+            "Value": [1, 2, 3, 4],
+        }
+    )
+    path = tmp_path / "striped.tex"
+
+    save_latex_table(
+        table,
+        path,
+        strip_by="Platform",
+        group_by="Architecture",
+    )
+
+    latex = path.read_text()
+    assert r"\begin{tabular}{cr}" in latex
+    assert r"{} & Value" in latex
+    assert (
+        r"\cellcolor{black!8}\multirow{-4}{*}"
+        r"{\rotatebox[origin=c]{90}{\strut i.MX8MP}}"
+    ) in latex
+    assert r"\multicolumn{1}{l}{\itshape SSD MobileNetV2 FPNLite}" in latex
+    assert r"\cline{2-2}" in latex
+    assert r">{\columncolor{black!8}}" not in latex
+    assert "Platform &" not in latex
+    assert "Architecture &" not in latex
 
 
 def test_each_deviation_is_a_single_axis_from_the_reference():

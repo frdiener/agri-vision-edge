@@ -3516,7 +3516,7 @@ def deployment_summary_table(
     reference: str = CPU_REFERENCE_PLATFORM,
     percent: bool = True,
 ) -> pd.DataFrame:
-    """Summarize what each board can run, one row per board, detector and granularity.
+    """Summarize each board, architecture and weight granularity.
 
     Accuracy is read from ``reference`` so a row's AP is a property of the export
     rather than of the board it ran on. Latency and speedup come from
@@ -3631,7 +3631,7 @@ def deployment_summary_table(
                 rows.append(
                     {
                         "Platform": platform_label(board).removesuffix(" NPU"),
-                        "Detector": _short(pd.Series([arch])).iloc[0],
+                        "Architecture": arch,
                         "Weights": gran,
                         "Export": quant_label_of_scheme(scheme),
                         "AP": round(ap, digits),
@@ -3658,7 +3658,9 @@ def deployment_summary_table(
     # Name the row a deployment would choose: the fastest-accelerated block wins
     # on accuracy, which is the recommendation the table is meant to derive.
     accelerated = table["Outcome"] == "accelerated"
-    for _, block in table[accelerated].groupby(["Platform", "Detector"], sort=False):
+    for _, block in table[accelerated].groupby(
+        ["Platform", "Architecture"], sort=False
+    ):
         table.loc[block["AP"].idxmax(), "Outcome"] = "recommended"
 
     return table.reset_index(drop=True)
@@ -5364,6 +5366,74 @@ def _grouped_tabular(latex: str, group_sizes: list[tuple[str, int]]) -> str:
     return "\n".join(out) + "\n"
 
 
+def _striped_grouped_tabular(
+    latex: str,
+    strip_groups: list[tuple[str, list[tuple[str, int]]]],
+) -> str:
+    """Render outer groups as a shaded vertical strip and inner groups as blocks."""
+    lines = latex.splitlines()
+    try:
+        tabular = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("\\begin{tabular}{")
+        )
+        top = lines.index("\\toprule")
+        first = lines.index("\\midrule") + 1
+        last = lines.index("\\bottomrule")
+    except (StopIteration, ValueError):
+        return latex
+
+    prefix = "\\begin{tabular}{"
+    column_spec = lines[tabular][len(prefix) : -1]
+    span = len(column_spec.replace("|", ""))
+    total_columns = span + 1
+    lines[tabular] = f"{prefix}c{column_spec}}}"
+
+    # Pandas may emit more than one header row for multi-level columns. Give
+    # every one an empty cell for the new strip column.
+    for index in range(top + 1, first - 1):
+        if lines[index].rstrip().endswith("\\\\"):
+            lines[index] = f"{{}} & {lines[index]}"
+
+    out, cursor = lines[:first], first
+    for strip_index, (strip_label, group_sizes) in enumerate(strip_groups):
+        if strip_index:
+            out.append("\\midrule")
+
+        labelled_groups = sum(bool(label) for label, _ in group_sizes)
+        strip_rows = sum(size for _, size in group_sizes) + labelled_groups
+        strip_cell = (
+            f"\\multirow{{-{strip_rows}}}{{*}}"
+            f"{{\\rotatebox[origin=c]{{90}}{{\\strut {strip_label}}}}}"
+        )
+
+        for group_index, (group_label, size) in enumerate(group_sizes):
+            if group_index:
+                # Unlike booktabs' \cmidrule, \cline adds no white vertical
+                # padding that would interrupt the shaded outer strip.
+                out.append(f"\\cline{{2-{total_columns}}}")
+            if group_label:
+                out.append(
+                    "\\cellcolor{black!8} & "
+                    f"\\multicolumn{{{span}}}{{l}}{{\\itshape {group_label}}} \\\\"
+                )
+            for row_index, row in enumerate(lines[cursor : cursor + size]):
+                final_row = (
+                    group_index == len(group_sizes) - 1 and row_index == size - 1
+                )
+                cell = (
+                    f"\\cellcolor{{black!8}}{strip_cell}"
+                    if final_row
+                    else "\\cellcolor{black!8}"
+                )
+                out.append(f"{cell} & {row}")
+            cursor += size
+
+    out.extend(lines[last:])
+    return "\n".join(out) + "\n"
+
+
 def _significant_digits(float_format) -> int | None:
     """Return the precision of a ``%.Ng`` format string, if it is one."""
     if not isinstance(float_format, str):
@@ -5420,6 +5490,7 @@ def save_latex_table(
     label: str | None = None,
     split_by: str | tuple[str, ...] | None = None,
     group_by: str | tuple[str, ...] | None = None,
+    strip_by: str | None = None,
     drop_split_by: bool = False,
     clear_between_panels: bool = True,
     placement: str | None = None,
@@ -5436,6 +5507,10 @@ def save_latex_table(
     spanning label row, with the grouping columns dropped from the body. It
     combines with ``split_by``, which then decides the panels and ``group_by``
     the blocks within each.
+
+    ``strip_by`` moves one outer grouping column into a shaded, rotated strip
+    at the left. It may be combined with ``group_by`` for labelled blocks inside
+    each strip.
 
     ``short_caption`` becomes the List of Tables entry, which otherwise repeats
     the full caption. ``placement`` overrides the float specifier, which is
@@ -5461,6 +5536,13 @@ def save_latex_table(
     group_columns = (
         _resolve_group_columns(df, group_by, "group") if group_by is not None else []
     )
+    strip_columns = (
+        _resolve_group_columns(df, strip_by, "strip") if strip_by is not None else []
+    )
+    if len(strip_columns) > 1:
+        raise ValueError("strip_by accepts exactly one column")
+    if set(group_columns) & set(strip_columns):
+        raise ValueError("group_by and strip_by columns must be distinct")
 
     if split_by is not None:
         if not caption:
@@ -5488,7 +5570,30 @@ def save_latex_table(
         if drop_split_by:
             group_df = group_df.drop(columns=split_columns)
         group_sizes: list[tuple[str, int]] = []
-        if group_columns:
+        strip_groups: list[tuple[str, list[tuple[str, int]]]] = []
+        if strip_columns:
+            strip_column = strip_columns[0]
+            strip_blocks = list(
+                group_df.groupby(strip_column, sort=False, dropna=False)
+            )
+            flattened = []
+            for strip_value, strip_df in strip_blocks:
+                strip_df = strip_df.drop(columns=strip_columns)
+                if group_columns:
+                    key = group_columns[0] if len(group_columns) == 1 else group_columns
+                    blocks = list(strip_df.groupby(key, sort=False, dropna=False))
+                    inner_sizes = [
+                        (_group_label(value), len(block)) for value, block in blocks
+                    ]
+                    strip_df = pd.concat([block for _, block in blocks]).drop(
+                        columns=group_columns
+                    )
+                else:
+                    inner_sizes = [("", len(strip_df))]
+                strip_groups.append((_group_label(strip_value), inner_sizes))
+                flattened.append(strip_df)
+            group_df = pd.concat(flattened)
+        elif group_columns:
             key = group_columns[0] if len(group_columns) == 1 else group_columns
             blocks = list(group_df.groupby(key, sort=False, dropna=False))
             # Concatenate so body rows follow the order the labels are emitted in.
@@ -5497,7 +5602,9 @@ def save_latex_table(
                 columns=group_columns
             )
         body = _latex_metric_notation(_ascii(group_df.to_latex(**kwargs)))
-        if group_sizes:
+        if strip_groups:
+            body = _striped_grouped_tabular(body, strip_groups)
+        elif group_sizes:
             body = _grouped_tabular(body, group_sizes)
         table_bodies.append((group, body))
 

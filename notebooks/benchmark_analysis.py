@@ -1387,7 +1387,7 @@ def _(mo):
     mo.md("""
     ### 5.5 &middot; Deployment summary
 
-    One row per board, detector and weight granularity, at the reference
+    One row per board, architecture and weight granularity, at the reference
     configuration. It carries the sections above into a single decision: accuracy
     comes from the host reference, so `AP` is a property of the export and is equal
     across boards; latency and energy come from the board named, against that same
@@ -1419,7 +1419,9 @@ def _(NMS, br, mo, power_judged, show_table, skipped, view):
         deployment_summary,
         "deployment_summary",
         mo,
-        short_caption="Deployment outcome by platform, detector and weight granularity",
+        short_caption=(
+            "Deployment outcome by platform, architecture and weight granularity"
+        ),
         caption="Deployment outcome for every weight granularity at the reference "
         "configuration. AP comes from the host reference and is a property of the "
         "export; latency and energy come from the board shown, against that same "
@@ -1428,8 +1430,9 @@ def _(NMS, br, mo, power_judged, show_table, skipped, view):
         "correctness verdict of \\cref{tab:deployability} with whether acceleration "
         "was worth anything. A dash marks an export with no benchmark row on that "
         "board.",
-        # One float, with the boards kept apart by a rule and a label row.
-        group_by="Platform",
+        # One float: boards form the shaded outer strip, architectures the blocks.
+        strip_by="Platform",
+        group_by="Architecture",
     )
     return
 
