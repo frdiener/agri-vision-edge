@@ -23,7 +23,9 @@ from agri_vision_edge.evaluation.benchmark_report import (
     preparation_ladder_table,
     qat_reclaim_table,
     resolution_ladder_table,
+    save_latex_table,
     story_ablation_table,
+    tiling_cross_table,
 )
 
 NPU = "frdm-imx93"
@@ -377,6 +379,28 @@ def test_resolution_ladder_reports_accuracy_in_percentage_points():
 
 
 # ------------------------------------------------------------ step 6
+
+
+def test_tiling_cross_keeps_full_architecture_names():
+    table = tiling_cross_table(
+        pd.DataFrame([_row(CPU_REFERENCE_PLATFORM, ap=0.40, nms=DEFAULT_NMS)])
+    )
+
+    assert set(table["Architecture"]) == {"SSD MobileNetV2"}
+
+
+def test_tiling_cross_latex_uses_delta_notation(tmp_path):
+    table = tiling_cross_table(
+        pd.DataFrame([_row(CPU_REFERENCE_PLATFORM, ap=0.40, nms=DEFAULT_NMS)])
+    )
+    path = tmp_path / "tiling_cross.tex"
+
+    save_latex_table(table, path, group_by="Architecture")
+
+    header = path.read_text().split("\\midrule", maxsplit=1)[0]
+    assert r"$\Delta$AP" in header
+    assert r"$\Delta$Crop AP" in header
+    assert r"$\Delta$Weed AP" in header
 
 
 def test_each_deviation_is_a_single_axis_from_the_reference():

@@ -731,6 +731,7 @@ def _(NMS, br, mo, show_table, skipped, view):
         ),
         "delegate_build_delta",
         mo,
+        group_by="Arch",
         caption="Effect of the Mesa/Teflon operator-support changes on the i.MX8M "
         "Plus at 320x320: correctness transitions and paired median latency by "
         "architecture and export scheme.",
@@ -1629,6 +1630,7 @@ def _(br, mo, show_table, view):
         br.tiling_cross_table(view(nms="both")),
         "tiling_cross",
         mo,
+        group_by="Architecture",
         caption="Training and evaluation tiling combinations for multi-class float "
         "TFLite on the CPU reference. Changes are relative to each architecture's "
         "full-frame reference.",

@@ -3890,7 +3890,7 @@ def tiling_cross_table(
             cell = group[
                 (group["dataset"] == dataset) & (group["eval_tiling"] == tiling)
             ]
-            row = {"Architecture": _arch_short(arch), "Tiling": label}
+            row = {"Architecture": arch, "Tiling": label}
 
             for col, name in metrics:
                 value = (
@@ -3903,7 +3903,7 @@ def tiling_cross_table(
                 if label == TILING_CELLS[0][0]:
                     reference[name] = value
                 base = reference.get(name)
-                row[f"d {name}"] = (
+                row[f"d{name}"] = (
                     None if value is None or base is None else round(value - base, 2)
                 )
 
@@ -5314,7 +5314,7 @@ def _ascii(value):
 
 def _latex_metric_notation(value: str) -> str:
     """Render internal delta-AP labels using mathematical notation."""
-    return value.replace("dAP", r"$\Delta$AP")
+    return re.sub(r"\bd(?=(?:Crop |Weed )?AP\b)", r"$\\Delta$", value)
 
 
 def _resolve_group_columns(df: pd.DataFrame, spec, kind: str) -> list[str]:
