@@ -367,6 +367,48 @@ def load_benchmark_results(
     return df, skipped
 
 
+def load_benchmark_timings(
+    root: str | Path = "benchmark_results",
+    exclude_dirs: Iterable[str] = NON_PLATFORM_DIRS,
+) -> pd.DataFrame:
+    """Load parseable latency runs without requiring valid accuracy metrics.
+
+    Prediction-integrity failures invalidate accuracy, not the clock around the
+    execution. This view therefore keeps runs with a readable ``latency.json``
+    even when ``metrics.json`` is absent or rejected.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return pd.DataFrame()
+
+    exclude = set(exclude_dirs)
+    rows: list[dict] = []
+    platforms = sorted(
+        path for path in root.iterdir() if path.is_dir() and path.name not in exclude
+    )
+
+    for platform_dir in platforms:
+        for run_dir in sorted(path for path in platform_dir.iterdir() if path.is_dir()):
+            info = parse_run_name(run_dir.name)
+            latency = _read_json(run_dir / "latency.json")
+            if info is None or latency is None:
+                continue
+
+            row = dict(info)
+            row["platform"] = platform_dir.name
+            row["device"] = platform_dir.name.removesuffix("_cpu")
+            row.update(_latency_fields(latency))
+            row.update(_runtime_fields(_read_json(run_dir / "runtime.json") or {}))
+            rows.append(row)
+
+    timings = pd.DataFrame(rows)
+    if timings.empty:
+        return timings
+    return timings.sort_values(
+        ["platform", "arch", "classes", "precision", "quant"]
+    ).reset_index(drop=True)
+
+
 def select_nms(df: pd.DataFrame, nms: str | None = DEFAULT_NMS) -> pd.DataFrame:
     """Filter to one NMS variant while retaining rows without an NMS token.
 
@@ -3452,6 +3494,8 @@ def device_latency_table(
         for _, r in npu.sort_values(keys).iterrows():
             key = tuple(r[k] for k in keys)
             reference = cpu_indexed.loc[key] if key in cpu_indexed.index else None
+            cpu_metric = None if reference is None else reference.get(metric)
+            npu_metric = r.get(metric)
 
             cpu_ms = (
                 None
@@ -3478,21 +3522,19 @@ def device_latency_table(
                     "NPU FPS": None if not npu_ms else round(1000.0 / npu_ms, 1),
                     "AP CPU": (
                         None
-                        if reference is None or pd.isna(reference[metric])
-                        else round(scale * float(reference[metric]), digits)
+                        if pd.isna(cpu_metric)
+                        else round(scale * float(cpu_metric), digits)
                     ),
                     "AP NPU": (
                         None
-                        if pd.isna(r[metric])
-                        else round(scale * float(r[metric]), digits)
+                        if pd.isna(npu_metric)
+                        else round(scale * float(npu_metric), digits)
                     ),
                     "dAP": (
                         None
-                        if reference is None
-                        or pd.isna(r[metric])
-                        or pd.isna(reference[metric])
+                        if pd.isna(npu_metric) or pd.isna(cpu_metric)
                         else round(
-                            scale * (float(r[metric]) - float(reference[metric])),
+                            scale * (float(npu_metric) - float(cpu_metric)),
                             digits,
                         )
                     ),
@@ -3511,6 +3553,7 @@ def deployment_summary_table(
     skipped: Iterable[str] = (),
     *,
     power_df: pd.DataFrame | None = None,
+    timing_df: pd.DataFrame | None = None,
     metric: str = "AP",
     nms: str | None = DEFAULT_NMS,
     reference: str = CPU_REFERENCE_PLATFORM,
@@ -3524,6 +3567,9 @@ def deployment_summary_table(
     energy from ``power_df``, which may be raw or already passed through
     `annotate_resource_runs`.
 
+    ``timing_df`` may contain runs rejected for scoring. Their execution time is
+    retained while their correctness verdict remains unchanged.
+
     Within a granularity the export method scoring highest on the reference is
     the one reported, so ``Export`` is a result rather than a fixed label.
     ``Outcome`` folds the correctness verdict together with whether acceleration
@@ -3534,7 +3580,11 @@ def deployment_summary_table(
 
     # Failed deployments are the point of the table, so they are kept.
     latency = device_latency_table(
-        df, metric=metric, deployable_only=False, nms=nms, percent=percent
+        df if timing_df is None else timing_df,
+        metric=metric,
+        deployable_only=False,
+        nms=nms,
+        percent=percent,
     )
     if latency.empty:
         return pd.DataFrame()

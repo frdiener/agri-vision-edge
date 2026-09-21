@@ -21,6 +21,7 @@ from agri_vision_edge.evaluation.benchmark_report import (
     deployment_summary_table,
     device_latency_table,
     discover_board_pairs,
+    load_benchmark_timings,
     preparation_ladder_table,
     qat_reclaim_table,
     resolution_ladder_table,
@@ -353,6 +354,54 @@ def test_deployment_summary_keeps_full_architecture_names():
 
     assert set(table["Architecture"]) == {"SSD MobileNetV2"}
     assert "Detector" not in table
+
+
+def test_deployment_summary_keeps_timing_for_an_unscoreable_export():
+    scored = pd.DataFrame(
+        [
+            _row(CPU_REFERENCE_PLATFORM, ap=0.40),
+            _row(CPU, ap=0.40, latency=100.0),
+        ]
+    )
+    timings = pd.DataFrame(
+        [
+            _row(CPU, ap=None, latency=100.0),
+            _row(NPU, ap=None, latency=25.0),
+        ]
+    )
+    skipped = [
+        f"{NPU}/untiled_ssd-mn2_mc_phenobench_320_fp32_ptq_{FAST_NMS} "
+        "(corrupt predictions)"
+    ]
+
+    row = deployment_summary_table(
+        scored,
+        skipped,
+        timing_df=timings,
+        nms=FAST_NMS,
+    ).iloc[0]
+
+    assert row["Outcome"] == "unscoreable"
+    assert row["NPU (ms)"] == pytest.approx(25.0)
+    assert row["CPU (ms)"] == pytest.approx(100.0)
+    assert row["Speedup"] == pytest.approx(4.0)
+
+
+def test_timing_loader_does_not_require_metrics(tmp_path):
+    run = (
+        tmp_path
+        / NPU
+        / f"untiled_ssd-mn2_mc_phenobench_320_fp32_ptq_{FAST_NMS}"
+    )
+    run.mkdir(parents=True)
+    (run / "latency.json").write_text('{"median_latency_ms": 25.0}')
+    (run / "runtime.json").write_text('{"backend": "delegate"}')
+
+    timings = load_benchmark_timings(tmp_path)
+
+    assert len(timings) == 1
+    assert timings.iloc[0]["median_latency_ms"] == pytest.approx(25.0)
+    assert timings.iloc[0]["backend"] == "delegate"
 
 
 def test_a_broken_delegated_run_never_reaches_the_latency_table():

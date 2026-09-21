@@ -122,6 +122,7 @@ def _(Path, br):
 def _(BENCHMARK_ROOT, br):
     # Each analysis selects its scope through `view(...)`.
     runs, skipped = br.load_benchmark_results(BENCHMARK_ROOT)
+    timing_runs = br.load_benchmark_timings(BENCHMARK_ROOT)
 
     # Reports use checkpoint-matched, per-class NMS by default.
     NMS = br.DEFAULT_NMS
@@ -181,7 +182,7 @@ def _(BENCHMARK_ROOT, br):
             out = br.reference_config_slice(out, **(ref if isinstance(ref, dict) else {}))
         return out
 
-    return CONTROL_TREES, NMS, SCHEME_LABELS, runs, skipped, view
+    return CONTROL_TREES, NMS, SCHEME_LABELS, runs, skipped, timing_runs, view
 
 
 @app.cell(hide_code=True)
@@ -1406,12 +1407,29 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(NMS, br, mo, power_judged, show_table, skipped, view):
+def _(
+    CONTROL_TREES,
+    NMS,
+    br,
+    mo,
+    power_judged,
+    show_table,
+    skipped,
+    timing_runs,
+    view,
+):
     # Correctness needs both NMS variants in scope; the table fixes NMS itself.
+    _timings = timing_runs[
+        (~timing_runs["platform"].isin(CONTROL_TREES))
+        & (timing_runs["arch"].isin(br.PRIMARY_ARCHS))
+        & (timing_runs["classes"] == "mc")
+        & (timing_runs["dataset"] == "phenobench")
+    ]
     deployment_summary = br.deployment_summary_table(
         view(nms="both", classes="mc", dataset="phenobench"),
         skipped,
         power_df=power_judged,
+        timing_df=_timings,
         nms=NMS,
     )
 
